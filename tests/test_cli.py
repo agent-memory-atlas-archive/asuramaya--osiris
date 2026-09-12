@@ -3604,10 +3604,15 @@ async def test_real_install_user_units_installs_new_files_and_reloads(
     reload_calls: list[list[str]] = []
 
     async def _fake_exec(*args: str, **kwargs: Any) -> Any:
-        reload_calls.append(list(args))
+        # the render step (WAVE 22) also calls create_subprocess_exec, against a repo
+        # with no .venv/ — let it "fail" (nonzero return) so _rendered_user_unit_contents
+        # falls back to the raw file untouched, same as a real missing-venv repo would.
+        is_daemon_reload = args and args[0] == "systemctl"
+        if is_daemon_reload:
+            reload_calls.append(list(args))
 
         class _Proc:
-            returncode = 0
+            returncode = 0 if is_daemon_reload else 1
 
             async def communicate(self) -> tuple[bytes, bytes]:
                 return b"", b""
@@ -3639,7 +3644,19 @@ async def test_real_install_user_units_unchanged_content_skips_daemon_reload(
     monkeypatch.setattr(Path, "home", lambda: fake_home)
 
     async def _unreachable(*args: str, **kwargs: Any) -> Any:
-        raise AssertionError("daemon-reload must never fire when nothing changed")
+        # the render step (WAVE 22) also calls create_subprocess_exec first, against a
+        # repo with no .venv/ — let it "fail" so it falls back to the raw file untouched;
+        # only a daemon-reload call (which must never fire when nothing changed) raises.
+        if args and args[0] == "systemctl":
+            raise AssertionError("daemon-reload must never fire when nothing changed")
+
+        class _Proc:
+            returncode = 1
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return b"", b""
+
+        return _Proc()
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", _unreachable)
 
@@ -3659,10 +3676,23 @@ async def test_real_install_user_units_refuses_a_unit_missing_a_description(
     (src_dir / "osiris-mcp.service").write_text("[Service]\nExecStart=/bin/true\n")
     monkeypatch.setattr(Path, "home", lambda: fake_home)
 
-    async def _unreachable(*args: str, **kwargs: Any) -> Any:
-        raise AssertionError("must never reach daemon-reload — refused before installing")
+    # the render step (WAVE 22) calls create_subprocess_exec first, against a repo
+    # with no .venv/ — let it "fail" (nonzero return) so _rendered_user_unit_contents
+    # falls back to the raw file untouched; only a daemon-reload call (systemctl),
+    # which must never fire on a refused batch, raises.
+    async def _guard_daemon_reload(*args: str, **kwargs: Any) -> Any:
+        if args and args[0] == "systemctl":
+            raise AssertionError("must never reach daemon-reload — refused before installing")
 
-    monkeypatch.setattr("asyncio.create_subprocess_exec", _unreachable)
+        class _Proc:
+            returncode = 1
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return b"", b""
+
+        return _Proc()
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _guard_daemon_reload)
 
     notes = await _real_install_user_units(repo_root)
     assert notes == [
@@ -3972,17 +4002,17 @@ async def test_cmd_deploy_actually_runs_install_prune_timers_sh(
     assert (target / "osiris-base-backup.service").read_text() == "# osiris-base-backup service\n"
 
 
-def test_install_prune_timers_sh_now_covers_all_five_backup_lane_units(
+def test_install_prune_timers_sh_now_covers_all_six_timer_lane_units(
     tmp_path: Path,
 ) -> None:
-    """Wave 21 (thread f04cce36 piece 3, operator ruling 2026-09-12): a config panel
-    letting the operator reschedule any of the five backup timers is only real if
-    deploy actually reinstalls all five, not the original three — a panel field that
-    silently does nothing until a human hand-installs it is worse than no field. No
-    `.venv` in this synthetic repo, so render_backup_timers.py's own subprocess call
-    fails and the script's fallback (a verbatim copy) takes over — proving the UNIT
-    LIST widened, independent of the render step's own DB behavior (covered in
-    test_render_backup_timers.py instead)."""
+    """Wave 21 (thread f04cce36 piece 3) widened this from three to five; WAVE 22
+    (ruling 7be61879, thread 40d6eef3) widens it once more to six — osiris-pg-autotune
+    was the last hand-installed timer the census named (osiris-preflight was already
+    covered by piece 3). A config panel/registered schedule that silently does nothing
+    until a human hand-installs the unit is worse than no field. No `.venv` in this
+    synthetic repo, so render_units.py's own subprocess call fails and the script's
+    fallback (a verbatim copy) takes over — proving the UNIT LIST widened, independent
+    of the render step's own DB behavior (covered in test_render_units.py instead)."""
     import os
     import subprocess
 
@@ -3995,7 +4025,7 @@ def test_install_prune_timers_sh_now_covers_all_five_backup_lane_units(
     (repo / install_script).write_text(real_install)
     (repo / install_script).chmod(0o755)
     for name in ("osiris-prune-manifest", "osiris-prune-apply", "osiris-base-backup",
-                "osiris-backup", "osiris-preflight"):
+                "osiris-backup", "osiris-preflight", "osiris-pg-autotune"):
         (repo / "deploy" / f"{name}.service").write_text(f"# {name} service\n")
         (repo / "deploy" / f"{name}.timer").write_text(f"# {name} timer\n")
     target = tmp_path / "target"
@@ -4012,9 +4042,9 @@ def test_install_prune_timers_sh_now_covers_all_five_backup_lane_units(
             os.environ["OSIRIS_SYSTEMD_USER_DIR"] = old_env
 
     assert result.returncode == 0, result.stderr
-    assert "10 installed/updated, 0 already current" in result.stdout
+    assert "12 installed/updated, 0 already current" in result.stdout
     assert (target / "osiris-backup.timer").read_text() == "# osiris-backup timer\n"
-    assert (target / "osiris-preflight.service").read_text() == "# osiris-preflight service\n"
+    assert (target / "osiris-pg-autotune.service").read_text() == "# osiris-pg-autotune service\n"
 
 
 # --- boot-status -------------------------------------------------------------------------------

@@ -1,22 +1,23 @@
 #!/bin/sh
-# Installs + enables the backup lane's five timer pairs — osiris-prune-manifest,
-# osiris-prune-apply, osiris-base-backup, osiris-backup, osiris-preflight — the SAME
-# idempotent copy-and-compare mechanism install_commands.sh already uses for the
-# slash-command surface (Thoth ruling msg 6949: "deploy is the one sanctioned hand that
-# writes machine files"). Thoth mail 8437: "have deploy install these three units the
-# way it installs slash commands, so a stranger's box gets them without a hand" — the
-# original three were hand-installed once already; WIDENED to all five (Wave 21,
-# thread f04cce36 piece 3, operator ruling 2026-09-12): the backup config panel lets
-# the operator reschedule ANY of the five, and a panel field that silently does
-# nothing until a human hand-installs it is worse than no field.
+# Installs + enables the timer lane's SIX timer pairs — osiris-prune-manifest,
+# osiris-prune-apply, osiris-base-backup, osiris-backup, osiris-preflight, and (WAVE 22,
+# ruling 7be61879, thread 40d6eef3) osiris-pg-autotune — the SAME idempotent
+# copy-and-compare mechanism install_commands.sh already uses for the slash-command
+# surface (Thoth ruling msg 6949: "deploy is the one sanctioned hand that writes machine
+# files"). Thoth mail 8437: "have deploy install these three units the way it installs
+# slash commands, so a stranger's box gets them without a hand" — the original three were
+# hand-installed once already; widened to five (Wave 21, thread f04cce36 piece 3) then to
+# six (WAVE 22): osiris-pg-autotune was the last hand-installed timer census gap-list-1
+# #1 named — a panel field (or, now, a registered schedule) that silently does nothing
+# until a human hand-installs it is worse than no field.
 #
 # RENDERED, NOT COPIED VERBATIM, since piece 3: each `.timer` passes through
-# scripts/render_backup_timers.py first, which substitutes the operator's own
-# configured OnCalendar= override (backup_settings.timer_schedules) for the shipped
-# default when one is set — "the panel writes it, deploy makes it real." A unit with
-# no override renders byte-identical to its shipped file, so the compare-then-copy
-# below stays a true no-op for it; the render step itself fails OPEN (falls back to
-# the shipped defaults) rather than ever blocking this install on a DB hiccup.
+# scripts/render_units.py first (generalized past the backup lane alone, WAVE 22), which
+# substitutes the operator's own configured OnCalendar= override for the shipped default
+# when one is set — "the panel writes it, deploy makes it real." A unit with no override
+# renders byte-identical to its shipped file, so the compare-then-copy below stays a true
+# no-op for it; the render step itself fails OPEN (falls back to the shipped defaults)
+# rather than ever blocking this install on a DB hiccup.
 #
 # IDEMPOTENT: the copy is compare-then-copy (never touches a byte-identical target); a
 # repeat `systemctl --user enable --now` on an already-enabled, already-active timer is
@@ -33,13 +34,13 @@ TOPLEVEL="$(git rev-parse --show-toplevel)"
 REAL_TARGET_DIR="$HOME/.config/systemd/user"
 TARGET_DIR="${OSIRIS_SYSTEMD_USER_DIR:-$REAL_TARGET_DIR}"
 
-UNITS="osiris-prune-manifest osiris-prune-apply osiris-base-backup osiris-backup osiris-preflight"
+UNITS="osiris-prune-manifest osiris-prune-apply osiris-base-backup osiris-backup osiris-preflight osiris-pg-autotune"
 
 mkdir -p "$TARGET_DIR"
 
 RENDER_DIR="$(mktemp -d)"
 trap 'rm -rf "$RENDER_DIR"' EXIT
-"$TOPLEVEL/.venv/bin/python" "$TOPLEVEL/scripts/render_backup_timers.py" \
+"$TOPLEVEL/.venv/bin/python" "$TOPLEVEL/scripts/render_units.py" \
     --deploy-dir "$TOPLEVEL/deploy" --out "$RENDER_DIR" \
     || cp "$TOPLEVEL"/deploy/osiris-*.timer "$TOPLEVEL"/deploy/osiris-*.service "$RENDER_DIR/"
 
@@ -66,7 +67,7 @@ if [ "$TARGET_DIR" = "$REAL_TARGET_DIR" ]; then
     fi
     systemctl --user enable --now \
         osiris-prune-manifest.timer osiris-prune-apply.timer osiris-base-backup.timer \
-        osiris-backup.timer osiris-preflight.timer
+        osiris-backup.timer osiris-preflight.timer osiris-pg-autotune.timer
 fi
 
 echo "install_prune_timers: $installed installed/updated, $current already current — $TARGET_DIR"

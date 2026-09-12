@@ -66,7 +66,19 @@ _SUBPROCESS_BASELINE: dict[str, int] = {
     # 70 -> 71 (2026-09-12, Sekhmet, WAVE 22 backfill CLI door, thread c89a9873): one new
     # dispatch line, `asyncio.run(cmd_backfill(...))`, same false-positive class as both
     # comments above — not a genuine new unbounded subprocess call.
-    "src/cli.py": 71,
+    #
+    # 71 -> 72 (2026-09-12, Seshat, WAVE 22, ruling 7be61879, thread 40d6eef3, rebased
+    # onto Sekhmet's own raise above — sum of all three, not a replacement of any):
+    # `_rendered_user_unit_contents`'s own `await asyncio.wait_for(proc.communicate(),
+    # timeout=10.0)` IS genuinely bounded (a real 10s timeout, matching
+    # compositions.py's own `_backup_timer_live_state` — `asyncio.wait_for(proc.
+    # communicate(), timeout=5.0)`, baselined the same way) — the scanner's own AST
+    # check looks at the `communicate()` call's OWN kwargs, never the wrapping
+    # `wait_for`'s, so a wait_for-wrapped call always reads as "unmarked" here. The
+    # sibling `proc.communicate()` on the timeout branch (draining an already-killed
+    # process, genuinely near-instant) IS inline-marked instead — both are safe,
+    # this one just isn't textually markable without hiding the real timeout.
+    "src/cli.py": 72,
     "src/ingest/files.py": 3,
     "src/ingest/gitlog.py": 3,
     "src/ingest/sessions.py": 3,

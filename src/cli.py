@@ -1766,12 +1766,51 @@ def _placeholder_unit_reason(text: str, repo_root: Path) -> str | None:
     return None
 
 
+async def _rendered_user_unit_contents(repo_root: Path) -> dict[str, str]:
+    """Stage deploy/user/*.service through scripts/render_units.py first (WAVE 22, ruling
+    7be61879, thread 40d6eef3) — a SUBPROCESS call against `repo_root`'s own venv/script,
+    same shape install_prune_timers.sh's own RENDER_DIR pattern already uses for the timer
+    lane, deliberately NOT an in-process import: a synthetic test repo_root with no .venv/
+    or no scripts/render_units.py (predating this wave) then fails the subprocess exec
+    itself, naturally falling back — no live DB is ever reached from a repo that never
+    shipped this script, the same isolation the timer lane's own tests already rely on.
+    ANY failure returns an EMPTY dict; the caller falls back to the raw shipped file
+    untouched — a config-layer hiccup must never block a deploy's own unit install."""
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            proc = await asyncio.create_subprocess_exec(
+                str(repo_root / ".venv" / "bin" / "python"),
+                str(repo_root / "scripts" / "render_units.py"),
+                "--deploy-dir", str(repo_root / "deploy"), "--out", str(out_dir),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            try:
+                await asyncio.wait_for(proc.communicate(), timeout=10.0)
+            except TimeoutError:
+                proc.kill()
+                # unbounded-wait-ok: draining an already-killed process's pipes is near-instant
+                await proc.communicate()
+                return {}
+            if proc.returncode != 0:
+                return {}
+            rendered_dir = out_dir / "user"
+            if not rendered_dir.is_dir():
+                return {}
+            return {p.name: p.read_text() for p in rendered_dir.glob("*.service")}
+    except OSError:
+        return {}
+
+
 async def _real_install_user_units(repo_root: Path) -> list[str]:
     """Copies deploy/user/*.service over ~/.config/systemd/user/ (creating the dir if this is
     a fresh box) and daemon-reloads ONLY if something actually changed — an idle box's every
-    deploy should not spam a reload it doesn't need. The unit's own content is the source of
-    truth; nothing here renders or substitutes (systemd's own %h/%u specifiers do that at
-    activation time), so this is a straight byte-for-byte copy, diffed first.
+    deploy should not spam a reload it doesn't need. The RENDERED content is the source of
+    truth when rendering succeeds (WAVE 22: MemoryMax/--watch/--host/--port substituted in
+    from the settings registry, same "the panel writes it, deploy makes it real" shape the
+    timer lane already has); systemd's own %h/%u specifiers still resolve at activation
+    time regardless, untouched by this step.
 
     A `repo_root` with no deploy/user/ (a test's own tmp_path, or a checkout that predates
     this) touches NOTHING outside itself — no directory created, no real ~/.config read —
@@ -1781,14 +1820,26 @@ async def _real_install_user_units(repo_root: Path) -> list[str]:
     `_placeholder_unit_reason`'s own docstring) rather than installing any of it the
     moment ONE source file looks like a placeholder: notes named `unit: REFUSED ...`
     are the signal `cmd_deploy` gates the restart on, same law as its own silent-no-op
-    guard. Every real unit this repo ships passes both checks today."""
+    guard. Every real unit this repo ships passes both checks today.
+
+    THE PLACEHOLDER CHECK RUNS ON THE RENDERED CONTENT (Thoth's own ruling, mail
+    10247/10261/10284, WAVE 22): render_units.py's own `_looks_like_a_real_unit` guard
+    already refuses a corrupting substitution at ITS layer, but this refusal is the
+    LAST line of defense before anything actually reaches disk — checking the raw
+    shipped source instead of what render actually produced would let a future
+    rendering bug (in this script, or a new substitution added later) slip a stub
+    unit past both guards. `rendered.get(name, src.read_text())` is computed ONCE and
+    reused for both the placeholder check and the install below — never re-rendered,
+    never re-read."""
     sources = user_unit_sources(repo_root)
     if not sources:
         return ["unit files: no deploy/user/ found — nothing to install"]
+    rendered = await _rendered_user_unit_contents(repo_root)
+    contents = {src.name: rendered.get(src.name, src.read_text()) for src in sources}
     placeholder_notes = [
-        f"unit: REFUSED {src.name} — {reason}"
-        for src in sources
-        if (reason := _placeholder_unit_reason(src.read_text(), repo_root)) is not None
+        f"unit: REFUSED {name} — {reason}"
+        for name, text in contents.items()
+        if (reason := _placeholder_unit_reason(text, repo_root)) is not None
     ]
     if placeholder_notes:
         return placeholder_notes
@@ -1798,7 +1849,7 @@ async def _real_install_user_units(repo_root: Path) -> list[str]:
     changed: list[str] = []
     for src in sources:
         dest = target_dir / src.name
-        new_content = src.read_text()
+        new_content = contents[src.name]
         old_content = dest.read_text() if dest.exists() else None
         if old_content == new_content:
             continue
