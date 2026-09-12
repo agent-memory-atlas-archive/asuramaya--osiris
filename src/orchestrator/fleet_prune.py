@@ -125,6 +125,7 @@ async def _unclaimed_bodies(
 async def prune_dry_run(
     pool: asyncpg.Pool, *, projects_root: Path | None = None, jobs_home: Path | None = None,
     live_bodies_by_cwd: Any = None, registry_census_fn: Any = None, exists_fn: Any = None,
+    include_reconcile: bool = True,
 ) -> dict[str, Any]:
     """THE ONE CLASSIFIER, reporting only — never writes. Composes `fleet_reconcile.
     reconcile_dry_run`'s five buckets verbatim with this module's two new ones
@@ -133,36 +134,66 @@ async def prune_dry_run(
     (`into`) has no currently-live `agent_mounts` row — Thoth's "swarm child of a
     retired root" class, reported here as a refinement rather than a bucket of its own,
     since `reconcile_execute` already folds these rows correctly regardless of the flag.
-    """
-    reconciled = await fleet_reconcile.reconcile_dry_run(
-        pool, projects_root=projects_root, jobs_home=jobs_home,
-        live_bodies_by_cwd=live_bodies_by_cwd)
-    buckets: dict[str, list[dict[str, Any]]] = {
-        k: list(v) for k, v in reconciled["buckets"].items()
-    }
+
+    `include_reconcile=False` (thread cc82a8e7, classification_laws_heartbeat's own
+    heavy-sweep follow-up to 9150aec2) skips the `fleet_reconcile.reconcile_dry_run`
+    call entirely — a fold-candidate/ghost scan across the WHOLE fleet, measured live at
+    the dominant cost of this cron's own fleet_prune sub-sweep, which never acts on any
+    of those five buckets (see `prune_execute`'s own docstring: it only ever acts on
+    `dead_transcript`/`unclaimed_body`) and duplicates work the SEPARATE
+    `fleet_reconcile_heartbeat` cron already performs and acts on independently, gated
+    behind its own `osiris_fleet_reconcile_enabled` switch. The five reconcile buckets
+    come back empty and `reconciled: False` names why — every OTHER caller (the MCP
+    `backfill` tool, the CLI `fleet-prune` door, every existing test) keeps the default
+    `True` and the full picture, unchanged."""
+    if include_reconcile:
+        reconciled = await fleet_reconcile.reconcile_dry_run(
+            pool, projects_root=projects_root, jobs_home=jobs_home,
+            live_bodies_by_cwd=live_bodies_by_cwd)
+        buckets: dict[str, list[dict[str, Any]]] = {
+            k: list(v) for k, v in reconciled["buckets"].items()
+        }
+        examined = reconciled.get("examined", 0)
+        census_blind = reconciled["census_blind"]
+        over_cap = reconciled["over_cap"]
+    else:
+        buckets = {
+            "bulk_fold_swarm": [], "rollup_office_remount": [],
+            "drop_ephemeral_test_cwd": [], "ghost_gap": [], "leave_for_human": [],
+        }
+        examined = 0
+        census_blind = False
+        over_cap = False
     buckets["dead_transcript"] = await _dead_transcript_mounts(pool, exists_fn=exists_fn)
     buckets["unclaimed_body"] = await _unclaimed_bodies(
         pool, registry_census_fn=registry_census_fn)
 
-    live_root_ids = {
-        str(r["agent_id"]) for r in await pool.fetch(
-            "SELECT agent_id FROM agent_mounts WHERE last_seen IS NOT NULL "
-            "AND now() - last_seen < make_interval(secs => $1)", float(_LIVE_WINDOW_SECS))
-    }
-    for row in buckets["bulk_fold_swarm"]:
-        into = row.get("into")
-        if into and into not in live_root_ids:
-            row["swarm_root_retired"] = True
+    if include_reconcile:
+        live_root_ids = {
+            str(r["agent_id"]) for r in await pool.fetch(
+                "SELECT agent_id FROM agent_mounts WHERE last_seen IS NOT NULL "
+                "AND now() - last_seen < make_interval(secs => $1)",
+                float(_LIVE_WINDOW_SECS))
+        }
+        for row in buckets["bulk_fold_swarm"]:
+            into = row.get("into")
+            if into and into not in live_root_ids:
+                row["swarm_root_retired"] = True
 
     counts = {k: len(v) for k, v in buckets.items()}
     return {
         "buckets": buckets, "counts": counts, "total": sum(counts.values()),
-        "examined": reconciled.get("examined", 0),
-        "census_blind": reconciled["census_blind"], "over_cap": reconciled["over_cap"],
-        "note": "MECHANICAL FLEET PRUNE — REPORT ONLY. fleet_reconcile's own five buckets "
+        "examined": examined, "census_blind": census_blind, "over_cap": over_cap,
+        "reconciled": include_reconcile,
+        "note": ("MECHANICAL FLEET PRUNE — REPORT ONLY. fleet_reconcile's own five buckets "
                 "plus dead_transcript and unclaimed_body; bulk_fold_swarm rows carry "
                 "swarm_root_retired when their own root has no live mount. Nothing here "
-                "acts on fleet_reconcile's own buckets — see prune_execute's docstring.",
+                "acts on fleet_reconcile's own buckets — see prune_execute's docstring."
+                if include_reconcile else
+                "MECHANICAL FLEET PRUNE — REPORT ONLY, include_reconcile=False: the five "
+                "fleet_reconcile buckets were never computed this call (see this "
+                "function's own docstring) — only dead_transcript/unclaimed_body, the "
+                "only two prune_execute ever acts on, are real."),
     }
 
 
@@ -170,6 +201,7 @@ async def prune_execute(
     actions: Actions, *, actor: str, execute: bool = False,
     projects_root: Path | None = None, jobs_home: Path | None = None,
     live_bodies_by_cwd: Any = None, registry_census_fn: Any = None, exists_fn: Any = None,
+    include_reconcile: bool = True,
 ) -> dict[str, Any]:
     """THE ACTING HALF — DRY RUN IS THE DEFAULT (`execute=False`), same convention as
     `reconcile_execute`. Acts ONLY on `dead_transcript` (drop, reversible/audited) and
@@ -177,6 +209,14 @@ async def prune_execute(
     holder both already exist) — see the module docstring for why `fleet_reconcile`'s own
     buckets are deliberately left untouched here, gated instead behind their own
     `fleet_reconcile_heartbeat`/`osiris_fleet_reconcile_enabled` kill switch.
+
+    `include_reconcile=False` (thread cc82a8e7) skips `prune_dry_run`'s own
+    `fleet_reconcile.reconcile_dry_run` call on both reads below — see that function's
+    own docstring. Since this door NEVER acts on those five buckets regardless, a caller
+    that also never reads `reconcile_buckets_untouched` (classification_laws_heartbeat's
+    own fleet_prune sub-sweep is the one such caller today) gets the identical
+    would_drop/would_bind/dropped/bound behavior at a fraction of the cost. Every other
+    caller keeps the default `True`.
 
     Re-reads the tray via `prune_dry_run` (never trusts a stale caller-supplied report).
     A single row's drop or bind failing is caught and reported inline, never aborting the
@@ -190,7 +230,7 @@ async def prune_execute(
     report = await prune_dry_run(
         actions.pool, projects_root=projects_root, jobs_home=jobs_home,
         live_bodies_by_cwd=live_bodies_by_cwd, registry_census_fn=registry_census_fn,
-        exists_fn=exists_fn)
+        exists_fn=exists_fn, include_reconcile=include_reconcile)
     would_drop = [
         {"job_dir": row["job_dir"], "agent_id": row.get("agent_id")}
         for row in report["buckets"]["dead_transcript"]
@@ -204,6 +244,7 @@ async def prune_execute(
             ("bulk_fold_swarm", "rollup_office_remount", "drop_ephemeral_test_cwd",
              "ghost_gap", "leave_for_human")
         },
+        "reconciled": report["reconciled"],
         "census_blind": report["census_blind"], "over_cap": report["over_cap"],
         "execute": execute,
     }
@@ -253,7 +294,7 @@ async def prune_execute(
     after = await prune_dry_run(
         actions.pool, projects_root=projects_root, jobs_home=jobs_home,
         live_bodies_by_cwd=live_bodies_by_cwd, registry_census_fn=registry_census_fn,
-        exists_fn=exists_fn)
+        exists_fn=exists_fn, include_reconcile=include_reconcile)
     plan.update({
         "dropped_transcripts": dropped, "bound": bound,
         "before_counts": report["counts"], "after_counts": after["counts"],

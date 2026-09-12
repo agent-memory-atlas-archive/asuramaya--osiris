@@ -979,7 +979,8 @@ async def classification_laws_heartbeat(ctx: dict[str, Any]) -> int:
         _log.info("ghost house-stamp sweep: %s", ghosts)
 
     pruned = await _timed("fleet_prune", prune_execute(
-        actions, actor="cron:classification_laws_heartbeat", execute=True))
+        actions, actor="cron:classification_laws_heartbeat", execute=True,
+        include_reconcile=False))
     dropped = len([d for d in pruned.get("dropped_transcripts", []) if "error" not in d])
     bound = len([b for b in pruned.get("bound", []) if b.get("bound")])
     if pruned.get("dropped_transcripts") or pruned.get("bound"):
