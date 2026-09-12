@@ -777,6 +777,45 @@ async def test_lifespan_seeds_the_type_catalog_on_boot(
     assert n2 == n_expect_object + n_expect_link
 
 
+async def test_lifespan_binds_even_when_triggers_is_exclusively_locked(
+    pg_dsn: str, redis_url: str, actions: Actions,
+) -> None:
+    """A live incident (Thoth mail 10214): a concurrent pg_dump held a lock
+    project_triggers' own TRUNCATE needed, hanging the ASGI lifespan at startup — the
+    console never bound, and the deploy's health/smoke poller burned its own timeout
+    reporting a false console failure. project_triggers no longer takes ACCESS
+    EXCLUSIVE (DELETE + upsert-by-helper_id instead, migration 0068's own unique
+    constraint) and sets its own bounded `lock_timeout`; the lifespan catches the
+    resulting LockNotAvailableError and leaves the previous projection in place.
+
+    Proved at the REAL lifespan protocol, same law test_lifespan_seeds_the_type_
+    catalog_on_boot already holds — and against a lock even STRONGER than a pg_dump
+    would ever take (ACCESS EXCLUSIVE, held open in a second connection for the whole
+    test), so this can never pass by accident of a lock too weak to matter."""
+    import asyncio
+    import os
+    import time
+
+    os.environ["DATABASE_URL"] = pg_dsn
+    os.environ["REDIS_URL"] = redis_url
+
+    conn = await actions.pool.acquire()
+    tr = conn.transaction()
+    await tr.start()
+    await conn.execute("LOCK TABLE triggers IN ACCESS EXCLUSIVE MODE")
+    try:
+        app = create_app()  # own pool: exercises the exact lifespan a real boot runs
+        started = time.monotonic()
+        async with asyncio.timeout(10):
+            async with app.router.lifespan_context(app):
+                pass
+        elapsed = time.monotonic() - started
+        assert elapsed < 10  # comfortably inside project_triggers' own 2s lock_timeout
+    finally:
+        await tr.rollback()
+        await actions.pool.release(conn)
+
+
 async def test_object_card_title_uses_resolve_label_not_name_only(actions: Actions) -> None:
     """Task #97 workstream 3: _object_card (the watch/subscription card-preview
     endpoint) used to check ONLY the `name` property for its title — a Practice

@@ -33,9 +33,13 @@ async def _make_case(actions: Actions, budgets: dict) -> uuid.UUID:
         "INSERT INTO cases (name, owner, budgets) VALUES ('c','analyst:test',$1) RETURNING id",
         budgets,
     )
+    # ON CONFLICT DO NOTHING (migration 0068's own unique constraint on helper_id):
+    # this is a test-setup convenience, not the real projection — a second call
+    # inserting the same helper_id must never fail the test over an irrelevant detail.
     await actions.pool.execute(
         "INSERT INTO triggers (on_event, match, helper_id, enabled) "
-        "VALUES ('object_created', $1, 'telegram_channel_profile', true)",
+        "VALUES ('object_created', $1, 'telegram_channel_profile', true) "
+        "ON CONFLICT (helper_id) DO NOTHING",
         {"type": "TelegramChannel"},
     )
     return uuid.UUID(str(cid))

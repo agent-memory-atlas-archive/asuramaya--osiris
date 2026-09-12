@@ -19,7 +19,9 @@ from src.cli import (
     _collapse_resume_log,
     _composition_gaps,
     _find_repo_root,
+    _pg_dump_active,
     _real_install_user_units,
+    _real_wait_for_pg_dump,
     _run_install_script,
     _synthetic_automount_probe,
     _wait_for_health,
@@ -1850,6 +1852,79 @@ def test_alembic_head_reads_this_repos_real_migrations() -> None:
 
     repo_root = Path(__file__).resolve().parent.parent
     assert _alembic_head(repo_root) is not None
+
+
+# --- _real_wait_for_pg_dump: same bounded-retry shape (Thoth mail 10214, a live incident:
+# restarting straight into a pg_dump blocked the console at startup behind its own lock on
+# `triggers`) ------------------------------------------------------------------------------
+
+async def test_pg_dump_active_is_false_with_no_dump_running(actions: Actions) -> None:
+    assert await _pg_dump_active(actions.pool) is False
+
+
+async def test_wait_for_pg_dump_clear_on_first_try_never_sleeps() -> None:
+    calls = []
+
+    async def _probe(pool: object) -> bool:
+        calls.append(1)
+        return False
+
+    async def _no_sleep(_delay: float) -> None:
+        raise AssertionError("must never sleep when no pg_dump is running")
+
+    clear, waited = await _real_wait_for_pg_dump(None, probe=_probe, sleep=_no_sleep)
+    assert clear is True
+    assert waited == 0.0
+    assert len(calls) == 1
+
+
+async def test_wait_for_pg_dump_clears_after_one_retry() -> None:
+    attempts = [True, False]
+    slept: list[float] = []
+
+    async def _probe(pool: object) -> bool:
+        return attempts.pop(0)
+
+    async def _fake_sleep(delay: float) -> None:
+        slept.append(delay)
+
+    clear, waited = await _real_wait_for_pg_dump(None, probe=_probe, sleep=_fake_sleep)
+    assert clear is True
+    assert slept == [5.0]
+    assert waited == 5.0
+
+
+async def test_wait_for_pg_dump_gives_up_at_the_ceiling_and_reports_honestly() -> None:
+    """A genuinely long-running dump is still reported — the bound protects against
+    hanging a deploy forever, it must never hide a real, sustained wait."""
+    async def _always_active(pool: object) -> bool:
+        return True
+
+    slept: list[float] = []
+
+    async def _fake_sleep(delay: float) -> None:
+        slept.append(delay)
+
+    clear, waited = await _real_wait_for_pg_dump(
+        None, probe=_always_active, ceiling_secs=20.0, sleep=_fake_sleep)
+    assert clear is False
+    assert waited >= 20.0
+    assert slept == [5.0, 10.0, 20.0]  # 5+10=15 (<20, keep going), +20=35 (>=20, stop)
+
+
+async def test_wait_for_pg_dump_backoff_is_capped() -> None:
+    async def _always_active(pool: object) -> bool:
+        return True
+
+    slept: list[float] = []
+
+    async def _fake_sleep(delay: float) -> None:
+        slept.append(delay)
+
+    await _real_wait_for_pg_dump(
+        None, probe=_always_active, ceiling_secs=200.0, sleep=_fake_sleep)
+    assert slept == [5.0, 10.0, 20.0, 40.0, 60.0, 60.0, 60.0]  # doubles until 60
+    assert max(slept) == 60.0
 
 
 # --- _wait_for_smoke: a bounded retry-with-backoff, no real sleeping in tests ------------------
