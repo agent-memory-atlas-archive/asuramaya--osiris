@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
 from src.actions.core import Actions
 from src.orchestrator.charter import set_charter
 from src.orchestrator.migration_0060 import apply_migration_0060, plan_migration_0060
@@ -262,3 +263,39 @@ async def test_classification_laws_heartbeat_wires_through_to_apply_migration_00
 
     again = await classification_laws_heartbeat(ctx)  # idempotent, same as the sweep itself
     assert again == 0
+
+
+# ═══ OWNER RESOLUTION MEMOIZATION (thread cc82a8e7, classification_laws_heartbeat's own
+# heavy-sweep follow-up to 9150aec2): many open threads commonly share the SAME owner —
+# resolve_owner_seat must be called at most once per DISTINCT (owner, repo) pair within
+# one plan_migration_0060 call, never once per thread row ═════════════════════════════
+
+async def test_plan_migration_0060_memoizes_owner_resolution_per_distinct_owner(
+    actions: Actions, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ten threads share ONE already-compliant seat owner — resolve_owner_seat still
+    confirms that seat is live (its own docstring: an already-compliant `seat:<...>`
+    owner is still resolved, never skipped), but must pay that round trip ONCE for the
+    tick, not ten times."""
+    from src.orchestrator.owner_normalization import resolve_owner_seat as _real_resolve
+
+    seat_id = await _seat(actions, "M60MemoSeat")
+    for i in range(10):
+        await _thread(actions, f"m60-memo-thread-{i}", owner=seat_id)
+
+    calls: list[tuple[str, str | None]] = []
+
+    async def _counting_resolve_owner_seat(
+        pool: object, raw: str, *, project: str | None = None,
+    ) -> str | None:
+        calls.append((raw, project))
+        return await _real_resolve(pool, raw, project=project)
+
+    monkeypatch.setattr(
+        "src.orchestrator.owner_normalization.resolve_owner_seat",
+        _counting_resolve_owner_seat)
+
+    plan = await plan_migration_0060(actions.pool)
+
+    assert len(calls) == 1, f"expected exactly one resolve call, got {calls}"
+    assert plan["owner_resolved"] == []  # already compliant — nothing to write

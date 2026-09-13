@@ -97,7 +97,19 @@ def _kind_for_evidence(evidence_class: str | None) -> str:
 
 async def plan_migration_0060(pool: asyncpg.Pool) -> dict[str, Any]:
     """DRY RUN -- never writes. Every open Thread classified against all three laws at
-    once (one scan, one row set)."""
+    once (one scan, one row set).
+
+    OWNER RESOLUTION IS MEMOIZED PER (owner, repo) WITHIN THIS ONE CALL (thread
+    cc82a8e7, classification_laws_heartbeat's own heavy-sweep follow-up to 9150aec2):
+    resolve_owner_seat/_coordinating_seat_for_project each pay a live DB round trip
+    even for an ALREADY-compliant `seat:<...>` owner (confirming it is still active),
+    so the naive per-row loop paid one round trip PER THREAD — 262 open threads,
+    measured live, but only 35 DISTINCT owner values among them. Caching within this
+    one call turns that into ~35-40 round trips instead, with ZERO staleness risk: every
+    distinct owner is still freshly re-resolved every single tick, nothing here is
+    skipped or trusted stale across ticks — this is NOT the same shape as skipping
+    already-compliant rows outright, which would blind the law to a seat that goes
+    inactive between ticks, exactly the drift this migration exists to catch."""
     from src.orchestrator.owner_normalization import (
         _coordinating_seat_for_project,
         resolve_owner_seat,
@@ -110,16 +122,25 @@ async def plan_migration_0060(pool: asyncpg.Pool) -> dict[str, Any]:
     kind_assigned: list[dict[str, Any]] = []
     kind_reclassified: list[dict[str, Any]] = []
     to_expire: list[dict[str, Any]] = []
+    _resolved_cache: dict[tuple[str, str | None], str | None] = {}
 
     for row in rows:
         canonical, repo = row["canonical"], row["repo"]
         owner = (row["owner"] or "").strip()
 
-        # (1) OWNER LAW
+        # (1) OWNER LAW — memoized by (owner, repo): see this function's own docstring.
         if owner:
-            new_owner = await resolve_owner_seat(pool, owner, project=repo)
+            cache_key = (owner, repo)
+            if cache_key not in _resolved_cache:
+                _resolved_cache[cache_key] = await resolve_owner_seat(
+                    pool, owner, project=repo)
+            new_owner = _resolved_cache[cache_key]
         elif repo:
-            new_owner, _reason = await _coordinating_seat_for_project(pool, repo)
+            cache_key = ("", repo)
+            if cache_key not in _resolved_cache:
+                resolved, _reason = await _coordinating_seat_for_project(pool, repo)
+                _resolved_cache[cache_key] = resolved
+            new_owner = _resolved_cache[cache_key]
         else:
             new_owner = None
         already_compliant = owner == "operator" or owner.startswith("seat:")

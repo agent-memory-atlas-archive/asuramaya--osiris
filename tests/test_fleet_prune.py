@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
 from src.actions.core import Actions
 from src.orchestrator.fleet_prune import prune_dry_run, prune_execute
 from src.orchestrator.mounts import save_mount
@@ -185,3 +186,88 @@ async def test_swarm_root_retired_flag_augments_bulk_fold_swarm(
 
     mine = [r for r in out["buckets"]["bulk_fold_swarm"] if r["dupe"] == "agent:pa225001"]
     assert mine and mine[0].get("swarm_root_retired") is True
+
+
+# ═══ include_reconcile=False (thread cc82a8e7, classification_laws_heartbeat's own
+# heavy-sweep follow-up to 9150aec2): the caller that never reads fleet_reconcile's own
+# five buckets should never pay for computing them ═════════════════════════════════════
+
+async def test_include_reconcile_false_skips_reconcile_dry_run_entirely(
+    actions: Actions, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dominant cost fleet_prune's own heartbeat sub-sweep pays every tick for
+    buckets it never acts on — `include_reconcile=False` must never call
+    `fleet_reconcile.reconcile_dry_run` at all, not just discard its result."""
+    from src.orchestrator import fleet_prune as fp
+
+    called = False
+
+    async def _boom(*args: object, **kwargs: object) -> dict[str, Any]:
+        nonlocal called
+        called = True
+        raise AssertionError("reconcile_dry_run must not be called when "
+                              "include_reconcile=False")
+
+    monkeypatch.setattr(fp.fleet_reconcile, "reconcile_dry_run", _boom)
+
+    out = await prune_dry_run(actions.pool, include_reconcile=False)
+
+    assert called is False
+    assert out["reconciled"] is False
+    for bucket in ("bulk_fold_swarm", "rollup_office_remount", "drop_ephemeral_test_cwd",
+                  "ghost_gap", "leave_for_human"):
+        assert out["buckets"][bucket] == []
+
+
+async def test_include_reconcile_defaults_true_for_every_other_caller(
+    actions: Actions, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default must stay `True` — the MCP tool, the CLI door, and every existing
+    caller keep computing the full picture unless they explicitly opt out."""
+    from src.orchestrator import fleet_prune as fp
+
+    calls = 0
+    real = fp.fleet_reconcile.reconcile_dry_run
+
+    async def _counting(*args: object, **kwargs: object) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(fp.fleet_reconcile, "reconcile_dry_run", _counting)
+
+    out = await prune_dry_run(actions.pool)
+
+    assert calls == 1
+    assert out["reconciled"] is True
+
+
+async def test_prune_execute_include_reconcile_false_still_acts_on_its_two_buckets(
+    actions: Actions, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`include_reconcile=False` must change NOTHING about what prune_execute actually
+    acts on — dead_transcript still drops, unclaimed_body still binds."""
+    from src.orchestrator import fleet_prune as fp
+
+    async def _boom(*args: object, **kwargs: object) -> dict[str, Any]:
+        raise AssertionError("must not be called")
+
+    monkeypatch.setattr(fp.fleet_reconcile, "reconcile_dry_run", _boom)
+
+    p = actions.pool
+    live_dir = tmp_path / "jobs" / "cccccccc"
+    gone_dir = tmp_path / "jobs" / "dddddddd"  # never created — a dead anchor
+    live_dir.mkdir(parents=True)
+    await _mk_agent(actions, "agent:increcon-live")
+    await _mk_agent(actions, "agent:increcon-gone")
+    await save_mount(p, job_dir=str(live_dir), agent_id="agent:increcon-live",
+                     project="prunehouse", cwd="/w/live", model=None, session_key=None)
+    await save_mount(p, job_dir=str(gone_dir), agent_id="agent:increcon-gone",
+                     project="prunehouse", cwd="/w/gone", model=None, session_key=None)
+
+    out = await prune_execute(actions, actor="test", execute=True,
+                              live_bodies_by_cwd=_bodies(), include_reconcile=False)
+
+    dropped = {d["job_dir"] for d in out["dropped_transcripts"] if "error" not in d}
+    assert str(gone_dir) in dropped
+    assert out["reconciled"] is False
