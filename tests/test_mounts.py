@@ -2483,6 +2483,68 @@ async def test_registry_census_is_blind_not_empty_on_a_harness_read_failure(
     assert out["rowless"] == []
 
 
+# ═══ apply_boot_time_fleet_pass — REBOOT SURVIVAL, the fleet half (thread bc6a5d455da2):
+# a resumed body's stale mount row must not wait for its own next MCP call to refresh ═══
+
+async def test_boot_time_fleet_pass_refreshes_a_matched_bodys_stale_mount(
+    actions: Actions,
+) -> None:
+    p = actions.pool
+    await mounts.save_mount(p, job_dir="/x/jobs/bootres1", agent_id="agent:bootres1",
+                            project="osiris", cwd="/code/osiris", model=None,
+                            session_key="whisper:bootres1")
+    await p.execute(
+        "UPDATE agent_mounts SET last_seen = now() - interval '2 hours' "
+        "WHERE agent_id='agent:bootres1'")
+
+    async def _census(_pool: object) -> dict[str, Any]:
+        return {"blind": False, "matched": [
+            {"agent_id": "agent:bootres1", "job_dir": "/x/jobs/bootres1", "pid": 555},
+        ], "rowless": []}
+
+    report = await mounts.apply_boot_time_fleet_pass(actions, census_fn=_census)
+    assert report["refreshed_count"] == 1
+    assert report["rowless_count"] == 0
+    row = await p.fetchrow(
+        "SELECT last_seen FROM agent_mounts WHERE job_dir='/x/jobs/bootres1'")
+    assert row is not None
+    assert (datetime.now(UTC) - row["last_seen"]) < timedelta(minutes=1)
+    stamped = await p.fetchval(
+        "SELECT a.value #>> '{}' FROM current_assertions a JOIN objects o "
+        "ON o.id=a.object_id WHERE o.canonical='agent:bootres1' "
+        "AND a.name='boot_resumed_at'")
+    assert stamped is not None
+
+
+async def test_boot_time_fleet_pass_names_a_rowless_body_never_binds_it(
+    actions: Actions,
+) -> None:
+    async def _census(_pool: object) -> dict[str, Any]:
+        return {"blind": False, "matched": [], "rowless": [
+            {"session_id": "ghostbody-1111-2222-3333-444444444444", "pid": 777,
+             "proc_cwd": "/w/ghost"},
+        ]}
+
+    report = await mounts.apply_boot_time_fleet_pass(actions, census_fn=_census)
+    assert report["refreshed_count"] == 0
+    assert report["rowless_count"] == 1
+    assert report["rowless"][0]["session_id"] == "ghostbody-1111-2222-3333-444444444444"
+    # never bound — no agent_mounts row minted for it
+    row = await actions.pool.fetchrow(
+        "SELECT 1 FROM agent_mounts WHERE job_dir LIKE '%ghostbody%'")
+    assert row is None
+
+
+async def test_boot_time_fleet_pass_reports_blind_not_empty(actions: Actions) -> None:
+    async def _census(_pool: object) -> dict[str, Any]:
+        return {"blind": True}
+
+    report = await mounts.apply_boot_time_fleet_pass(actions, census_fn=_census)
+    assert report["blind"] is True
+    assert report["refreshed"] == []
+    assert report["rowless"] == []
+
+
 async def test_the_registry_census_mcp_tool_wraps_the_orchestrator(
     actions: Actions, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

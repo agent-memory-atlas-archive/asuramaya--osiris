@@ -235,6 +235,18 @@ async def startup(ctx: dict[str, Any]) -> None:
                     await check_and_resolve_clean_boot(pool, service="osiris-worker")
         except Exception as exc:  # noqa: BLE001 — the guard must never become the thing it guards against
             _log.warning("deploy_guard reboot check failed at worker boot: %r", exc)
+        # REBOOT SURVIVAL, the fleet half (thread bc6a5d455da2): the 17:26 CDT reboot
+        # resumed every seat body within five minutes but osiris's own agent_mounts rows
+        # stayed frozen at their pre-reboot last_seen until each body's own next call — a
+        # SEPARATE try/except, same isolation every independent boot-time check here gets.
+        try:
+            from src.orchestrator.mounts import apply_boot_time_fleet_pass
+
+            pass_report = await apply_boot_time_fleet_pass(actions)
+            if pass_report.get("refreshed_count") or pass_report.get("rowless_count"):
+                _log.info("boot-time fleet pass: %s", pass_report)
+        except Exception as exc:  # noqa: BLE001 — the guard must never become the thing it guards against
+            _log.warning("boot-time fleet pass failed: %r", exc)
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:

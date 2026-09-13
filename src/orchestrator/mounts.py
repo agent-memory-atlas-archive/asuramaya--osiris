@@ -305,13 +305,79 @@ async def registry_census(
         candidates = by_key.get(v["job_dir_key"], [])
         if candidates:
             matched.append({**v, "agent_id": candidates[0]["agent_id"],
-                            "project": candidates[0]["project"]})
+                            "project": candidates[0]["project"],
+                            "job_dir": candidates[0]["job_dir"]})
         else:
             rowless.append(v)
     return {"blind": False, "verified": verified, "matched": matched, "rowless": rowless,
             "verified_count": len(verified), "matched_count": len(matched),
             "rowless_count": len(rowless), "pulse_live": pulse_live,
             "pulse_live_count": len(pulse_live)}
+
+
+async def apply_boot_time_fleet_pass(
+    actions: Actions, *, census_fn: Any = None, actor: str = "boot-fleet-pass",
+) -> dict[str, Any]:
+    """REBOOT SURVIVAL, the fleet half (thread bc6a5d455da2, operator ruling 2026-09-13
+    "it has to survive and recover reboot by itself"): the 17:26 CDT reboot's own live
+    specimen — the harness daemon resumed every seat body within five minutes, but
+    osiris's own side did nothing to notice. `agent_mounts.last_seen` for a resumed body
+    stayed frozen at its PRE-reboot value until that body's own next MCP call — every
+    liveness reader (agent_liveness, seat_occupancy, fleet()) read every resumed seat as
+    COLD for however long it took that body to next speak, even though the harness
+    itself already confirmed the body alive again.
+
+    Runs `registry_census` (the same harness+/proc cross-check `fleet_prune`'s own
+    `_unclaimed_bodies` already trusts) and, for every `matched` row (a live body the
+    census already ties to an EXISTING agent_mounts row), refreshes that row's
+    `last_seen` to now() and stamps a durable `boot_resumed_at` property on the Agent —
+    evidence this specific generation was independently confirmed live at THIS moment,
+    never overwritten, so a later investigation can see exactly when a resumed body was
+    first noticed rather than inferring it from a mount row's own bumped timestamp alone.
+
+    `rowless` bodies (a verified live body with NO agent_mounts row at all) are NAMED
+    here, never bound — `fleet_prune`'s own `unclaimed_body` bucket already resolves and
+    binds these via `tree_seat_hint` on its own 15-minute cadence (classification_laws_
+    heartbeat); duplicating that resolve-then-bind logic here would be a second copy of
+    the same mechanism for a population the existing sweep already reaches within 15
+    minutes regardless. A blind census (the harness registry read itself failed) reports
+    nothing rather than guessing — the same "could not look" law every reader of this
+    census already holds to.
+
+    Called BOTH at worker startup (arq_worker.py's own `startup()`, once per process
+    boot — the automatic fleet-wide side) and on demand via `osiris boot-status
+    --fleet` (an operator wanting to check right now, without waiting for the next
+    worker restart) — the SAME function, never two copies."""
+    census_fn = census_fn or registry_census
+    census = await census_fn(actions.pool)
+    if census.get("blind"):
+        return {"blind": True, "refreshed": [], "rowless": [],
+                "note": "the harness registry read failed — cannot census, not empty"}
+    stamped_at = datetime.now(UTC)
+    refreshed: list[dict[str, Any]] = []
+    for m in census["matched"]:
+        agent_id, job_dir = m["agent_id"], m["job_dir"]
+        await actions.pool.execute(
+            "UPDATE agent_mounts SET last_seen=now() WHERE job_dir=$1", job_dir)
+        agent_obj = await actions.create_or_find_object("Agent", agent_id, actor)
+        await actions.assert_property(
+            agent_obj, "boot_resumed_at", stamped_at.isoformat(), actor, stamped_at,
+            _CONF, evidence_class=_EC)
+        refreshed.append({"agent_id": agent_id, "job_dir": job_dir, "pid": m.get("pid")})
+    rowless = [
+        {"session_id": r["session_id"], "pid": r.get("pid"),
+         "cwd": r.get("proc_cwd") or r.get("harness_cwd")}
+        for r in census["rowless"]
+    ]
+    return {
+        "blind": False, "refreshed": refreshed, "rowless": rowless,
+        "refreshed_count": len(refreshed), "rowless_count": len(rowless),
+        "note": "REBOOT SURVIVAL, the fleet half — every registry_census-verified body "
+                "already tied to a mount row had its last_seen refreshed and a "
+                "boot_resumed_at property stamped; a body with no mount row at all is "
+                "named here, not bound (fleet_prune's own unclaimed_body bucket does "
+                "that, on its own cadence).",
+    }
 
 
 async def pulse_mount(pool: asyncpg.Pool, *, agent_id: str) -> dict[str, Any]:

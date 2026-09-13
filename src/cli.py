@@ -448,7 +448,9 @@ async def cmd_smoke_chaos(*, pool: asyncpg.Pool | None = None) -> int:
 
 # --- boot-status -------------------------------------------------------------------------------
 
-async def cmd_boot_status(*, pool: asyncpg.Pool | None = None, as_json: bool = False) -> int:
+async def cmd_boot_status(
+    *, pool: asyncpg.Pool | None = None, as_json: bool = False, fleet: bool = False,
+) -> int:
     """Report-only rollout check (thread 0e5bae06, #84) — names every active seat NOT
     carrying a compiled managed section, classified by why, same shape as
     `composition_gap_notes`: a build isn't done when its acceptance test passes, it's
@@ -459,7 +461,60 @@ async def cmd_boot_status(*, pool: asyncpg.Pool | None = None, as_json: bool = F
     `as_json` (Thoth dispatch 6746, specimen A): the CLI's own top-level help claims
     "Every read verb takes --json" for this verb's own displayed group — this used to be
     false. `gaps` is already `list[dict[str, str]]`, trivially JSON-serializable; no
-    second data shape invented for the machine path."""
+    second data shape invented for the machine path.
+
+    `fleet` (thread bc6a5d455da2, REBOOT SURVIVAL's fleet half): a SEPARATE report mode,
+    never blended with the rollout-gap check above — swaps to `mounts.
+    apply_boot_time_fleet_pass`, the SAME function the worker calls once at its own
+    startup, so an operator can run the identical boot-time reconciliation on demand
+    without waiting for (or forcing) a worker restart. Not a dry run: refreshing a
+    registry_census-verified live body's own mount row and stamping boot_resumed_at is
+    purely additive and safe by construction (the same class of always-on, no-kill-
+    switch-needed write classification_laws_heartbeat's own siblings already are) —
+    exits 1 only when a live body has NO mount row at all (rowless — named, never
+    bound, see that function's own docstring for why), 0 otherwise."""
+    if fleet:
+        from src.orchestrator.mounts import apply_boot_time_fleet_pass
+
+        owns_pool = pool is None
+        if pool is None:
+            from src.config.dev_env import apply_dev_fallback
+            from src.config.settings import get_settings
+            from src.db.pool import create_pool
+
+            apply_dev_fallback()
+            settings = get_settings()
+            try:
+                pool = await create_pool(
+                    settings.database_url, min_size=1, max_size=4,
+                    application_name="osiris-cli:boot-status-fleet")
+            except Exception as exc:  # noqa: BLE001 - the CLI boundary: report, no raw traceback
+                print(f"osiris boot-status --fleet: could not reach postgres at "
+                      f"{settings.database_url} — {exc}. Set DATABASE_URL, or start the "
+                      "dev instance.", file=sys.stderr)
+                return 1
+        try:
+            from src.actions.core import Actions
+            report = await apply_boot_time_fleet_pass(Actions(pool))
+        finally:
+            if owns_pool:
+                await pool.close()
+        if as_json:
+            from src import cli_render as render
+            render.emit(report, as_json=True)
+            return 1 if report.get("rowless_count") else 0
+        if report.get("blind"):
+            print("boot --fleet: the harness registry read failed — cannot census")
+            return 1
+        for r in report["refreshed"]:
+            print(f"refreshed: {r['agent_id']} (job_dir {r['job_dir']})")
+        for r in report["rowless"]:
+            print(f"no mount row: session {r['session_id']} pid={r.get('pid')} "
+                  f"cwd={r.get('cwd')}")
+        if not report["refreshed"] and not report["rowless"]:
+            print("boot --fleet: every live body already had a fresh mount row")
+        return 1 if report.get("rowless_count") else 0
+
     from src.orchestrator.boot_compiler import boot_rollout_gap_notes, boot_rollout_gaps
 
     owns_pool = pool is None
@@ -3520,6 +3575,31 @@ async def cmd_send(
                   f"{exc}. Set DATABASE_URL, or start the dev instance.", file=sys.stderr)
             return 1
     try:
+        # THE TRIGGER-DARK FALSE NEGATIVE (thread bc6a5d455da2, REBOOT SURVIVAL's fleet
+        # half, Thoth mail 10225/10253): dispatch_dm/dispatch_broadcast both default to
+        # `get_settings()` — a bare env read — when no `settings=` is given. The worker's
+        # own systemd unit carries an environment drop-in setting OSIRIS_TRIGGER_ENABLED;
+        # a bare `osiris send` run from an interactive shell has no such drop-in, so this
+        # door reported "trigger-dark" during the 2026-09-13 MCP outage even though the
+        # operator's actual stored toggle (settings table, key wake.trigger.enabled) was
+        # on. `wake.trigger.enabled` is registered effect='next_tick' (settings_registry.
+        # py), so `settings_with_overlay` — opt-in to 'immediate' fields ONLY, a
+        # DELIBERATE risk boundary per that module's own docstring citing Thoth's own
+        # mail 10040 — never surfaces it; widening that shared filter would touch every
+        # one of its other callers for a fix this one door needs. `current_stored_value`
+        # is the narrow escape hatch instead: read this ONE key's current stored value
+        # directly, bypass `effect` filtering entirely, and build the Settings object
+        # this door's own dispatch calls pass in explicitly.
+        from src.config.settings import get_settings as _get_settings
+        from src.orchestrator.settings_service import current_stored_value
+
+        base_settings = _get_settings()
+        stored_trigger = await current_stored_value(pool, "wake.trigger.enabled")
+        dispatch_settings = (
+            base_settings if stored_trigger is None
+            else base_settings.model_copy(
+                update={"osiris_trigger_enabled": bool(stored_trigger)}))
+
         prior: list[dict[str, Any]] = []
         if want_prior_art and (grade == "ask" or to_agent):
             from src.mcp_server import _surface_prior_art
@@ -3558,7 +3638,8 @@ async def cmd_send(
                 try:
                     from src.orchestrator.trigger import dispatch_dm
                     out["dispatch"] = await dispatch_dm(
-                        pool, addressee=res["to_agent"], msg_id=res["id"], sender=actor)
+                        pool, addressee=res["to_agent"], msg_id=res["id"], sender=actor,
+                        settings=dispatch_settings)
                 except Exception as exc:  # noqa: BLE001 - the send already committed; confess
                     out["dispatch"] = {"mode": "deferred",
                                        "detail": f"immediate dispatch failed ({exc}) — "
@@ -3579,7 +3660,8 @@ async def cmd_send(
                 try:
                     from src.orchestrator.trigger import dispatch_broadcast
                     out["dispatch"] = await dispatch_broadcast(
-                        pool, project=dest, msg_id=res["id"], sender=actor)
+                        pool, project=dest, msg_id=res["id"], sender=actor,
+                        settings=dispatch_settings)
                 except Exception as exc:  # noqa: BLE001 - the send already committed; confess
                     out["dispatch"] = {"mode": "deferred",
                                        "detail": f"immediate dispatch failed ({exc}) — "
@@ -5695,6 +5777,13 @@ def _build_parser() -> argparse.ArgumentParser:
                    epilog="example: osiris boot-status")
     p_boot_status.add_argument("--json", action="store_true", dest="as_json",
                                help="machine-readable: one compact JSON line")
+    p_boot_status.add_argument("--fleet", action="store_true",
+                               help="a separate report: registry_census-verified live "
+                                    "bodies get their mount row refreshed and a "
+                                    "boot_resumed_at stamp; a body with no mount row at "
+                                    "all is named. Runs the SAME pass the worker runs "
+                                    "once at its own startup — exit 1 if any body has "
+                                    "no mount row")
 
     p_lint = sub.add_parser("lint", description=_d(
         "the graph audits itself — headless mirror of the graph_lint MCP tool/CMD-K "
@@ -6820,7 +6909,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "smoke":
         return asyncio.run(cmd_smoke(chaos=args.chaos, as_json=args.as_json))
     if args.command == "boot-status":
-        return asyncio.run(cmd_boot_status(as_json=args.as_json))
+        return asyncio.run(cmd_boot_status(as_json=args.as_json, fleet=args.fleet))
     if args.command == "lint":
         return asyncio.run(cmd_lint(
             check=args.check, project=args.project, as_json=args.as_json,
