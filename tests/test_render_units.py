@@ -206,6 +206,43 @@ def test_render_skips_the_daemon_lane_when_no_user_dir_exists(tmp_path: Path) ->
     assert not (out / "user").exists()
 
 
+# --- the reboot-survival guard (Thoth's ruling, mail 10247/10261) -------------------
+
+def test_looks_like_a_real_unit_requires_description_and_execstart() -> None:
+    from scripts.render_units import _looks_like_a_real_unit
+
+    assert _looks_like_a_real_unit(
+        "[Unit]\nDescription=fake\n\n[Service]\nExecStart=/bin/true\n")
+    assert not _looks_like_a_real_unit("[Unit]\n\n[Service]\nExecStart=/bin/true\n")
+    assert not _looks_like_a_real_unit("[Unit]\nDescription=fake\n\n[Service]\n")
+    assert not _looks_like_a_real_unit("[Unit]\nDescription=\n\n[Service]\nExecStart=\n")
+
+
+def test_render_falls_back_to_the_shipped_file_when_a_substitution_breaks_the_unit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A substitution function that corrupts ExecStart= (a bad regex match, an
+    unexpected value shape — the exact failure mode the guard exists for) must never
+    reach the installed file; the shipped original is used instead, logged to stderr."""
+    import scripts.render_units as ru
+
+    deploy = tmp_path / "deploy"
+    user_dir = deploy / "user"
+    user_dir.mkdir(parents=True)
+    _write_daemon_unit(user_dir, "osiris-console", memory_max="512M")
+    original = (user_dir / "osiris-console.service").read_text()
+
+    def _corrupt(text: str, value: object) -> str:
+        return "\n".join(ln for ln in text.splitlines() if not ln.startswith("ExecStart="))
+
+    monkeypatch.setitem(ru._DAEMON_SERVICE_SUBS, "osiris-console.service",
+                        [("daemon.osiris_console.memory_max", _corrupt)])
+    out = tmp_path / "out"
+    n = render(deploy, out, {"daemon.osiris_console.memory_max": "1G"})
+    assert n == 0  # the fallback is byte-identical to the shipped file — not a real render
+    assert (out / "user" / "osiris-console.service").read_text() == original
+
+
 # --- the one async hop --------------------------------------------------------------
 
 async def test_configured_values_reads_the_real_settings_table(

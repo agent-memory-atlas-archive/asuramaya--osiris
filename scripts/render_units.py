@@ -17,7 +17,14 @@ passes through render, never re-templated wholesale" discipline the backup lane 
 used: `_sub_oncalendar` (the timer lane, reused verbatim), `_sub_memory_max` (in-place
 replace when a MemoryMax= line exists, insert one before [Install] when adding a
 genuinely new cap, drop the line when the value is empty), and two CLI-arg regex
-substitutions for `deploy/user/osiris-{pulse,console}.service`'s own ExecStart= line."""
+substitutions for `deploy/user/osiris-{pulse,console}.service`'s own ExecStart= line.
+
+THE REBOOT-SURVIVAL GUARD (Thoth's ruling, mail 10247/10261): a rendered daemon
+`.service` is only installed when it still has a real `[Unit]` `Description=` and a
+non-empty `ExecStart=` (`_looks_like_a_real_unit`) — a stub or a substitution gone wrong
+must never install a unit that starts nothing (or the wrong thing). A unit that fails the
+check falls back to the shipped file untouched, logged to stderr, same fails-open
+discipline as a settings-read hiccup."""
 from __future__ import annotations
 
 import argparse
@@ -76,6 +83,25 @@ def _sub_console_port(text: str, value: Any) -> str:
     if value is None:
         return text
     return re.sub(r"--port \d+", f"--port {int(value)}", text)
+
+
+def _looks_like_a_real_unit(text: str) -> bool:
+    """The reboot-survival guard (Thoth's ruling, mail 10247/10261): a rendered unit
+    is never installed unless it still has a real `[Unit]` `Description=` line and a
+    non-empty `ExecStart=` — the two lines every substitution function above could, in
+    principle, mangle (a bad regex match, an unexpected value shape) into a unit that
+    starts the wrong process or none at all. Cheap line-scan, not a full systemd-unit
+    parser — this only needs to catch "the substitution broke the file," not validate
+    every field."""
+    has_description = any(
+        line.startswith("Description=") and line.removeprefix("Description=").strip()
+        for line in text.splitlines()
+    )
+    has_execstart = any(
+        line.startswith("ExecStart=") and line.removeprefix("ExecStart=").strip()
+        for line in text.splitlines()
+    )
+    return has_description and has_execstart
 
 
 # timer unit (relative to deploy/) -> the settings key controlling its OnCalendar= line.
@@ -157,6 +183,11 @@ def render(deploy_dir: Path, out_dir: Path, values: dict[str, Any]) -> int:
             new_text = text
             for key, fn in subs:
                 new_text = fn(new_text, values.get(key))
+            if not _looks_like_a_real_unit(new_text):
+                print(f"render_units: rendered {name} is missing a Description= or a "
+                      "real ExecStart= — installing the shipped file untouched instead",
+                      file=sys.stderr)
+                new_text = text
             if new_text != text:
                 rendered += 1
             (out_user_dir / name).write_text(new_text)
