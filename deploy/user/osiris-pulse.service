@@ -13,8 +13,12 @@
 # 3-infra) — none of these are hand-authored or hand-copied any more.
 [Unit]
 Description=Osiris heartbeat (developer-persona pulse; read-only over local repos)
-After=network-online.target
+After=network-online.target docker.service
 Wants=network-online.target
+# REBOOT SURVIVAL (thread 194eac83, operator ruling aaa8e841): disables systemd's own
+# default 5-tries/10s start-limit so a slow-to-answer dependency after a cold boot never
+# permanently strands a unit that would otherwise self-heal via Restart=always.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -29,6 +33,11 @@ Environment=REDIS_URL=redis://127.0.0.1:6396/0
 # Repos the developer-pulse watches (read-only). Comma-separated absolute paths.
 # Leave empty to watch nothing. Example: %h/code/osiris,%h/code/other
 Environment=OSIRIS_DEV_REPOS=%h/code/osiris
+# REBOOT SURVIVAL (thread 194eac83): After=docker.service orders unit start correctly, but
+# docker's own container health lags its own systemd unit becoming active — this blocks
+# activation until postgres actually answers on :5601 rather than racing it (/dev/tcp is a
+# bash builtin, no extra binary dependency).
+ExecStartPre=/bin/bash -c 'until (echo > /dev/tcp/127.0.0.1/5601) 2>/dev/null; do sleep 1; done'
 # Sense HEAD every 600s. The digest/staleness verdict is computed on READ (the pulse-digest
 # lens), so a dead loop is visible in the digest even if this unit stops (the dead-man's-switch).
 ExecStart=%h/code/osiris/.venv/bin/python -m src.orchestrator.pulse --watch 600

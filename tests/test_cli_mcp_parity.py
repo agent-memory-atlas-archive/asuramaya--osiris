@@ -232,6 +232,11 @@ CLI_ONLY_PARAMS = {
         "port, own testcontainer DB/Redis) — so the crash-replay mechanism itself is now "
         "exercised for real in the suite; neither a CLI param nor an MCP tool, so this "
         "table's own claim is untouched by it.",
+    ("smoke", "reboot"): "REBOOT SURVIVAL (thread 194eac83, operator ruling aaa8e841): "
+        "restarts every real daemon unit in dependency order and asserts each port/the "
+        "worker heartbeat answers — same operator/manager-hand-only class as `chaos` "
+        "directly above (every worker charter says 'you NEVER restart services'), "
+        "deliberately unreachable from any MCP tool a seat could call mid-turn.",
     ("fleet", "as_json"): "a PRESENTATION flag, not an act: --json picks the compact "
         "one-line machine render over the human one at the terminal boundary "
         "(src/cli_render.emit). An MCP tool ALREADY returns structured data to its "

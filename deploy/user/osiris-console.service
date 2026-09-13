@@ -12,8 +12,12 @@
 # 3-infra) — it is no longer hand-authored or hand-copied.
 [Unit]
 Description=Osiris console (read-only membrane lens + console; :8011)
-After=network-online.target
+After=network-online.target docker.service
 Wants=network-online.target
+# REBOOT SURVIVAL (thread 194eac83, operator ruling aaa8e841): disables systemd's own
+# default 5-tries/10s start-limit so a slow-to-answer dependency after a cold boot never
+# permanently strands a unit that would otherwise self-heal via Restart=always.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -24,6 +28,11 @@ WorkingDirectory=%h/code/osiris
 # recognize straight into server_settings (connect_utils.py), so no code change was needed.
 Environment=DATABASE_URL=postgresql://osiris:osiris@127.0.0.1:5601/osiris?application_name=osiris-console
 Environment=REDIS_URL=redis://127.0.0.1:6396/0
+# REBOOT SURVIVAL (thread 194eac83): After=docker.service orders unit start correctly, but
+# docker's own container health lags its own systemd unit becoming active — this blocks
+# activation until postgres actually answers on :5601 rather than racing it (/dev/tcp is a
+# bash builtin, no extra binary dependency).
+ExecStartPre=/bin/bash -c 'until (echo > /dev/tcp/127.0.0.1/5601) 2>/dev/null; do sleep 1; done'
 # --factory: uvicorn calls create_app() (which builds its OWN pool + lifespan), the self-standing
 # form of the app; the module-level `app` is the same surface for the /opt system unit.
 ExecStart=%h/code/osiris/.venv/bin/uvicorn --factory src.api.app:create_app --host 127.0.0.1 --port 8011

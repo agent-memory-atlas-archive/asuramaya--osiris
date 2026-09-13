@@ -325,13 +325,20 @@ def diff_tool_lists(before: dict[str, str], after: dict[str, str]) -> list[str]:
            + [f"~{n} changed" for n in changed])
 
 
-async def cmd_smoke(*, chaos: bool = False, as_json: bool = False) -> int:
-    """`as_json` (Thoth dispatch 6746, specimen A): never chaos's own path — `--chaos`
-    runs a longer-lived, separate probe (`cmd_smoke_chaos`) with its own text-only
-    receipt, untouched here; the ordinary probe's `fails`/`warnings` are already
-    `list[str]`, trivially JSON-serializable."""
+async def cmd_smoke(
+    *, chaos: bool = False, reboot: bool = False, as_json: bool = False,
+) -> int:
+    """`as_json` (Thoth dispatch 6746, specimen A): never chaos's OR reboot's own path —
+    `--chaos` and `--reboot` each run a longer-lived, separate probe with their own
+    text-only receipt, untouched here; the ordinary probe's `fails`/`warnings` are
+    already `list[str]`, trivially JSON-serializable.
+
+    `reboot` (REBOOT SURVIVAL, thread 194eac83): see `cmd_smoke_reboot`'s own docstring —
+    a REAL restart of every daemon in dependency order, never run automatically."""
     if chaos:
         return await cmd_smoke_chaos()
+    if reboot:
+        return await cmd_smoke_reboot()
     fails, warnings = await _run_smoke_probes_full()
     if as_json:
         from src import cli_render as render
@@ -450,6 +457,7 @@ async def cmd_smoke_chaos(*, pool: asyncpg.Pool | None = None) -> int:
 
 async def cmd_boot_status(
     *, pool: asyncpg.Pool | None = None, as_json: bool = False, fleet: bool = False,
+    units: bool = False,
 ) -> int:
     """Report-only rollout check (thread 0e5bae06, #84) — names every active seat NOT
     carrying a compiled managed section, classified by why, same shape as
@@ -472,7 +480,15 @@ async def cmd_boot_status(
     purely additive and safe by construction (the same class of always-on, no-kill-
     switch-needed write classification_laws_heartbeat's own siblings already are) —
     exits 1 only when a live body has NO mount row at all (rowless — named, never
-    bound, see that function's own docstring for why), 0 otherwise."""
+    bound, see that function's own docstring for why), 0 otherwise.
+
+    `units` (REBOOT SURVIVAL, the units half, thread 194eac83, operator ruling aaa8e841):
+    an ADDITIVE, entirely separate axis — see `_cmd_boot_status_units`'s own docstring.
+    No pool needed, so this branches BEFORE the pool-connect block below; a different
+    keyword param than any `--fleet`-shaped extension this verb may also grow elsewhere,
+    on purpose, so two independent report axes over the same CLI verb never collide."""
+    if units:
+        return await _cmd_boot_status_units(as_json=as_json)
     if fleet:
         from src.orchestrator.mounts import apply_boot_time_fleet_pass
 
@@ -1920,6 +1936,120 @@ async def _real_restart_services(units: list[str]) -> tuple[int, str]:
     return proc.returncode or 0, out.decode(errors="replace")
 
 
+# --- smoke --reboot: REBOOT SURVIVAL's own drill (thread 194eac83, operator ruling aaa8e841) --
+
+# Dependency order: boot-heal repairs unit drift first (never blocks the daemons — it
+# carries no Requires=, only Before= — but restarting it FIRST here mirrors what a real
+# boot does), then the daemons whose own :5601 ExecStartPre wait already makes them
+# tolerant of postgres answering late.
+_REBOOT_UNITS_ORDER = (
+    "osiris-boot-heal", "osiris-mcp", "osiris-worker", "osiris-console", "osiris-manager",
+)
+
+
+def _port_open_probe(host: str, port: int) -> Callable[[], Awaitable[bool]]:
+    """A zero-arg bool probe for `_wait_for_health`'s own generic bounded-backoff poll —
+    reused here rather than a second poll loop, parametrized to a bare TCP connect
+    instead of console's own /health GET. False on ANY failure (refused, timed out) —
+    not up yet, same discipline `_health_probe` already holds."""
+    async def _probe() -> bool:
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=2.0)
+        except (OSError, TimeoutError):
+            return False
+        writer.close()
+        with contextlib.suppress(OSError):
+            await writer.wait_closed()
+        return True
+    return _probe
+
+
+def _worker_heartbeat_probe(
+    pool: asyncpg.Pool, *, fresh_within_secs: float,
+) -> Callable[[], Awaitable[bool]]:
+    """A zero-arg bool probe reading the SAME dead-man's-switch watermark
+    `monitor.heartbeat_age_secs` already exposes — never a second liveness read for the
+    worker. Fresh means the worker ticked at least once inside the budget since this
+    drill started restarting it, not merely that a stale pre-restart beat still exists."""
+    async def _probe() -> bool:
+        from src.orchestrator.monitor import heartbeat_age_secs
+        age = await heartbeat_age_secs(pool)
+        return age is not None and age < fresh_within_secs
+    return _probe
+
+
+async def cmd_smoke_reboot(
+    *, pool: asyncpg.Pool | None = None, budget_secs: float = 90.0,
+    restart: RestartServices = _real_restart_services,
+    port_open_probe: Callable[[str, int], Callable[[], Awaitable[bool]]] = _port_open_probe,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> int:
+    """osiris smoke --reboot — the reboot drill (REBOOT SURVIVAL, thread 194eac83,
+    operator ruling aaa8e841): restarts every unit in dependency order
+    (`_REBOOT_UNITS_ORDER`) via the SAME `systemctl --user restart` `osiris deploy`
+    itself uses, then asserts pg :5601, mcp :8790, and console :8011 each answer within
+    `budget_secs`, plus the worker's own heartbeat watermark going fresh within the same
+    budget — exit 1 on any miss, naming which one. A REAL restart of REAL daemons
+    (matching `osiris smoke --chaos`'s own already-established precedent for a
+    deliberate, operator-invoked disruptive drill) — "the drill runs live only by the
+    operator's hand" (thread 194eac83's own words), never run automatically."""
+    print(f"osiris smoke --reboot: restarting {', '.join(_REBOOT_UNITS_ORDER)} in "
+          "dependency order...")
+    rc, out = await restart(list(_REBOOT_UNITS_ORDER))
+    if rc != 0:
+        print(f"osiris smoke --reboot: restart FAILED (exit {rc}): {out}", file=sys.stderr)
+        return 1
+
+    misses: list[str] = []
+    for label, host, port in (
+        ("postgres :5601", "127.0.0.1", 5601),
+        ("mcp :8790", "127.0.0.1", 8790),
+        ("console :8011", "127.0.0.1", 8011),
+    ):
+        ready, elapsed = await _wait_for_health(
+            port_open_probe(host, port), ceiling_secs=budget_secs, sleep=sleep)
+        print(f"  {label}: {'up' if ready else 'NO ANSWER'} after {elapsed:.1f}s")
+        if not ready:
+            misses.append(label)
+
+    owns_pool = pool is None
+    if pool is None:
+        from src.config.dev_env import apply_dev_fallback
+        from src.config.settings import get_settings
+        from src.db.pool import create_pool
+
+        apply_dev_fallback()
+        settings = get_settings()
+        try:
+            pool = await create_pool(
+                settings.database_url, min_size=1, max_size=2,
+                application_name="osiris-cli:smoke-reboot")
+        except Exception as exc:  # noqa: BLE001 - the CLI boundary: report, no raw traceback
+            print(f"  worker heartbeat: could not reach postgres to check — {exc}",
+                  file=sys.stderr)
+            misses.append("worker heartbeat (postgres unreachable)")
+            pool = None
+    if pool is not None:
+        try:
+            ready, elapsed = await _wait_for_health(
+                _worker_heartbeat_probe(pool, fresh_within_secs=budget_secs),
+                ceiling_secs=budget_secs, sleep=sleep)
+        finally:
+            if owns_pool:
+                await pool.close()
+        print(f"  worker heartbeat: {'fresh' if ready else 'STALE'} after {elapsed:.1f}s")
+        if not ready:
+            misses.append("worker heartbeat")
+
+    if misses:
+        print(f"osiris smoke --reboot: FAILED — {', '.join(misses)} did not answer "
+              f"within {budget_secs:.0f}s", file=sys.stderr)
+        return 1
+    print("osiris smoke --reboot: all green")
+    return 0
+
+
 async def _real_unit_start_timestamps(units: list[str]) -> dict[str, str]:
     """`ExecMainStartTimestamp` for each just-restarted unit, straight from systemd — the
     deploy receipt's own PROOF a restart actually replaced the running process (a fresh
@@ -1939,6 +2069,90 @@ async def _real_unit_start_timestamps(units: list[str]) -> dict[str, str]:
         if ts:
             out[unit] = ts
     return out
+
+
+def unit_drift_notes(repo_root: Path, systemd_user_dir: Path) -> list[str]:
+    """REBOOT SURVIVAL, the units half (thread 194eac83, operator ruling aaa8e841): every
+    deploy/user/*.service source compared byte-for-byte against what's actually installed
+    at `systemd_user_dir/<name>` — the exact class of fault that took osiris-mcp and
+    osiris-pulse down after the 2026-09-13 17:26 CDT reboot (a 30-byte test stub sat
+    installed while the real unit sat correct in git, untouched since the last real
+    `osiris deploy`). Pure filesystem read, no systemctl involved — this question never
+    needs a live daemon to answer it. A source with no installed counterpart at all is
+    named NOT INSTALLED, never silently skipped."""
+    notes: list[str] = []
+    for src in user_unit_sources(repo_root):
+        dest = systemd_user_dir / src.name
+        if not dest.is_file():
+            notes.append(f"{src.name}: NOT INSTALLED — {dest} does not exist")
+            continue
+        if dest.read_text() != src.read_text():
+            notes.append(f"{src.name}: DRIFTED — installed content differs from the repo's "
+                        f"own deploy/user/{src.name}")
+    return notes
+
+
+async def _real_unit_health(units: list[str]) -> dict[str, dict[str, str]]:
+    """{unit_stem: {"is-enabled": ..., "is-failed": ...}} — the two systemctl reads
+    `osiris boot-status --units` needs to name an ENABLED unit that is currently FAILED
+    (Thoth's own "enabled-but-dead" population, thread 194eac83), without assuming a
+    long-running daemon's own idle 'inactive' state means anything is wrong: a
+    successfully-completed oneshot (osiris-boot-heal) reports 'inactive', never 'failed',
+    so `is-failed` alone (never `is-active`) is the correct discriminator across both unit
+    shapes this repo ships."""
+    out: dict[str, dict[str, str]] = {}
+    for unit in units:
+        row: dict[str, str] = {}
+        for verb in ("is-enabled", "is-failed"):
+            proc = await asyncio.create_subprocess_exec(
+                "systemctl", "--user", verb, f"{unit}.service",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            stdout, _ = await proc.communicate()
+            row[verb] = stdout.decode(errors="replace").strip()
+        out[unit] = row
+    return out
+
+
+def enabled_but_dead_notes(health: dict[str, dict[str, str]]) -> list[str]:
+    """Named per Thoth's own phrase (thread 194eac83): enabled=true but failed=true — the
+    systemd state a unit reaches when it never even attempted to run this boot (or tried
+    and gave up). StartLimitIntervalSec=0 on every daemon unit (this same wave) prevents
+    the crash-loop-into-permanent-failure half of that; this names the state directly
+    rather than assuming the ratchet alone is proof nothing can still land here."""
+    notes: list[str] = []
+    for unit, row in health.items():
+        if row.get("is-enabled") == "enabled" and row.get("is-failed") == "failed":
+            notes.append(f"{unit}: ENABLED but FAILED (systemctl --user status {unit})")
+    return notes
+
+
+async def _cmd_boot_status_units(*, as_json: bool = False) -> int:
+    """`osiris boot-status --units` — see `unit_drift_notes`/`enabled_but_dead_notes` for
+    the two checks this composes. An ADDITIVE new report, never a replacement for the
+    existing rollout-gap check `cmd_boot_status` already runs: a different axis (unit
+    files on disk + systemctl state, no pool needed) over the same CLI verb."""
+    root = _find_repo_root()
+    if root is None:
+        print("osiris boot-status --units: not inside a git checkout — nothing to check",
+              file=sys.stderr)
+        return 1
+    systemd_user_dir = Path.home() / ".config" / "systemd" / "user"
+    drift = unit_drift_notes(root, systemd_user_dir)
+    health = await _real_unit_health(deploy_unit_names(root))
+    dead = enabled_but_dead_notes(health)
+    if as_json:
+        from src import cli_render as render
+        render.emit({"drift": drift, "enabled_but_dead": dead}, as_json=True)
+        return 1 if (drift or dead) else 0
+    if not drift and not dead:
+        print("boot-status --units: every deploy/user unit matches its repo source and "
+              "no enabled unit is failed")
+        return 0
+    for note in drift:
+        print(f"DRIFT: {note}")
+    for note in dead:
+        print(f"DEAD: {note}")
+    return 1
 
 
 def _alembic_config(repo_root: Path) -> Any | None:
@@ -5835,21 +6049,28 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_smoke = sub.add_parser(
         "smoke", description=_d("the same deploy-time liveness probe the fleet runs"),
-        epilog="example: osiris smoke\nexample: osiris smoke --chaos")
+        epilog="example: osiris smoke\nexample: osiris smoke --chaos\n"
+               "example: osiris smoke --reboot")
     p_smoke.add_argument(
         "--chaos", action="store_true",
         help="crash replay: kill osiris-mcp/osiris-worker hard, fire a concurrent "
              "session-end storm, restart, then assert system invariants still hold "
              "under a real crash, never just a graceful restart")
+    p_smoke.add_argument(
+        "--reboot", action="store_true",
+        help="REBOOT SURVIVAL (thread 194eac83): restarts every daemon unit in "
+             "dependency order (boot-heal first) and asserts pg/mcp/console each answer "
+             "and the worker's own heartbeat goes fresh within budget — a real restart "
+             "of real daemons, runs live only by the operator's own hand")
     p_smoke.add_argument("--json", action="store_true", dest="as_json",
-                         help="machine-readable: one compact JSON line. Never chaos's "
-                              "own path (--chaos runs a separate, longer-lived probe "
-                              "with its own text receipt) — the ordinary probe only")
+                         help="machine-readable: one compact JSON line. Never chaos's or "
+                              "reboot's own path (each runs a separate, longer-lived "
+                              "probe with its own text receipt) — the ordinary probe only")
 
     p_boot_status = sub.add_parser("boot-status", description=_d(
         "name every active seat with no compiled managed section, "
                                "classified by why (report-only; exit 1 if any)"),
-                   epilog="example: osiris boot-status")
+                   epilog="example: osiris boot-status\nexample: osiris boot-status --units")
     p_boot_status.add_argument("--json", action="store_true", dest="as_json",
                                help="machine-readable: one compact JSON line")
     p_boot_status.add_argument("--fleet", action="store_true",
@@ -5859,6 +6080,11 @@ def _build_parser() -> argparse.ArgumentParser:
                                     "all is named. Runs the SAME pass the worker runs "
                                     "once at its own startup — exit 1 if any body has "
                                     "no mount row")
+    p_boot_status.add_argument("--units", action="store_true",
+                               help="REBOOT SURVIVAL (thread 194eac83): a separate report "
+                                    "— deploy/user unit drift against the repo's own "
+                                    "sources, plus any enabled-but-failed unit; no pool "
+                                    "needed, never mixed with the seat rollout report above")
 
     p_lint = sub.add_parser("lint", description=_d(
         "the graph audits itself — headless mirror of the graph_lint MCP tool/CMD-K "
@@ -6982,9 +7208,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "attach":
         return asyncio.run(cmd_attach(args.handle))
     if args.command == "smoke":
-        return asyncio.run(cmd_smoke(chaos=args.chaos, as_json=args.as_json))
+        return asyncio.run(
+            cmd_smoke(chaos=args.chaos, reboot=args.reboot, as_json=args.as_json))
     if args.command == "boot-status":
-        return asyncio.run(cmd_boot_status(as_json=args.as_json, fleet=args.fleet))
+        return asyncio.run(cmd_boot_status(
+            as_json=args.as_json, fleet=args.fleet, units=args.units))
     if args.command == "lint":
         return asyncio.run(cmd_lint(
             check=args.check, project=args.project, as_json=args.as_json,

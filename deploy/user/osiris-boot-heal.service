@@ -1,0 +1,48 @@
+# Osiris boot heal — systemd USER oneshot unit. REBOOT SURVIVAL, the units half
+# (thread 194eac83, operator ruling aaa8e841, 2026-09-13: "it has to survive and recover
+# reboot by itself").
+#
+# Runs ONCE at every boot, BEFORE the five daemon units (the Before= list below), and
+# reinstalls any of them (or the seven oneshot backup/preflight/pg-autotune timer pairs
+# under deploy/) that have drifted from this repo's own sources — the exact fault that
+# took osiris-mcp and osiris-pulse down after the 2026-09-13 17:26 CDT reboot: their
+# installed unit files were 30-byte test stubs, never repaired until this unit existed.
+# See scripts/osiris_boot_heal.py's own module docstring for the full mechanism (it calls
+# the SAME two sanctioned installers `osiris deploy` already uses — never a third copy).
+#
+# No `Requires=` on this unit anywhere — only Before= ordering. A failure here delays
+# nothing and blocks no daemon from starting; `osiris boot-status` reports this unit's own
+# `systemctl --user is-failed` state separately, so a genuine bug in the healer is visible
+# without ever making the healer itself a single point of boot failure.
+#
+# A USER unit like every sibling in this directory (runs AS the operator, against the
+# operator's own dev instance). `osiris deploy` installs this file the same way it installs
+# every deploy/user/*.service file — it is no longer hand-authored or hand-copied.
+[Unit]
+Description=Osiris boot heal (repairs drifted/stub systemd units before the daemons start)
+After=network-online.target docker.service
+Wants=network-online.target
+Before=osiris-mcp.service osiris-worker.service osiris-console.service osiris-pulse.service osiris-manager.service
+# REBOOT SURVIVAL: disables systemd's own default 5-tries/10s start-limit — a oneshot that
+# fails fast on a cold, not-yet-answering box should still get its next scheduled chance
+# rather than being permanently marked "failed" after a handful of quick retries.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/code/osiris
+Environment=DATABASE_URL=postgresql://osiris:osiris@127.0.0.1:5601/osiris?application_name=osiris-boot-heal
+Environment=REDIS_URL=redis://127.0.0.1:6396/0
+# The LLM provider is resolved with shutil.which('claude') at RUN time, and a user
+# unit does not inherit a login shell's PATH — matches every sibling unit's own pin.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# REBOOT SURVIVAL: this unit's own repair logic writes to ~/.config/systemd/user and shells
+# out to systemctl — neither needs postgres, but install_prune_timers.sh's own render step
+# (scripts/render_backup_timers.py) reads backup_settings from the DB, failing open to the
+# shipped defaults on a DB hiccup (its own docstring) — the same :5601 wait every daemon
+# carries, so a cold-boot race with postgres degrades to defaults rather than an error.
+ExecStartPre=/bin/bash -c 'until (echo > /dev/tcp/127.0.0.1/5601) 2>/dev/null; do sleep 1; done'
+ExecStart=%h/code/osiris/.venv/bin/python scripts/osiris_boot_heal.py
+
+[Install]
+WantedBy=default.target
