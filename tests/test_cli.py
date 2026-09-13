@@ -20,6 +20,7 @@ from src.cli import (
     _composition_gaps,
     _find_repo_root,
     _pg_dump_active,
+    _placeholder_unit_reason,
     _real_install_user_units,
     _real_wait_for_pg_dump,
     _run_install_script,
@@ -83,6 +84,7 @@ from src.cli import (
     match_session,
     oneshot_deployed_scripts,
     resolve_model,
+    unit_install_drift,
     user_unit_sources,
 )
 from src.config.settings import Settings
@@ -2744,15 +2746,30 @@ def test_find_repo_root_finds_this_repo_from_a_subdirectory() -> None:
 
 
 async def test_cmd_deploy_restarts_and_reports_smoke_and_gaps(
-    actions: Actions, tmp_path: Path,
+    actions: Actions, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # a real deploy/user/*.service pair — deploy_unit_names is DERIVED from these
     # (thread 2a280e07's own follow-up: never a hand-listed default), so a test exercising
     # the restart step needs real sources to derive from, same as production always has.
+    # THE LIVE INCIDENT THIS GUARDS AGAINST (Thoth mail 10242): this test doesn't pass
+    # its own `install_units=` stub, so `cmd_deploy`'s default `_real_install_user_units`
+    # runs FOR REAL — with `Path.home` unpatched, that installer wrote straight into
+    # THIS BOX's actual ~/.config/systemd/user, overwriting the live osiris-mcp/
+    # osiris-pulse units with 30-byte stubs that left them dead across a reboot. Every
+    # OTHER cmd_deploy test relies on `repo_root=tmp_path` carrying no deploy/user/ at
+    # all (see test_real_install_user_units_no_deploy_user_dir_touches_nothing) — this
+    # is the one that genuinely needs the installer to run, so it's the one that must
+    # patch `Path.home` itself, not rely on that shared assumption.
+    fake_home = tmp_path / "fake-home"
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
     unit_dir = tmp_path / "deploy" / "user"
     unit_dir.mkdir(parents=True)
-    (unit_dir / "osiris-mcp.service").write_text("[Service]\nExecStart=/bin/true\n")
-    (unit_dir / "osiris-pulse.service").write_text("[Service]\nExecStart=/bin/true\n")
+    unit_body = (
+        "[Unit]\nDescription=test unit\n[Service]\n"
+        f"ExecStart={tmp_path}/.venv/bin/python -m src.mcp_server\n"
+    )
+    (unit_dir / "osiris-mcp.service").write_text(unit_body)
+    (unit_dir / "osiris-pulse.service").write_text(unit_body)
 
     calls: list[list[str]] = []
     tool_snapshots = iter([{"smoke": "aaa"}, {"smoke": "bbb", "retire_assertion": "ccc"}])
@@ -3390,8 +3407,11 @@ async def test_real_install_user_units_no_deploy_user_dir_touches_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The default installer must never mkdir into a real caller's home when the repo it was
-    handed carries no deploy/user/ — this is what every OTHER cmd_deploy test in this file
-    relies on implicitly (none of them pass install_units, all of them pass repo_root=tmp_path)."""
+    handed carries no deploy/user/ — this is what every OTHER cmd_deploy test that skips
+    `install_units=` relies on implicitly (repo_root=tmp_path with no deploy/user/ under
+    it). The one exception, test_cmd_deploy_restarts_and_reports_smoke_and_gaps, DOES
+    create a deploy/user/ and DOES let the real installer run — and patches Path.home
+    itself for exactly that reason (Thoth mail 10242's own live incident: it used to not)."""
     fake_home = tmp_path / "not-a-real-home"
     monkeypatch.setattr(Path, "home", lambda: fake_home)
 
@@ -3401,13 +3421,22 @@ async def test_real_install_user_units_no_deploy_user_dir_touches_nothing(
     assert not fake_home.exists()
 
 
+def _real_shaped_unit(repo_root: Path) -> str:
+    """A minimal but genuinely real-shaped unit body — passes `_placeholder_unit_reason`
+    (a `Description=` line, an `ExecStart=` under this repo's own checkout) without
+    pulling in every field a real deploy/user/*.service carries."""
+    return f"[Unit]\nDescription=test\n[Service]\nExecStart={repo_root}/.venv/bin/python\n"
+
+
 async def test_real_install_user_units_installs_new_files_and_reloads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake_home = tmp_path / "home"
-    src_dir = tmp_path / "repo" / "deploy" / "user"
+    repo_root = tmp_path / "repo"
+    src_dir = repo_root / "deploy" / "user"
     src_dir.mkdir(parents=True)
-    (src_dir / "osiris-mcp.service").write_text("[Service]\nExecStart=/bin/true\n")
+    body = _real_shaped_unit(repo_root)
+    (src_dir / "osiris-mcp.service").write_text(body)
     monkeypatch.setattr(Path, "home", lambda: fake_home)
 
     reload_calls: list[list[str]] = []
@@ -3425,10 +3454,10 @@ async def test_real_install_user_units_installs_new_files_and_reloads(
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
 
-    notes = await _real_install_user_units(tmp_path / "repo")
+    notes = await _real_install_user_units(repo_root)
 
     dest = fake_home / ".config" / "systemd" / "user" / "osiris-mcp.service"
-    assert dest.read_text() == "[Service]\nExecStart=/bin/true\n"
+    assert dest.read_text() == body
     assert any("installed (new) osiris-mcp.service" in n for n in notes)
     assert reload_calls == [["systemctl", "--user", "daemon-reload"]]
 
@@ -3437,12 +3466,14 @@ async def test_real_install_user_units_unchanged_content_skips_daemon_reload(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake_home = tmp_path / "home"
-    src_dir = tmp_path / "repo" / "deploy" / "user"
+    repo_root = tmp_path / "repo"
+    src_dir = repo_root / "deploy" / "user"
     src_dir.mkdir(parents=True)
-    (src_dir / "osiris-mcp.service").write_text("same\n")
+    body = _real_shaped_unit(repo_root)
+    (src_dir / "osiris-mcp.service").write_text(body)
     dest_dir = fake_home / ".config" / "systemd" / "user"
     dest_dir.mkdir(parents=True)
-    (dest_dir / "osiris-mcp.service").write_text("same\n")
+    (dest_dir / "osiris-mcp.service").write_text(body)
     monkeypatch.setattr(Path, "home", lambda: fake_home)
 
     async def _unreachable(*args: str, **kwargs: Any) -> Any:
@@ -3450,8 +3481,152 @@ async def test_real_install_user_units_unchanged_content_skips_daemon_reload(
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", _unreachable)
 
-    notes = await _real_install_user_units(tmp_path / "repo")
+    notes = await _real_install_user_units(repo_root)
     assert notes == ["unit files: unchanged, no daemon-reload needed"]
+
+
+async def test_real_install_user_units_refuses_a_unit_missing_a_description(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact incident shape (Thoth mail 10242): a bare `[Service]` stub with no
+    `[Unit]` Description= line — refused, never installed."""
+    fake_home = tmp_path / "home"
+    repo_root = tmp_path / "repo"
+    src_dir = repo_root / "deploy" / "user"
+    src_dir.mkdir(parents=True)
+    (src_dir / "osiris-mcp.service").write_text("[Service]\nExecStart=/bin/true\n")
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+    async def _unreachable(*args: str, **kwargs: Any) -> Any:
+        raise AssertionError("must never reach daemon-reload — refused before installing")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _unreachable)
+
+    notes = await _real_install_user_units(repo_root)
+    assert notes == [
+        "unit: REFUSED osiris-mcp.service — no [Unit] Description= line"]
+    assert not (fake_home / ".config" / "systemd" / "user" / "osiris-mcp.service").exists()
+
+
+async def test_real_install_user_units_refuses_a_unit_with_a_bare_binary_execstart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Description= alone isn't enough — an ExecStart naming neither %h nor this
+    repo's own checkout (a bare `/bin/true`, the live incident's own exact value) is
+    refused just as loudly."""
+    fake_home = tmp_path / "home"
+    repo_root = tmp_path / "repo"
+    src_dir = repo_root / "deploy" / "user"
+    src_dir.mkdir(parents=True)
+    (src_dir / "osiris-mcp.service").write_text(
+        "[Unit]\nDescription=test\n[Service]\nExecStart=/bin/true\n")
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+    notes = await _real_install_user_units(repo_root)
+    assert len(notes) == 1 and notes[0].startswith("unit: REFUSED osiris-mcp.service")
+    assert "ExecStart" in notes[0]
+    assert not (fake_home / ".config" / "systemd" / "user" / "osiris-mcp.service").exists()
+
+
+async def test_real_install_user_units_refuses_the_whole_batch_on_one_bad_unit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One placeholder among several real units refuses ALL of them — never a partial
+    install that leaves the fleet in a mixed, half-installed state."""
+    fake_home = tmp_path / "home"
+    repo_root = tmp_path / "repo"
+    src_dir = repo_root / "deploy" / "user"
+    src_dir.mkdir(parents=True)
+    (src_dir / "osiris-mcp.service").write_text(_real_shaped_unit(repo_root))
+    (src_dir / "osiris-pulse.service").write_text("[Service]\nExecStart=/bin/true\n")
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+    notes = await _real_install_user_units(repo_root)
+    assert notes == [
+        "unit: REFUSED osiris-pulse.service — no [Unit] Description= line"]
+    assert not (fake_home / ".config" / "systemd" / "user").exists()
+
+
+async def test_real_install_user_units_the_repos_own_real_units_all_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every unit deploy/user/ actually ships must already pass this validation — a
+    live regression here would refuse every real `osiris deploy` on the box."""
+    fake_home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    repo_root = _find_repo_root(Path(__file__).resolve().parent)
+    assert repo_root is not None
+
+    for src in user_unit_sources(repo_root):
+        assert _placeholder_unit_reason(src.read_text(), repo_root) is None, src.name
+
+
+async def test_real_install_user_units_never_writes_outside_the_patched_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact live incident (Thoth mail 10242): a sibling test ran the REAL
+    installer with `Path.home` unpatched, silently overwriting this box's actual
+    ~/.config/systemd/user files with test stubs. Proves the installer's own boundary
+    directly, not by trusting every future test to remember the patch: every actual
+    filesystem write it makes lands under the patched home, never anywhere else."""
+    fake_home = tmp_path / "fake-home"
+    repo_root = tmp_path / "repo"
+    src_dir = repo_root / "deploy" / "user"
+    src_dir.mkdir(parents=True)
+    (src_dir / "osiris-mcp.service").write_text(_real_shaped_unit(repo_root))
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+    written_paths: list[Path] = []
+    real_write_text = Path.write_text
+
+    def _tracking_write_text(self: Path, *a: Any, **k: Any) -> int:
+        written_paths.append(self)
+        return real_write_text(self, *a, **k)
+
+    monkeypatch.setattr(Path, "write_text", _tracking_write_text)
+
+    async def _fake_exec(*args: str, **kwargs: Any) -> Any:
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self) -> tuple[bytes, bytes]:
+                return b"", b""
+
+        return _Proc()
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
+
+    await _real_install_user_units(repo_root)
+
+    assert written_paths  # actually wrote something — a vacuous pass proves nothing
+    assert all(fake_home == p or fake_home in p.parents for p in written_paths)
+
+
+async def test_unit_install_drift_reports_missing_drifted_and_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Khnum's own boot-heal/boot-status consume this directly (ruling aaa8e841) — pure
+    and read-only, never touches ~/.config itself."""
+    fake_home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    repo_root = tmp_path / "repo"
+    src_dir = repo_root / "deploy" / "user"
+    src_dir.mkdir(parents=True)
+    (src_dir / "osiris-mcp.service").write_text("mcp v2\n")
+    (src_dir / "osiris-pulse.service").write_text("pulse v2\n")
+    (src_dir / "osiris-worker.service").write_text("worker v1\n")
+
+    dest_dir = fake_home / ".config" / "systemd" / "user"
+    dest_dir.mkdir(parents=True)
+    (dest_dir / "osiris-pulse.service").write_text("pulse v1 (stale)\n")
+    (dest_dir / "osiris-worker.service").write_text("worker v1\n")
+    # osiris-mcp.service: not installed at all
+
+    assert unit_install_drift(repo_root) == {
+        "osiris-mcp.service": "missing",
+        "osiris-pulse.service": "drifted",
+        "osiris-worker.service": "ok",
+    }
 
 
 async def test_cmd_deploy_calls_install_units_before_restarting(
