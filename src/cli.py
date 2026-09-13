@@ -2107,7 +2107,8 @@ async def _real_unit_health(units: list[str]) -> dict[str, dict[str, str]]:
             proc = await asyncio.create_subprocess_exec(
                 "systemctl", "--user", verb, f"{unit}.service",
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-            stdout, _ = await proc.communicate()
+            stdout, _ = await asyncio.wait_for(  # unbounded-wait-ok: bounded via wait_for,
+                proc.communicate(), timeout=10.0)  # not a timeout= kwarg on communicate()
             row[verb] = stdout.decode(errors="replace").strip()
         out[unit] = row
     return out
