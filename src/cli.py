@@ -2295,6 +2295,44 @@ CheckWhisperProbe = Callable[[], Awaitable[tuple[bool, str]]]
 ChaosGate = Callable[[asyncpg.Pool], Awaitable[dict[str, Any]]]
 FullSuiteGate = Callable[[Path], Awaitable[dict[str, Any]]]
 CheckFalseMintLive = Callable[[asyncpg.Pool], Awaitable[list[dict[str, Any]]]]
+WaitForPgDump = Callable[[asyncpg.Pool], Awaitable[tuple[bool, float]]]
+
+_PG_DUMP_WAIT_CEILING_SECS = 900.0  # 15 min — Thoth's own bound, mail 10214
+
+
+async def _pg_dump_active(pool: asyncpg.Pool) -> bool:
+    """`application_name='pg_dump'` is pg_dump's own client identity, stamped by the
+    tool itself — no query-text pattern-matching, no false positives from something
+    that merely mentions the string."""
+    n = await pool.fetchval(
+        "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'pg_dump'")
+    return bool(n)
+
+
+async def _real_wait_for_pg_dump(
+    pool: asyncpg.Pool, *,
+    probe: Callable[[asyncpg.Pool], Awaitable[bool]] = _pg_dump_active,
+    ceiling_secs: float = _PG_DUMP_WAIT_CEILING_SECS,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> tuple[bool, float]:
+    """A BOUNDED wait (never indefinite, 15 min ceiling) for a concurrent pg_dump to
+    finish BEFORE restarting units — a live incident (Thoth mail 10214): the console
+    restarted straight into a pg_dump's own lock on `triggers`, hung at startup behind
+    it, and the deploy's own health/smoke poller burned its OWN timeout reporting a
+    console failure that was really "a backup is running." This waits for the actual
+    cause instead of probing a console that cannot come up. Same backoff shape
+    `_wait_for_health`/`_wait_for_smoke` already use. Returns (clear, elapsed) —
+    clear=False past the ceiling means deploy proceeds anyway regardless
+    (project_triggers' own `lock_timeout` is the last line of defense, not this wait)."""
+    elapsed = 0.0
+    delay = 5.0
+    active = await probe(pool)
+    while active and elapsed < ceiling_secs:
+        await sleep(delay)
+        elapsed += delay
+        delay = min(delay * 2, 60.0)
+        active = await probe(pool)
+    return not active, elapsed
 
 
 async def _synthetic_automount_probe(client: Any) -> tuple[bool, str]:
@@ -2461,6 +2499,7 @@ async def cmd_deploy(
     chaos_gate: ChaosGate = _real_chaos_gate,
     check_false_mint_live: CheckFalseMintLive = _real_check_false_mint_live,
     full_suite_gate: FullSuiteGate = _real_full_suite_gate,
+    wait_for_pg_dump: WaitForPgDump = _real_wait_for_pg_dump,
     deploy_settings: Settings | None = None,
 ) -> int:
     """The deploy ritual as one verb (thread e51a841c): a live near-miss held batch 3 because
@@ -2603,6 +2642,23 @@ async def cmd_deploy(
                      "mount()).")
         except Exception as exc:  # noqa: BLE001
             print(f"NOTE: pre-restart disconnect warning failed to send: {exc}")
+
+        # A LIVE INCIDENT (Thoth mail 10214): restarting straight into a running
+        # pg_dump made the console hang at startup behind the dump's own lock on
+        # `triggers`, and the health/smoke poller burned its OWN timeout reporting a
+        # console failure that was really "a backup is running." Wait for the actual
+        # cause instead of probing a console that cannot come up — bounded at 15
+        # minutes; past that, deploy proceeds anyway (project_triggers' own
+        # `lock_timeout` is the real last line of defense, not this wait).
+        pg_dump_clear, pg_dump_waited = await wait_for_pg_dump(pool)
+        if pg_dump_waited:
+            if pg_dump_clear:
+                print(f"osiris deploy: waited {pg_dump_waited:.0f}s for a concurrent "
+                      "pg_dump to finish before restarting")
+            else:
+                print(f"osiris deploy: a pg_dump is still running after "
+                      f"{pg_dump_waited:.0f}s — proceeding anyway (project_triggers' "
+                      "own lock_timeout protects startup)")
 
         units = deploy_unit_names(root)
         rc, out = await restart(units)

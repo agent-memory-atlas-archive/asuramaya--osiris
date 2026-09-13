@@ -46,10 +46,16 @@ async def _make_case(actions: Actions, budgets: dict) -> uuid.UUID:
         "INSERT INTO cases (name, owner, budgets) VALUES ('c','analyst:test',$1) RETURNING id",
         budgets,
     )
-    # triggers must be projected for the relay to match helpers
+    # triggers must be projected for the relay to match helpers. ON CONFLICT DO NOTHING
+    # (migration 0068's own unique constraint on helper_id): this test's own
+    # cross-case test calls _make_case twice in the SAME transaction (case A, then
+    # case B) — a second bare INSERT of the same helper_id would violate the
+    # constraint that lets project_triggers upsert instead of TRUNCATE (Thoth mail
+    # 10214).
     await actions.pool.execute(
         "INSERT INTO triggers (on_event, match, helper_id, enabled) "
-        "VALUES ('object_created', $1, 'crtsh_subdomains', true)",
+        "VALUES ('object_created', $1, 'crtsh_subdomains', true) "
+        "ON CONFLICT (helper_id) DO NOTHING",
         {"type": "Domain"},
     )
     return uuid.UUID(str(cid))

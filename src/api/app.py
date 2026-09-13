@@ -142,7 +142,21 @@ def create_app(pool: asyncpg.Pool | None = None) -> FastAPI:
         app.state.arq = await create_arq_pool(RedisSettings.from_dsn(settings.redis_url))
         # triggers are a projection of manifests (#5) — (re)project on startup so a
         # fresh deployment actually fires helpers (else Expand finds no triggers).
-        await project_triggers(app.state.pool, app.state.manifests)
+        # THE ASGI APP MUST ALWAYS BIND (Thoth mail 10214, a live incident): a
+        # concurrent pg_dump held a lock project_triggers' own TRUNCATE needed, hanging
+        # startup. project_triggers no longer takes that lock and sets its own bounded
+        # `lock_timeout`, so this can only still raise LockNotAvailableError against some
+        # OTHER exclusive-lock holder neither of us anticipated — caught here rather than
+        # left to hang the lifespan forever: log once, leave the previous projection in
+        # place, and let the console come up regardless (a stale trigger set is a much
+        # smaller failure than a console that never binds).
+        try:
+            await project_triggers(app.state.pool, app.state.manifests)
+        except asyncpg.exceptions.LockNotAvailableError:
+            _log.warning(
+                "project_triggers timed out waiting for a lock on `triggers` (likely a "
+                "concurrent pg_dump or similar) — leaving the previous projection in "
+                "place; the console still binds")
         try:
             yield
         finally:

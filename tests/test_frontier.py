@@ -152,9 +152,13 @@ async def test_fire_triggers_crawls_anchor_skips_speculative_leaf(
     actions: Actions, case_id: str, redis_client: aioredis.Redis
 ) -> None:
     cid = uuid.UUID(case_id)
+    # ON CONFLICT DO NOTHING (migration 0068's own unique constraint on helper_id):
+    # this is a test-setup convenience, not the real projection — a second call
+    # inserting the same helper_id must never fail the test over an irrelevant detail.
     await actions.pool.execute(
         "INSERT INTO triggers (on_event, match, helper_id, enabled) "
-        "VALUES ('object_created', $1, 'fake_acct', true)",
+        "VALUES ('object_created', $1, 'fake_acct', true) "
+        "ON CONFLICT (helper_id) DO NOTHING",
         {"type": "Account"},
     )
     ctx = CascadeContext(
