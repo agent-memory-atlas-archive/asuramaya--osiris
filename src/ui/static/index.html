@@ -39,6 +39,16 @@
   /* the browse drawer only ever makes sense alongside the space canvas — hidden whenever
      a non-browse surface takes over #result via the pre-existing #stage.panel toggle. */
   #stage.panel .table-drawer { display: none; }
+  .legend-panel { position: absolute; bottom: 56px; left: 14px; z-index: 11; max-height: 60%;
+                   overflow-y: auto; background: rgba(13,18,25,0.92); backdrop-filter: blur(8px);
+                   border: 1px solid var(--border2); border-radius: 6px; padding: 8px 10px;
+                   font-size: 11px; min-width: 200px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
+  .legend-row { display: flex; align-items: center; gap: 6px; padding: 2px 0; color: var(--muted);
+                cursor: pointer; white-space: nowrap; }
+  .legend-row input { flex: none; }
+  .legend-row.legend-class { color: var(--text); font-size: 11px; margin-top: 6px; }
+  .legend-row.legend-class:first-child { margin-top: 0; }
+  .legend-swatch { display: inline-block; width: 9px; height: 9px; border-radius: 50%; flex: none; }
 </style>
 <style>
   .pop { position: absolute; z-index: 30; background: var(--panel); border: 1px solid var(--border2); border-radius: 9px; padding: 14px; box-shadow: 0 16px 48px rgba(0,0,0,0.6); font-size: 12px; min-width: 220px; }
@@ -131,7 +141,9 @@
           <span id="graph-level-badge" class="o-faint" style="align-self:center;font-size:11px;padding:0 4px"></span>
           <button class="iconbtn" id="fit-btn">Fit</button>
           <button class="iconbtn" id="up-btn">Clear focus</button>
+          <button class="iconbtn" id="legend-btn">Legend</button>
         </div>
+        <div id="legend-panel" class="legend-panel" hidden></div>
         <div class="graph-search-row">
           <input id="graph-search" class="filter" placeholder="Find a node…" autocomplete="off" />
           <div id="graph-search-dd" class="dd-list" style="display:none"></div>
