@@ -75,7 +75,13 @@ _SUBPROCESS_BASELINE: dict[str, int] = {
     "tests/conftest.py": 2,
     "tests/test_blob_content_sweep.py": 2,
     "tests/test_bodies.py": 1,
-    "tests/test_cli.py": 1,
+    # 1 -> 2 (2026-09-13, Khnum, REBOOT SURVIVAL units half, thread 194eac83): one new
+    # `_asyncio.run(probe())` in test_port_open_probe_false_on_a_closed_port — the same
+    # false-positive class as the cli.py dispatch-line comments above (the scanner's
+    # `name in ("run", "communicate")` matches asyncio.run's attribute name regardless
+    # of the callee); probe() itself wraps its TCP connect in `asyncio.wait_for(...,
+    # timeout=2.0)`, so this is not a genuine unbounded wait.
+    "tests/test_cli.py": 2,
     "tests/test_commands_status.py": 4,
     "tests/test_compose_drift.py": 3,
     "tests/test_deploy_guard.py": 4,

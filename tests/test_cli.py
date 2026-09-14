@@ -15,18 +15,21 @@ from typing import Any
 import pytest
 from src.actions.core import Actions
 from src.cli import (
+    _REBOOT_UNITS_ORDER,
     _apply_pending_migrations,
     _collapse_resume_log,
     _composition_gaps,
     _find_repo_root,
     _pg_dump_active,
     _placeholder_unit_reason,
+    _port_open_probe,
     _real_install_user_units,
     _real_wait_for_pg_dump,
     _run_install_script,
     _synthetic_automount_probe,
     _wait_for_health,
     _wait_for_smoke,
+    _worker_heartbeat_probe,
     alembic_gap_note,
     cmd_amend_decision,
     cmd_amend_practice,
@@ -68,6 +71,7 @@ from src.cli import (
     cmd_settings,
     cmd_show,
     cmd_smoke_chaos,
+    cmd_smoke_reboot,
     cmd_status,
     cmd_team,
     cmd_thread,
@@ -80,10 +84,12 @@ from src.cli import (
     deploy_unit_names,
     diff_tool_lists,
     dirty_tracked_src_files,
+    enabled_but_dead_notes,
     main,
     match_session,
     oneshot_deployed_scripts,
     resolve_model,
+    unit_drift_notes,
     unit_install_drift,
     user_unit_sources,
 )
@@ -2639,6 +2645,110 @@ async def test_cmd_smoke_chaos_records_the_ledger_and_prints_the_findings(
     assert _json.loads(cursor)["ok"] is False
 
 
+# --- cmd_smoke_reboot — REBOOT SURVIVAL's own drill (thread 194eac83) -----------------------
+
+async def _instant_sleep(secs: float) -> None:
+    """No real delay — every reboot-drill test below injects this so a bounded-backoff
+    poll that never succeeds still runs in milliseconds, not `budget_secs` real seconds."""
+
+
+def test_port_open_probe_false_on_a_closed_port() -> None:
+    """No real server bound — a probe against a port nothing listens on must report False,
+    never raise, the same 'not up yet, not a crash' discipline `_health_probe` holds."""
+    import asyncio as _asyncio
+
+    probe = _port_open_probe("127.0.0.1", 1)  # port 1 — reserved, nothing binds it in CI
+    assert _asyncio.run(probe()) is False
+
+
+async def test_worker_heartbeat_probe_true_only_once_fresh(actions: Actions) -> None:
+    from src.orchestrator.monitor import write_heartbeat
+
+    probe_fresh = _worker_heartbeat_probe(actions.pool, fresh_within_secs=60.0)
+    assert await probe_fresh() is False  # never beaten yet
+
+    await write_heartbeat(actions.pool)
+    assert await probe_fresh() is True
+
+    probe_impossible = _worker_heartbeat_probe(actions.pool, fresh_within_secs=0.0)
+    assert await probe_impossible() is False  # a real beat, but outside a 0s window
+
+
+async def test_cmd_smoke_reboot_restart_failure_exits_1(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _fake_restart(units: list[str]) -> tuple[int, str]:
+        return 1, "Unit osiris-mcp.service failed to restart"
+
+    import io
+    from contextlib import redirect_stderr
+
+    buf = io.StringIO()
+    with redirect_stderr(buf):
+        out = await cmd_smoke_reboot(restart=_fake_restart, sleep=_instant_sleep)
+    assert out == 1
+    assert "restart FAILED" in buf.getvalue()
+
+
+async def test_cmd_smoke_reboot_all_green(
+    actions: Actions, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.orchestrator.monitor import write_heartbeat
+
+    await write_heartbeat(actions.pool)
+    restart_calls: list[list[str]] = []
+
+    async def _fake_restart(units: list[str]) -> tuple[int, str]:
+        restart_calls.append(units)
+        return 0, "ok"
+
+    def _always_open(host: str, port: int) -> Any:
+        async def _probe() -> bool:
+            return True
+        return _probe
+
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        out = await cmd_smoke_reboot(
+            pool=actions.pool, restart=_fake_restart, port_open_probe=_always_open,
+            sleep=_instant_sleep)
+    assert out == 0
+    assert restart_calls == [list(_REBOOT_UNITS_ORDER)]
+    assert "all green" in buf.getvalue()
+
+
+async def test_cmd_smoke_reboot_names_a_missing_port_and_stale_worker(
+    actions: Actions, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Never beats the worker heartbeat and one port never opens — both misses named,
+    the other two ports still reported up, exit 1."""
+    async def _fake_restart(units: list[str]) -> tuple[int, str]:
+        return 0, "ok"
+
+    def _open_unless_mcp(host: str, port: int) -> Any:
+        async def _probe() -> bool:
+            return port != 8790
+        return _probe
+
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+
+    out_buf, err_buf = io.StringIO(), io.StringIO()
+    with redirect_stdout(out_buf), redirect_stderr(err_buf):
+        out = await cmd_smoke_reboot(
+            pool=actions.pool, budget_secs=0.5, restart=_fake_restart,
+            port_open_probe=_open_unless_mcp, sleep=_instant_sleep)
+    assert out == 1
+    out_text = out_buf.getvalue()
+    assert "postgres :5601: up" in out_text
+    assert "mcp :8790: NO ANSWER" in out_text
+    assert "console :8011: up" in out_text
+    assert "worker heartbeat: STALE" in out_text
+    err_text = err_buf.getvalue()
+    assert "mcp :8790" in err_text and "worker heartbeat" in err_text
+
+
 # --- _synthetic_automount_probe: the pure verdict logic, mocked transport ------------------
 
 async def test_synthetic_automount_probe_ok_on_a_clean_200() -> None:
@@ -3343,7 +3453,21 @@ _REQUIRED_UNIT_ENV = {
     ],
     "osiris-console.service": ["DATABASE_URL=", "application_name=osiris-console", "REDIS_URL="],
     "osiris-pulse.service": ["DATABASE_URL=", "application_name=osiris-pulse", "REDIS_URL="],
+    "osiris-manager.service": [
+        "DATABASE_URL=", "application_name=osiris-manager", "REDIS_URL=",
+        "OOMScoreAdjust=-900", "MemoryLow=64M",  # the sacred proc's own near-immunity
+    ],
+    "osiris-boot-heal.service": [
+        "DATABASE_URL=", "application_name=osiris-boot-heal", "REDIS_URL=",
+        "Type=oneshot",  # runs once, then stops — never Restart=always (see the sibling
+        # hardening test below, which deliberately excludes this unit from that check)
+    ],
 }
+
+# Units that are genuinely long-running daemons (Restart=always is correct for them) —
+# osiris-boot-heal is deliberately excluded: a oneshot with Restart=always would loop
+# tightly re-running itself the instant it exits, never the intended "once per boot".
+_RESTART_ALWAYS_UNITS = frozenset(_REQUIRED_UNIT_ENV) - {"osiris-boot-heal.service"}
 
 
 def test_deploy_user_units_contract_every_required_env_line_present() -> None:
@@ -3360,6 +3484,44 @@ def test_deploy_user_units_contract_every_required_env_line_present() -> None:
         text = (unit_dir / name).read_text()
         for needle in required_substrings:
             assert needle in text, f"{name} is missing {needle!r}"
+
+
+def test_deploy_user_units_all_carry_reboot_survival_hardening() -> None:
+    """REBOOT SURVIVAL, the units half (thread 194eac83, operator ruling aaa8e841): every
+    daemon unit — not just the ones already using Restart=always — must survive a cold
+    boot where postgres (docker-compose.full.yml) answers late, without systemd's own
+    default 5-tries/10s start-limit permanently stranding it as 'failed'. Reads the REAL
+    files, same discipline as the env contract test above."""
+    repo_root = _find_repo_root(Path(__file__).resolve().parent)
+    assert repo_root is not None
+    unit_dir = repo_root / "deploy" / "user"
+    for name in _REQUIRED_UNIT_ENV:
+        text = (unit_dir / name).read_text()
+        assert "StartLimitIntervalSec=0" in text, f"{name} missing StartLimitIntervalSec=0"
+        assert "docker.service" in text, f"{name} missing After=...docker.service"
+        assert "ExecStartPre=" in text and "/dev/tcp/127.0.0.1/5601" in text, (
+            f"{name} missing the ExecStartPre wait on :5601")
+        if name in _RESTART_ALWAYS_UNITS:
+            assert "Restart=always" in text, f"{name} missing Restart=always"
+
+
+def test_osiris_boot_heal_unit_is_a_oneshot_ordered_before_the_daemons() -> None:
+    """REBOOT SURVIVAL (thread 194eac83): boot-heal must run BEFORE the daemons it repairs,
+    exactly once per boot (never Restart=always — that would tight-loop a oneshot the
+    instant it exits), and carry no Requires= that could turn a bug in the healer into a
+    boot blocker for anything it orders itself ahead of."""
+    repo_root = _find_repo_root(Path(__file__).resolve().parent)
+    assert repo_root is not None
+    text = (repo_root / "deploy" / "user" / "osiris-boot-heal.service").read_text()
+    directive_lines = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+    assert "Type=oneshot" in text
+    assert not any(line.startswith("Restart=always") for line in directive_lines)
+    assert not any(line.startswith("Requires=") for line in directive_lines)
+    before_line = next(line for line in directive_lines if line.startswith("Before="))
+    for daemon in ("osiris-mcp.service", "osiris-worker.service", "osiris-console.service",
+                  "osiris-pulse.service", "osiris-manager.service"):
+        assert daemon in before_line, (
+            f"osiris-boot-heal.service's own Before= line is missing {daemon}")
 
 
 def test_user_unit_sources_discovers_the_real_deploy_user_dir() -> None:
@@ -3868,6 +4030,121 @@ async def test_cmd_boot_status_clean_on_a_blank_db(actions: Actions) -> None:
         out = await cmd_boot_status(pool=actions.pool)
     assert out == 0
     assert "every active seat carries a compiled managed section" in buf.getvalue()
+
+
+# --- cmd_boot_status --units: REBOOT SURVIVAL's own report axis (thread 194eac83) --------
+
+def test_unit_drift_notes_clean_when_installed_matches_the_repo_source(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    (repo_root / "deploy" / "user").mkdir(parents=True)
+    (repo_root / "deploy" / "user" / "osiris-mcp.service").write_text("[Service]\nfoo=1\n")
+    systemd_user_dir = tmp_path / "home" / ".config" / "systemd" / "user"
+    systemd_user_dir.mkdir(parents=True)
+    (systemd_user_dir / "osiris-mcp.service").write_text("[Service]\nfoo=1\n")
+
+    assert unit_drift_notes(repo_root, systemd_user_dir) == []
+
+
+def test_unit_drift_notes_names_a_not_installed_unit(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    (repo_root / "deploy" / "user").mkdir(parents=True)
+    (repo_root / "deploy" / "user" / "osiris-mcp.service").write_text("[Service]\nfoo=1\n")
+    systemd_user_dir = tmp_path / "home" / ".config" / "systemd" / "user"
+    systemd_user_dir.mkdir(parents=True)
+
+    notes = unit_drift_notes(repo_root, systemd_user_dir)
+    assert len(notes) == 1
+    assert "osiris-mcp.service" in notes[0] and "NOT INSTALLED" in notes[0]
+
+
+def test_unit_drift_notes_names_a_drifted_unit_the_live_specimen(tmp_path: Path) -> None:
+    """The exact live fault (thread 194eac83): a 30-byte stub installed where the repo's
+    real unit content should be."""
+    repo_root = tmp_path / "repo"
+    (repo_root / "deploy" / "user").mkdir(parents=True)
+    (repo_root / "deploy" / "user" / "osiris-mcp.service").write_text(
+        "[Service]\nExecStart=%h/code/osiris/.venv/bin/python -m src.mcp_server\n")
+    systemd_user_dir = tmp_path / "home" / ".config" / "systemd" / "user"
+    systemd_user_dir.mkdir(parents=True)
+    (systemd_user_dir / "osiris-mcp.service").write_text("[Service]\nExecStart=/bin/true\n")
+
+    notes = unit_drift_notes(repo_root, systemd_user_dir)
+    assert len(notes) == 1
+    assert "osiris-mcp.service" in notes[0] and "DRIFTED" in notes[0]
+
+
+def test_enabled_but_dead_notes_flags_only_enabled_and_failed() -> None:
+    health = {
+        "osiris-mcp": {"is-enabled": "enabled", "is-failed": "failed"},
+        "osiris-worker": {"is-enabled": "enabled", "is-failed": "active"},
+        "osiris-console": {"is-enabled": "disabled", "is-failed": "failed"},
+        "osiris-boot-heal": {"is-enabled": "enabled", "is-failed": "inactive"},
+    }
+    notes = enabled_but_dead_notes(health)
+    assert len(notes) == 1
+    assert "osiris-mcp" in notes[0]
+
+
+async def test_cmd_boot_status_units_clean_when_nothing_drifted_or_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+    from contextlib import redirect_stdout
+
+    monkeypatch.setattr("src.cli.unit_drift_notes", lambda root, d: [])
+
+    async def _fake_health(units: list[str]) -> dict[str, dict[str, str]]:
+        return {u: {"is-enabled": "enabled", "is-failed": "active"} for u in units}
+
+    monkeypatch.setattr("src.cli._real_unit_health", _fake_health)
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        out = await cmd_boot_status(units=True)
+    assert out == 0
+    assert "no enabled unit is failed" in buf.getvalue()
+
+
+async def test_cmd_boot_status_units_reports_drift_and_dead_and_exits_nonzero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+    from contextlib import redirect_stdout
+
+    monkeypatch.setattr(
+        "src.cli.unit_drift_notes",
+        lambda root, d: ["osiris-pulse.service: DRIFTED — installed content differs"])
+
+    async def _fake_health(units: list[str]) -> dict[str, dict[str, str]]:
+        return {"osiris-mcp": {"is-enabled": "enabled", "is-failed": "failed"}}
+
+    monkeypatch.setattr("src.cli._real_unit_health", _fake_health)
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        out = await cmd_boot_status(units=True)
+    assert out == 1
+    out_text = buf.getvalue()
+    assert "DRIFT: osiris-pulse.service" in out_text
+    assert "DEAD: osiris-mcp" in out_text
+
+
+async def test_cmd_boot_status_units_json_mode_emits_both_lists(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("src.cli.unit_drift_notes", lambda root, d: [])
+
+    async def _fake_health(units: list[str]) -> dict[str, dict[str, str]]:
+        return {u: {"is-enabled": "enabled", "is-failed": "active"} for u in units}
+
+    monkeypatch.setattr("src.cli._real_unit_health", _fake_health)
+
+    out = await cmd_boot_status(units=True, as_json=True)
+    assert out == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"drift": [], "enabled_but_dead": []}
 
 
 async def test_cmd_boot_status_names_a_gap_and_exits_nonzero(

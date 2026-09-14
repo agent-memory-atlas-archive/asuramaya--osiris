@@ -11,12 +11,21 @@
 # 3-infra) — it is no longer hand-authored or hand-copied.
 [Unit]
 Description=Osiris worker (Arq: cascade drain, watch evaluator, reaper)
-After=network-online.target
+After=network-online.target docker.service
 Wants=network-online.target
+# REBOOT SURVIVAL (thread 194eac83, operator ruling aaa8e841): disables systemd's own
+# default 5-tries/10s start-limit so a slow-to-answer dependency after a cold boot never
+# permanently strands a unit that would otherwise self-heal via Restart=always.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 WorkingDirectory=%h/code/osiris
+# REBOOT SURVIVAL (thread 194eac83): After=docker.service orders unit start correctly, but
+# docker's own container health lags its own systemd unit becoming active — this blocks
+# activation until postgres actually answers on :5601 rather than racing it (/dev/tcp is a
+# bash builtin, no extra binary dependency).
+ExecStartPre=/bin/bash -c 'until (echo > /dev/tcp/127.0.0.1/5601) 2>/dev/null; do sleep 1; done'
 # application_name identifies this daemon's own connections in pg_stat_activity — asyncpg
 # forwards any DSN query param it doesn't recognize straight into server_settings
 # (connect_utils.py), so no code change was needed.
@@ -62,7 +71,7 @@ MemoryMax=3G
 # companion, at ~21.6GB RSS + a chrome renderer at 7.9GB, drove the box to 49G/61G used +
 # 15G swap) took osiris-worker down with 'oom-kill' alongside osiris-mcp — neither was the
 # hog. Same rationale/value as deploy/user/osiris-mcp.service's own OOMScoreAdjust: matches
-# deploy/osiris-manager.service's precedent (-900) at a more moderate -500, since the worker
+# deploy/user/osiris-manager.service's precedent (-900) at a more moderate -500, since the worker
 # also legitimately grows (real cascade/watch work) and a near-immune score would be the
 # wrong trade if it were ever genuinely the runaway.
 OOMScoreAdjust=-500

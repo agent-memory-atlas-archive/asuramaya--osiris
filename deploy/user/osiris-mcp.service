@@ -10,8 +10,12 @@
 # infra) — it is no longer hand-authored or hand-copied.
 [Unit]
 Description=Osiris persistent MCP server (dev, streamable-http :8790)
-After=network-online.target
+After=network-online.target docker.service
 Wants=network-online.target
+# REBOOT SURVIVAL (thread 194eac83, operator ruling aaa8e841): disables systemd's own
+# default 5-tries/10s start-limit so a slow-to-answer dependency after a cold boot never
+# permanently strands a unit that would otherwise self-heal via Restart=always.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -30,6 +34,11 @@ Environment=OSIRIS_MCP_PORT=8790
 # coin flip on whatever PATH the user manager happened to carry. It lost silently for
 # 10 hours on 2026-07-12 (48/48 ticks: 'no LLM provider for session-sensing'). Pinned.
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# REBOOT SURVIVAL (thread 194eac83): After=docker.service orders unit start correctly, but
+# docker's own container health lags its own systemd unit becoming active — this blocks
+# activation until postgres actually answers on :5601 rather than racing it (/dev/tcp is a
+# bash builtin, no extra binary dependency).
+ExecStartPre=/bin/bash -c 'until (echo > /dev/tcp/127.0.0.1/5601) 2>/dev/null; do sleep 1; done'
 ExecStart=%h/code/osiris/.venv/bin/python -m src.mcp_server
 Restart=always
 RestartSec=5
@@ -40,7 +49,7 @@ MemoryMax=3G
 # companion, at ~21.6GB RSS + a chrome renderer at 7.9GB, drove the box to 49G/61G used +
 # 15G swap) took osiris-mcp and osiris-worker down alongside it — neither was the hog,
 # but neither had any standing next to whatever else was on the box either. Matches
-# deploy/osiris-manager.service's own precedent (OOMScoreAdjust=-900, "under system-wide
+# deploy/user/osiris-manager.service's own precedent (OOMScoreAdjust=-900, "under system-wide
 # memory pressure the kernel should reclaim from bodies long before it ever looks at the
 # sacred proc") at a more moderate value: mcp is heavier and legitimately grows (a shared
 # pool for the whole fleet), so -900's near-immunity would be the wrong trade if IT ever
