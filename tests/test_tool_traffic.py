@@ -16,12 +16,20 @@ from src.actions.core import Actions
 def _clean_tool_stats(monkeypatch: pytest.MonkeyPatch) -> None:
     """Module globals are process-wide state — reset before AND after every test so one
     test's counts can never leak into the next (the same discipline `_seam_pcts.clear()`
-    uses in test_seam_whisper.py)."""
+    uses in test_seam_whisper.py). `_in_flight_calls` and `_watchdog_task` (THE STALL
+    WATCHDOG, thread 0be2f790) are the same class of module-global state — cleaned up
+    the identical way, and any watchdog task a test started is cancelled here rather
+    than left running past its own test."""
     srv._tool_call_stats.clear()
     srv._tool_stats_window_start = None
+    srv._in_flight_calls.clear()
     yield
     srv._tool_call_stats.clear()
     srv._tool_stats_window_start = None
+    srv._in_flight_calls.clear()
+    if srv._watchdog_task is not None:
+        srv._watchdog_task.cancel()
+        srv._watchdog_task = None
 
 
 @pytest.fixture
@@ -279,3 +287,134 @@ async def test_tool_traffic_alias_decay_instrument_reads_the_absorbed_action_not
     assert stop["own_name_calls"] == 0
     assert stop["absorbed_action_calls"] == 0
     assert stop["eligible_for_removal"] is True
+
+
+# --- THE STALL WATCHDOG (thread 0be2f790, THE OSIRIS-MCP MAIN-THREAD STALL, Thoth ------
+# --- mail 10625): in-flight visibility + a background task that logs every thread's ----
+# --- own stack the moment a call passes the stall threshold ----------------------------
+
+def test_log_all_thread_stacks_logs_every_live_thread() -> None:
+    class _FakeLog:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        def warning(self, msg: str) -> None:
+            self.messages.append(msg)
+
+    log = _FakeLog()
+    srv._log_all_thread_stacks(log, reason="test reason 12345")
+    assert len(log.messages) == 1
+    assert "test reason 12345" in log.messages[0]
+    assert "live thread" in log.messages[0]
+    assert "thread " in log.messages[0]  # at least one "--- thread <id> ---" section
+
+
+@pytest.mark.asyncio
+async def test_watchdog_logs_once_when_a_call_crosses_the_threshold(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    import asyncio
+    import contextlib
+    import logging
+    import time
+
+    monkeypatch.setattr(srv, "_WATCHDOG_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(srv, "_WATCHDOG_STALL_THRESHOLD_S", 0.02)
+    call_id = next(srv._in_flight_next_id)
+    srv._in_flight_calls[call_id] = {
+        "tool": "search", "caller": "agent:thoth", "started_at": time.monotonic() - 1.0,
+        "logged": False,
+    }
+
+    task = asyncio.create_task(srv._watchdog_loop())
+    try:
+        with caplog.at_level(logging.WARNING, logger="osiris.mcp.watchdog"):
+            await asyncio.sleep(0.08)  # several poll intervals — proves ONCE, not repeated
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert srv._in_flight_calls[call_id]["logged"] is True
+    slow_records = [r for r in caplog.records if "SLOW TOOL CALL" in r.message]
+    assert len(slow_records) == 1  # exactly once, never re-fired for the same call_id
+    assert "'search'" in slow_records[0].message
+    assert "agent:thoth" in slow_records[0].message
+
+
+@pytest.mark.asyncio
+async def test_watchdog_never_logs_a_call_under_the_threshold(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    import asyncio
+    import contextlib
+    import logging
+    import time
+
+    monkeypatch.setattr(srv, "_WATCHDOG_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(srv, "_WATCHDOG_STALL_THRESHOLD_S", 5.0)
+    call_id = next(srv._in_flight_next_id)
+    srv._in_flight_calls[call_id] = {
+        "tool": "search", "caller": "agent:thoth", "started_at": time.monotonic(),
+        "logged": False,
+    }
+
+    task = asyncio.create_task(srv._watchdog_loop())
+    try:
+        with caplog.at_level(logging.WARNING, logger="osiris.mcp.watchdog"):
+            await asyncio.sleep(0.05)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert srv._in_flight_calls[call_id]["logged"] is False
+    assert not any("SLOW TOOL CALL" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_ensure_watchdog_task_is_idempotent() -> None:
+    srv._ensure_watchdog_task()
+    first = srv._watchdog_task
+    assert first is not None and not first.done()
+    srv._ensure_watchdog_task()
+    assert srv._watchdog_task is first  # no second task spawned while one is live
+    first.cancel()
+
+
+@pytest.mark.asyncio
+async def test_tool_traffic_carries_the_in_flight_list(
+    actions: Actions, _use_test_pool: None,
+) -> None:
+    """tool_traffic() is itself an in-flight call by the time its own body runs
+    (BoundedMCP.call_tool registers the entry before the tool body starts) — this test
+    calls `srv.tool_traffic` directly (never through BoundedMCP), so no such entry
+    exists here; only the synthetic ones this test seeds are expected."""
+    import time
+
+    fresh_id = next(srv._in_flight_next_id)
+    stale_id = next(srv._in_flight_next_id)
+    srv._in_flight_calls[fresh_id] = {
+        "tool": "mount", "caller": "agent:thoth", "started_at": time.monotonic(),
+        "logged": False}
+    srv._in_flight_calls[stale_id] = {
+        "tool": "search", "caller": "agent:seshat",
+        "started_at": time.monotonic() - 42.0, "logged": True}
+
+    out = await srv.tool_traffic(window_minutes=5)
+
+    by_id = {r["call_id"]: r for r in out["in_flight"]}
+    assert by_id[fresh_id]["tool"] == "mount"
+    assert by_id[fresh_id]["caller"] == "agent:thoth"
+    assert by_id[fresh_id]["elapsed_secs"] < 1.0
+    assert by_id[stale_id]["elapsed_secs"] >= 42.0
+    # sorted longest-in-flight first — the row an operator actually needs to see
+    assert out["in_flight"][0]["call_id"] == stale_id
+
+
+@pytest.mark.asyncio
+async def test_tool_traffic_in_flight_is_empty_with_nothing_running(
+    actions: Actions, _use_test_pool: None,
+) -> None:
+    out = await srv.tool_traffic(window_minutes=5)
+    assert out["in_flight"] == []
