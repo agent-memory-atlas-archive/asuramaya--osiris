@@ -638,8 +638,10 @@ _LINK_TYPES: tuple[LinkType, ...] = (
              "read-set writes exactly as before this edge existed. Properties: `door` "
              "(which surface produced the read) and a read timestamp; both carried in "
              "the link's own `properties` jsonb, no schema migration. Never targets the "
-             "operator's own words.",
-             ("Decision", "Thread"),
+             "operator's own words. Domain widened for piece 1's own project(action="
+             "'assert_property') write door (Sekhmet, rebase onto 3beae6f) — a fact-"
+             "write there touches a SoftwareProject, not just a Decision/Thread.",
+             ("Decision", "Thread", "SoftwareProject"),
              ("Message", "Decision", "Thread", "Reference", "Agent", "URL")),
 )
 

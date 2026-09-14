@@ -19,7 +19,9 @@ from typing import Any
 
 import asyncpg
 
+from src.actions.core import Actions
 from src.ontology.labels import fetch_label_props, resolve_label
+from src.orchestrator import credence
 
 # Identity bookkeeping links (merge plumbing) are not part of the entity's network.
 _HIDDEN_LINK_TYPES = ("same_as", "not_same_as")
@@ -142,6 +144,16 @@ async def entity_dossier(
             "evidence_class": r["evidence_class"],
             "confidence": r["confidence"],
         })
+    # PROVENANCE PIECE 1 (thread da545039f2ba): possible_upstream edges for every
+    # agent source that has touched THIS object, fetched once and sliced per-property
+    # below — a second, orthogonal independence signal beside `agreement`'s own raw
+    # value-count (agreement asks "did they say the same thing"; distinct_upstreams
+    # asks "even where they disagree or agree, how many of them could plausibly trace
+    # to the same upstream read, rather than being genuinely separate witnesses").
+    all_agent_srcs = {v["source"] for entry in properties.values() for v in entry["values"]
+                      if v["source"].startswith("agent:")}
+    ups = await credence.upstream_sets(Actions(pool), object_id, list(all_agent_srcs))
+    looked = await credence._looked_map(Actions(pool), all_agent_srcs)
     for entry in properties.values():
         distinct = {v["value"] for v in entry["values"]}
         entry["agreement"] = (
@@ -149,6 +161,9 @@ async def entity_dossier(
             "agreeing" if len(distinct) == 1 else
             "contradicting"
         )
+        prop_srcs = {v["source"] for v in entry["values"]}
+        entry["distinct_upstreams"] = credence.distinct_upstream_count(
+            {s: ups.get(s, frozenset()) for s in prop_srcs}, looked)
 
     # relationships, both directions, neighbor labelled and typed. Repeated edges
     # (same direction, type, neighbor) are collapsed: a duplicated link carries no

@@ -216,7 +216,7 @@ async def assert_project_property(
         return {"error": f"no such SoftwareProject: {project!r}"}
     await actions.assert_property(row["id"], name, value, actor, datetime.now(UTC), _CONF,
                                   evidence_class=_EC)
-    return {"project": row["canonical"], "name": name, "value": value}
+    return {"project": row["canonical"], "name": name, "value": value, "id": str(row["id"])}
 
 
 # --- set_project_window_tag (window-tag-gets-an-owner, decision 26f4f825's corollary) -----

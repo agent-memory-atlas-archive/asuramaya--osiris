@@ -54,6 +54,7 @@ from src.orchestrator import (
     handshake,
     mailbox,
     mounts,
+    provenance,
     resource_lease,
     task_sync,
 )
@@ -1229,6 +1230,31 @@ async def _source_for(ctx: Context | None, anchor: str | None = None) -> str:
     return ident.agent_id if ident else "session"
 
 
+async def _stamp_read_ids(
+    pool: asyncpg.Pool, ident: AgentIdentity | None, door: str, object_ids: list[Any],
+) -> None:
+    """PROVENANCE PIECE 1 (thread da545039f2ba): log this session's read-set at the
+    door, for every real object id a read tool is about to hand back. A no-op when
+    nobody is mounted (`ident is None`) — an unattributed read has no session for a
+    later write to be dependent ON. Never lets a stamping failure break the read tool
+    it rides along on (the same fails-open discipline this house already applies to
+    every other side channel that must never become the thing it's watching, e.g.
+    trigger.py's own `_manager_windows` docstring) — the caller's real result is
+    already decided by the time this runs."""
+    if ident is None or not object_ids:
+        return
+    import logging
+
+    try:
+        for raw in object_ids:
+            oid = raw if isinstance(raw, uuid.UUID) else uuid.UUID(str(raw))
+            await provenance.stamp_read(pool, agent_id=ident.agent_id, door=door,
+                                        object_id=oid)
+    except Exception:
+        logging.getLogger("osiris.mcp").exception(
+            "read-set stamping failed for door=%s (non-fatal)", door)
+
+
 _spawns_seen: dict[str, float] = {}  # child agent id → last registration (skip re-registering)
 _SPAWN_TTL = 600.0
 
@@ -1318,6 +1344,8 @@ async def search(
     out = await comp.run_spec(pool, spec, None, name="search",
                               caller=(ident.agent_id if ident else None))
     items: dict[str, Any] = out["items"]  # unwrap the composition envelope
+    await _stamp_read_ids(pool, ident, "search",
+                          [h["id"] for h in items.get("hits", [])])
     return items
 
 
@@ -1522,7 +1550,7 @@ async def identify_agent(ref: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def recall(ref: str, kind: str | None = None) -> dict[str, Any]:
+async def recall(ref: str, kind: str | None = None, ctx: Context | None = None) -> dict[str, Any]:
     """The full, untruncated record for a Thread or Decision — reach for this after
     orient()'s 160-char summary cap (task #60) leaves you wanting the whole thing. `ref` is
     a UUID, the 8-char short id orient() already hands you, or a summary substring. `kind`
@@ -1534,7 +1562,14 @@ async def recall(ref: str, kind: str | None = None) -> dict[str, Any]:
     empty when none. This is where those two verbs' own writes become visible; before this,
     neither surfaced anywhere a reader would think to look."""
     from src.orchestrator.recall import recall as _recall
-    return await _recall(await _pool_get(), ref, kind=kind)
+    pool = await _pool_get()
+    rec = await _recall(pool, ref, kind=kind)
+    canon = rec.get("canonical")
+    if canon:
+        ident = await _ident_for(ctx)
+        oid = await pool.fetchval("SELECT id FROM objects WHERE canonical=$1", canon)
+        await _stamp_read_ids(pool, ident, "recall", [oid] if oid else [])
+    return rec
 
 
 # --- collect (federate a base) ----------------------------------------------
@@ -1695,7 +1730,8 @@ async def consolidate(ctx: Context | None = None) -> dict[str, Any]:
 # --- analyze (read-model lenses) --------------------------------------------
 
 @mcp.tool()
-async def dossier(object_ref: str, want_relationships: bool = False) -> dict[str, Any]:
+async def dossier(object_ref: str, want_relationships: bool = False,
+                  ctx: Context | None = None) -> dict[str, Any]:
     """Who is this? Identity properties + the named relationship network. `object_ref`
     accepts a UUID, an 8-char short id (the same one a composition row's own "id" column
     hands out), a canonical, or a name. For an AGENT specifically, this is where succession
@@ -1711,6 +1747,8 @@ async def dossier(object_ref: str, want_relationships: bool = False) -> dict[str
     oid = await _resolve(pool, object_ref)
     if not oid:
         return {"error": f"no object {object_ref!r}"}
+    ident = await _ident_for(ctx)
+    await _stamp_read_ids(pool, ident, "dossier", [oid])
     return await entity_dossier(pool, oid, want_relationships=want_relationships)
 
 
@@ -4546,6 +4584,7 @@ async def graph_search(
     out = await comp.run_spec(pool, spec, None, name="graph_search", caller=caller)
     items = out.get("items", {})
     hits = items.get("hits", [])
+    await _stamp_read_ids(pool, ident, "graph_search", [h["id"] for h in hits])
     return {"hits": hits, "q": query,
             "scoped_to": {"project": project, "lineage": lineage}}
 
@@ -6083,6 +6122,17 @@ async def inbox(project: str | None = None, peek: bool = False,
     if flight:  # msg-78 lesson: an empty box with a held lease is NOT 'nothing happening'
         note += (f" — {len(flight)} in flight (leased by "
                  + ", ".join(sorted({f['leased_by'] for f in flight})) + ")")
+    if not spawn_reader and ident is not None:
+        # PROVENANCE PIECE 1: each message read gets its EXISTING Message object
+        # (mailbox.py's own send() already mints one for every message; never a fresh
+        # mint from the read side) — None (skipped) for an operator-authored message
+        # or one whose graph write never landed at send time.
+        msg_oids = []
+        for m in msgs:
+            oid = await provenance.message_object_id(pool, m["id"], m.get("from"))
+            if oid is not None:
+                msg_oids.append(oid)
+        await _stamp_read_ids(pool, ident, "inbox-peek" if peek else "inbox-lease", msg_oids)
     if render == "text":
         from src.orchestrator.textrender import render_mail_text
         text = render_mail_text(msgs)
@@ -6840,8 +6890,13 @@ async def _project_impl(
         from src.orchestrator.projects import (
             assert_project_property as _assert_project_property,
         )
-        return await _assert_project_property(Actions(await _pool_get()), project=project,
-                                              name=name, value=value, actor=ident.agent_id)
+        pool = await _pool_get()
+        out = await _assert_project_property(Actions(pool), project=project,
+                                             name=name, value=value, actor=ident.agent_id)
+        if out.get("id"):
+            await provenance.stamp_possible_upstream(
+                Actions(pool), written_object_id=uuid.UUID(out["id"]), source_id=ident.agent_id)
+        return out
     if action == "set_tag":
         assert project is not None and tag is not None and because is not None
         ident = await _ident_for(ctx)
@@ -8917,6 +8972,7 @@ async def record_decision(
         )
     except ValueError as e:  # task #107: e.g. a path-shaped repo — refuse clean, no traceback
         return {"error": str(e)}
+    await provenance.stamp_possible_upstream(Actions(pool), written_object_id=d, source_id=actor)
     # RECEIPT DIET (msg 6871): `summary` is NOT echoed back — the caller supplied it this
     # same turn, so echoing it verbatim is pure duplication. `resolved_thread(s)` below
     # still echoes ITS OWN summary (the closed THREAD's words, not this call's) because
@@ -9589,6 +9645,7 @@ async def ingest_reference(
         )
     except ValueError as e:  # task #107: e.g. a path-shaped repo — refuse clean, no traceback
         return {"error": str(e)}
+    await _stamp_read_ids(pool, ident, "ingest_reference", [ref])
     out: dict[str, Any] = {"id": str(ref), "canonical": canon,
                            "note": "cite it: record_decision(..., grounds=['" + canon + "'])"}
     if repo_defaulted:
@@ -9732,6 +9789,8 @@ async def read_citation(
         result = await capture.read_transcript_citation(pool, from_id, agent)
     except ValueError as err:
         return {"error": str(err)}
+    ident = await _ident_for(ctx)
+    await _stamp_read_ids(pool, ident, "read_citation", [from_id])
     return result
 
 
@@ -9912,6 +9971,7 @@ async def open_thread(
         )
     except ValueError as e:
         return {"error": str(e)}
+    await provenance.stamp_possible_upstream(Actions(pool), written_object_id=t, source_id=actor)
     if arc and not await capture.arc_in_scope(pool, repo):
         arc_receipt = capture._arc_out_of_scope_note(f"repo:{repo}" if repo else "(no project)")
     else:
@@ -10113,6 +10173,8 @@ async def _thread_action_impl(
             return {"error": str(e)}
         if tid is None:
             return {"error": f"no thread matches {ref!r}"}
+        await provenance.stamp_possible_upstream(Actions(pool), written_object_id=tid,
+                                                 source_id=actor)
         out = {"id": str(tid), "note": note.strip(), "status": "annotated"}
         if corrected_summary:
             out["corrected_summary"] = corrected_summary.strip()
