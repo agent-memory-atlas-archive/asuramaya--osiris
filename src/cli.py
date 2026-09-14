@@ -669,6 +669,64 @@ async def cmd_lint(
     return 1
 
 
+# --- graph-export --------------------------------------------------------------------------------
+
+async def cmd_graph_export(
+    *, out: str | None = None, as_json: bool = False, pool: asyncpg.Pool | None = None,
+) -> int:
+    """osiris graph-export --out FILE [--json] — the CLI mirror of GET /graph/stream
+    (NAVIGABLE SPACE, THE SERVER piece B, thread b6cb1d7c0b36): calls the SAME
+    src.orchestrator.graph_stream.fetch_snapshot the REST route calls, direct-to-
+    Postgres and headless (this command owns its own pool, no MCP/HTTP round trip) —
+    the same Pattern B shape as `osiris lint`, chosen because bulk-exporting tens of
+    thousands of positioned objects through an MCP round trip is the wrong shape for
+    this door. `--json` prints a header-only summary (schema_version/count/edge_count/
+    types/projects, no array bodies); `--out FILE` writes the exact binary payload
+    /graph/stream itself would have returned — pass both to get the summary AND the
+    file."""
+    from src.orchestrator.graph_stream import decode_snapshot, fetch_snapshot
+
+    owns_pool = pool is None
+    if pool is None:
+        from src.config.dev_env import apply_dev_fallback
+        from src.config.settings import get_settings
+        from src.db.pool import create_pool
+
+        apply_dev_fallback()
+        settings = get_settings()
+        try:
+            pool = await create_pool(
+                settings.database_url, min_size=1, max_size=4,
+                application_name="osiris-cli:graph-export")
+        except Exception as exc:  # noqa: BLE001 - the CLI boundary: report, no raw traceback
+            print(f"osiris graph-export: could not reach postgres at "
+                  f"{settings.database_url} — {exc}. Set DATABASE_URL, or start the dev "
+                  f"instance.", file=sys.stderr)
+            return 1
+    try:
+        data = await fetch_snapshot(pool)
+    finally:
+        if owns_pool:
+            await pool.close()
+
+    if not out and not as_json:
+        print("osiris graph-export: pass --out FILE to write the binary snapshot, or "
+              "--json for a header-only summary (or both)", file=sys.stderr)
+        return 1
+
+    if as_json:
+        from src import cli_render as render
+        header = decode_snapshot(data)
+        summary = {k: header[k] for k in
+                   ("schema_version", "count", "edge_count", "types", "projects")}
+        render.emit(summary, as_json=True)
+    if out:
+        await asyncio.to_thread(Path(out).write_bytes, data)
+        if not as_json:
+            print(f"osiris graph-export: wrote {len(data)} bytes to {out}")
+    return 0
+
+
 # --- audit -------------------------------------------------------------------------------------
 
 # The 5 audit-shaped siblings graph_lint keeps beside it in the CMD-K palette (WAVE 22 scope
@@ -6398,7 +6456,7 @@ COMMANDS, GROUPED BY WHAT YOU'RE TRYING TO DO:
   start a mind          new, launch, resume, mint-seat, attach
   end one               stop
   see the fleet         fleet, roster, backlog, team, status, boot-status, smoke, lint,
-                        audit
+                        audit, graph-export
   read the record       desk, show, threads, inbox, search, dossier, object-events,
                         succession-chain, candidates, composition, citation
   write to the record   send, decide, thread, annotate-thread, amend-decision,
@@ -6512,6 +6570,18 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="with --check: page size past the default full fetch")
     p_lint.add_argument("--offset", type=int, default=0,
                         help="with --check: page offset")
+
+    p_graph_export = sub.add_parser("graph-export", description=_d(
+        "the CLI mirror of GET /graph/stream (NAVIGABLE SPACE, THE SERVER piece B, "
+        "thread b6cb1d7c0b36) — the whole graph as typed arrays, direct-to-Postgres "
+        "and headless"),
+        epilog="example: osiris graph-export --out graph.bin\n"
+               "example: osiris graph-export --json")
+    p_graph_export.add_argument("--out", default=None,
+                        help="file path to write the exact binary snapshot payload to")
+    p_graph_export.add_argument("--json", action="store_true", dest="as_json",
+                        help="print a header-only summary (schema_version/count/"
+                             "edge_count/types/projects, no array bodies)")
 
     p_audit = sub.add_parser("audit", description=_d(
         "headless mirror of graph_lint's own CMD-K audit siblings — one door for all "
@@ -7759,6 +7829,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(cmd_lint(
             check=args.check, project=args.project, as_json=args.as_json,
             stale_days=args.stale_days, limit=args.limit, offset=args.offset))
+    if args.command == "graph-export":
+        return asyncio.run(cmd_graph_export(out=args.out, as_json=args.as_json))
     if args.command == "audit":
         return asyncio.run(cmd_audit(args.name, as_json=args.as_json))
     if args.command == "seed":

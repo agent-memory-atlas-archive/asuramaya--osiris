@@ -773,6 +773,40 @@ def create_app(pool: asyncpg.Pool | None = None) -> FastAPI:
             for r in rows
         ]}
 
+    @app.get("/graph/stream")
+    async def graph_stream_snapshot(p: asyncpg.Pool = Depends(get_pool)) -> Response:
+        """NAVIGABLE SPACE, THE SERVER, piece B (rulings f832c3a4 + 0a3d6719, thread
+        b6cb1d7c0b36): the whole graph as typed arrays, shape agreed by DM with Seshat
+        (mail 10439/10449/10451) before this was frozen. See
+        src.orchestrator.graph_stream's own module docstring for the exact wire format
+        -- this route is a thin wrapper: `fetch_snapshot` does the whole query+encode."""
+        from src.orchestrator.graph_stream import fetch_snapshot
+
+        data = await fetch_snapshot(p)
+        return Response(content=data, media_type="application/octet-stream")
+
+    @app.get("/graph/stream/deltas")
+    async def graph_stream_deltas(request: Request) -> StreamingResponse:
+        """SSE: pushes graph deltas (moved/added/retired, keyed by object id -- see the
+        module docstring for why not array index) since the last poll, over the SAME
+        poll-and-diff loop /cases/{id}/stream and /console/stream already use. A fresh
+        connection starts from cursor 0 (a full backlog on first connect is deliberate --
+        a client is expected to have just fetched /graph/stream and wants everything
+        that changed since, not since some arbitrary "now")."""
+        from src.orchestrator.graph_stream import deltas_since
+
+        async def gen() -> AsyncIterator[str]:
+            cursor = 0
+            while not await request.is_disconnected():
+                deltas, cursor = await deltas_since(request.app.state.pool, cursor)
+                if deltas:
+                    yield f"data: {_json.dumps(deltas)}\n\n"
+                else:
+                    yield ": keep-alive\n\n"
+                await asyncio.sleep(1.0)
+
+        return StreamingResponse(gen(), media_type="text/event-stream")
+
     @app.get("/objects/{object_id}")
     async def get_object(
         object_id: uuid.UUID, p: asyncpg.Pool = Depends(get_pool)
