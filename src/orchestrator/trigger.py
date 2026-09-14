@@ -936,6 +936,13 @@ def _turn_fresh_sync(root: Path, sid: str, active_secs: int, job_dir: str = "") 
     touches the file without writing). A turn appends timestamped records; a toucher
     cannot. No timestamp in the tail = not moving.
 
+    A TIMESTAMP ALONE IS NOT A TURN (thread bc6a5d455da2, the 2026-09-13 17:26 CDT
+    reboot specimen): a daemon resume appears to append its own fresh-timestamped
+    housekeeping line (`type: system`) as part of restoring a backgrounded body — not a
+    conversational turn — and that line is otherwise indistinguishable by timestamp alone
+    from a real one. Only `type: user`/`assistant` counts; every other type is skipped as
+    if it carried no timestamp at all, so a resumed-but-idle body reads idle, not mid-turn.
+
     ANCHORED, NEVER GLOBBED (the wire-resume-to-store finding, decision pending, msg
     6653/Thoth: "the same disease we just spent the night removing, one function over"):
     used to be `next(iter(root.glob(f"*/{sid}.jsonl")), None)` — an UNANCHORED search
@@ -974,9 +981,24 @@ def _turn_fresh_sync(root: Path, sid: str, active_secs: int, job_dir: str = "") 
         return False
     for line in reversed(tail.splitlines()):
         try:
-            ts = json.loads(line).get("timestamp")
-        except (ValueError, AttributeError):
+            d = json.loads(line)
+        except ValueError:
             continue
+        if not isinstance(d, dict):
+            continue
+        # A REAL TURN ONLY (thread bc6a5d455da2, the reboot specimen): a daemon resume
+        # appends its own fresh-timestamped housekeeping line — `type: system`, no
+        # different in shape from the `turn_duration`/`stop_hook_summary` lines a real
+        # turn also leaves behind — and the OLD check here counted ANY recent timestamp,
+        # never what kind of line carried it, so a resumed-but-idle body read as
+        # genuinely mid-turn and its mail held for as long as nothing else touched the
+        # file. Only `type: user`/`assistant` is a conversational turn (the same
+        # convention sessions.py/soul_store.py/context_lens.py/stophook_logic.py already
+        # use to tell content from housekeeping) — a system/summary/hook line is skipped
+        # here exactly as if it carried no timestamp at all, never read as a turn.
+        if d.get("type") not in ("user", "assistant"):
+            continue
+        ts = d.get("timestamp")
         if not ts:
             continue
         try:
