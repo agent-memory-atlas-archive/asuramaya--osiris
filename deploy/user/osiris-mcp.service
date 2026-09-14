@@ -29,6 +29,18 @@ Environment=REDIS_URL=redis://127.0.0.1:6396/0
 Environment=OSIRIS_MCP_TRANSPORT=streamable-http
 Environment=OSIRIS_MCP_HOST=127.0.0.1
 Environment=OSIRIS_MCP_PORT=8790
+# THE FREE OBSERVER'S ROOT (thread e332177f, operator's own box, 2026-09-14): this unit
+# never carried OSIRIS_TRANSCRIPTS at all — osiris-worker's own OSIRIS_SENSE_SESSIONS
+# below is a DIFFERENT, deliberately separate switch (settings.py's own docstring on
+# osiris_transcripts: "KILLING THE EXPENSIVE INFERRER MUST NEVER BLIND THE FREE
+# OBSERVER"), so setting one never implied the other. Every transcript-reading path that
+# runs INSIDE this process (the provenance backfill's own transcript index, and the
+# liveness transcript-mtime fallback whenever it's reached through an MCP door) was
+# silently inert with settings.osiris_transcripts defaulting to "". Registered as
+# `ingest.transcripts_root` in settings_registry.py (effect=restart:osiris-mcp) — an
+# operator override there is substituted in here by render_units.py on the next deploy
+# or boot-heal pass; this line is only the SHIPPED default.
+Environment=OSIRIS_TRANSCRIPTS=%h/.claude/projects
 # The LLM provider is resolved with shutil.which('claude') at RUN time, and a user
 # unit does not inherit a login shell's PATH — so the session-miner's provider was a
 # coin flip on whatever PATH the user manager happened to carry. It lost silently for

@@ -85,6 +85,37 @@ def _sub_console_port(text: str, value: Any) -> str:
     return re.sub(r"--port \d+", f"--port {int(value)}", text)
 
 
+def _sub_env_var(name: str) -> Callable[[str, Any], str]:
+    """`Environment=<name>=<value>` substitution, generic (thread e332177f: the first
+    caller is `ingest.transcripts_root` -> `OSIRIS_TRANSCRIPTS`, but the shape is the
+    same for any single-line env override). REPLACE in place when the line already
+    exists (the common case — every unit this touches ships a real default line);
+    otherwise INSERT one right before `[Install]`, mirroring `_sub_memory_max`'s own
+    "insert a genuinely new line" branch. An empty/None `value` means "no configured
+    override" — the shipped line is left untouched either way."""
+    prefix = f"Environment={name}="
+
+    def _sub(text: str, value: Any) -> str:
+        value = value.strip() if isinstance(value, str) else value
+        if not value:
+            return text
+        lines = text.splitlines()
+        out: list[str] = []
+        replaced = False
+        for line in lines:
+            if line.startswith(prefix):
+                replaced = True
+                out.append(f"{prefix}{value}")
+            else:
+                out.append(line)
+        if not replaced:
+            idx = next((i for i, ln in enumerate(out) if ln.strip() == "[Install]"), len(out))
+            out.insert(idx, f"{prefix}{value}")
+        return "\n".join(out) + "\n"
+
+    return _sub
+
+
 def _looks_like_a_real_unit(text: str) -> bool:
     """The reboot-survival guard (Thoth's ruling, mail 10247/10261): a rendered unit
     is never installed unless it still has a real `[Unit]` `Description=` line and a
@@ -121,7 +152,10 @@ def _timer_schedule_keys() -> dict[str, str]:
 
 # deploy/user/<name>.service -> the (key, substitution) pairs applied to it, in order.
 _DAEMON_SERVICE_SUBS: dict[str, list[tuple[str, Callable[[str, Any], str]]]] = {
-    "osiris-mcp.service": [("daemon.osiris_mcp.memory_max", _sub_memory_max)],
+    "osiris-mcp.service": [
+        ("daemon.osiris_mcp.memory_max", _sub_memory_max),
+        ("ingest.transcripts_root", _sub_env_var("OSIRIS_TRANSCRIPTS")),
+    ],
     "osiris-worker.service": [("daemon.osiris_worker.memory_max", _sub_memory_max)],
     "osiris-pulse.service": [
         ("daemon.osiris_pulse.memory_max", _sub_memory_max),

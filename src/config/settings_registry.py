@@ -462,9 +462,23 @@ _POOL_SIZES: tuple[SettingSpec, ...] = (
                env_field="osiris_manager_pool_size"),
 )
 
+# THE TRANSCRIPTS ROOT (thread e332177f, 2026-09-14, "the oldest-first default made the
+# sample blind" investigation's own root cause): osiris-mcp.service never set
+# OSIRIS_TRANSCRIPTS at all, so `settings.osiris_transcripts` defaulted to "" inside the
+# MCP process — silently inert for every transcript-reading path that runs there (the
+# provenance backfill's own index, and the liveness transcript-mtime fallback whenever
+# it's reached through an MCP door). Same shape as `_POOL_SIZES` above (`env_field`-
+# driven, `restart:<unit>` — the value is read once at process boot, never live-
+# overlaid) rather than a new pattern.
+_INGEST_SETTINGS: tuple[SettingSpec, ...] = (
+    SettingSpec("ingest.transcripts_root", "path", "", effect="restart:osiris-mcp",
+               authority="operator_or_ruling", requires_because=True, consequence="low",
+               write_name="daemon_unit_literals", env_field="osiris_transcripts"),
+)
+
 SETTINGS: tuple[SettingSpec, ...] = (
     _MANAGER_OVERLAY + _SECRETS + _DAEMON_KILL_SWITCHES + _MINER_BUDGETS + _BACKUP_SETTINGS
-    + _WAKE_LADDER + _DIAGNOSTICS + _DAEMON_UNIT_LITERALS + _POOL_SIZES
+    + _WAKE_LADDER + _DIAGNOSTICS + _DAEMON_UNIT_LITERALS + _POOL_SIZES + _INGEST_SETTINGS
 )
 
 
