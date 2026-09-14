@@ -62,8 +62,11 @@ import hashlib
 import json
 import math
 import uuid
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from typing import Any
 
+import asyncpg
 import numpy as np
 
 from src.actions.core import Actions
@@ -476,14 +479,26 @@ async def _bulk_assert_positions(
                 [json.dumps(v) for v in values])
 
 
-async def layout_batch(actions: Actions, *, limit: int = _BATCH_SIZE) -> int:
+async def layout_batch(actions: Actions, *, limit: int | None = None) -> int:
     """One heartbeat tick: place up to `limit` objects still missing the current layout
     version -- a deterministic sunflower base position (project center by rank, object
     by its own rank within the (project, type) group), nudged by a few iterations of
     intra-project edge attraction anchored on already-placed same-project neighbors,
     then hard-declumped. Returns how many objects were newly positioned (0 when the
     graph is fully placed under the current version -- the tick's own natural
-    quiescence, no flag needed)."""
+    quiescence, no flag needed).
+
+    `limit=None` (every real caller -- the cron heartbeat and `run_layout_migrate`)
+    reads `layout.batch_size` off the LIVE settings table (Thoth mail 10609, product
+    law: every action has a door) via `current_stored_value` -- effect='next_tick' is
+    genuine here, not the env-overlay path that only covers effect='immediate' keys --
+    falling back to `_BATCH_SIZE` when the key has never been written. Passing an
+    explicit `limit` (every test in this module) bypasses the settings lookup
+    entirely, same as before."""
+    if limit is None:
+        from src.orchestrator.settings_service import current_stored_value
+        stored = await current_stored_value(actions.pool, "layout.batch_size")
+        limit = int(stored) if isinstance(stored, int | float) else _BATCH_SIZE
     unplaced = await unplaced_batch(actions, limit)
     if not unplaced:
         return 0
@@ -505,3 +520,57 @@ async def layout_batch(actions: Actions, *, limit: int = _BATCH_SIZE) -> int:
     now = datetime.now(UTC)
     await _bulk_assert_positions(actions, placed, now)
     return len(placed)
+
+
+_LAYOUT_LOCK_KEY = "graph_layout_batch"  # advisory-lock name shared by the cron
+                                        # heartbeat and run_layout_migrate below
+
+
+async def _try_acquire_layout_lock(conn: asyncpg.Connection) -> bool:
+    """SESSION-scoped `pg_try_advisory_lock`, deliberately -- a transaction-scoped
+    lock would release the instant the acquiring query's own tiny transaction
+    commits, defeating the entire point of holding it for a whole migration run.
+    The historical outage this house learned from (#172: a connection returned to
+    the pool while still holding a session lock wedged the fleet for 15 minutes) is
+    avoided by construction here, not by avoiding session locks altogether: the ONLY
+    caller, `run_layout_migrate`, always releases via `_release_layout_lock` in a
+    `finally` BEFORE the `async with actions.pool.acquire()` block that owns this
+    connection ever exits -- the lock is never left to the pool's own connection
+    reset to clean up."""
+    return bool(await conn.fetchval(
+        "SELECT pg_try_advisory_lock(hashtext($1))", _LAYOUT_LOCK_KEY))
+
+
+async def _release_layout_lock(conn: asyncpg.Connection) -> None:
+    await conn.execute("SELECT pg_advisory_unlock(hashtext($1))", _LAYOUT_LOCK_KEY)
+
+
+async def run_layout_migrate(
+    actions: Actions, *, limit: int | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    """THE MIGRATION DOOR (Thoth mail 10609): loop `layout_batch` until
+    `unplaced_batch` runs dry, yielding one receipt per batch as it happens rather
+    than collecting a final report -- a `graph_layout_v` bump otherwise waits on the
+    cron heartbeat's own 1000-objects/5-minute pace (hours for a real migration).
+    Refuses outright (yields a single `{"error": ...}` receipt, does no work) if the
+    cron heartbeat is mid-tick and already holds `_LAYOUT_LOCK_KEY` -- see
+    `_try_acquire_layout_lock`'s own docstring for why this is session-scoped and
+    safe. The SAME `layout_batch` the cron heartbeat calls -- never a second
+    implementation of the placement logic, just a tighter loop around it."""
+    async with actions.pool.acquire() as lock_conn:
+        if not await _try_acquire_layout_lock(lock_conn):
+            yield {"error": "the layout heartbeat (or another migrate run) currently "
+                            "holds the layout lock -- try again shortly"}
+            return
+        try:
+            batch_no = 0
+            total_placed = 0
+            while True:
+                n = await layout_batch(actions, limit=limit)
+                batch_no += 1
+                total_placed += n
+                yield {"batch": batch_no, "placed": n, "total_placed": total_placed}
+                if n == 0:
+                    break
+        finally:
+            await _release_layout_lock(lock_conn)

@@ -1482,6 +1482,25 @@ def create_app(pool: asyncpg.Pool | None = None) -> FastAPI:
             p, body.target, actor="analyst:operator", dry_run=body.dry_run,
             because=body.because or None, only_bases=body.only_bases)
 
+    # THE MIGRATION DOOR (Thoth mail 10609, product law: every action has a door) --
+    # mirrors the `layout_migrate` MCP tool and the `osiris layout --migrate` CLI
+    # command one-for-one, all three calling graph_layout.run_layout_migrate, never
+    # one wrapping another. Synchronous (the whole migration is a bounded loop over
+    # cheap batches, not a background job) -- refuses if the heartbeat is mid-tick.
+    @app.post("/layout/migrate")
+    async def layout_migrate_route(
+        body: LayoutMigrateBody, p: asyncpg.Pool = Depends(get_pool)
+    ) -> dict[str, Any]:
+        from src.actions.core import Actions
+        from src.orchestrator.graph_layout import run_layout_migrate
+
+        actions = Actions(p)
+        receipts = [r async for r in run_layout_migrate(actions, limit=body.limit)]
+        if receipts and "error" in receipts[0]:
+            return receipts[0]
+        total_placed = receipts[-1]["total_placed"] if receipts else 0
+        return {"batches": receipts, "total_placed": total_placed}
+
     @app.post("/desk/settle")
     async def desk_settle(
         body: DeskSettleBody, p: asyncpg.Pool = Depends(get_pool)
@@ -2137,6 +2156,12 @@ class BackfillBody(BaseModel):
     because: str = ""
     only_bases: list[str] | None = None
     ruling: str | None = None
+
+
+class LayoutMigrateBody(BaseModel):
+    """THE MIGRATION DOOR's own body (Thoth mail 10609) — `limit` overrides the live
+    `layout.batch_size` setting for this one run; omit it to use the setting."""
+    limit: int | None = None
 
 
 class ActBody(BaseModel):

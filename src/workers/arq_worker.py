@@ -1321,15 +1321,30 @@ async def graph_layout_heartbeat(ctx: dict[str, Any]) -> int:
     module's own docstring for why this is a LOCAL relaxation anchored on already-placed
     neighbors, never a global recompute. Read-mostly (the only writes are graph_x/graph_y
     assertions on objects that had none); one bad batch must not kill the cron, same "log
-    and wait for the next tick" law every other heartbeat here already holds itself to."""
-    from src.orchestrator.graph_layout import layout_batch
+    and wait for the next tick" law every other heartbeat here already holds itself to.
+
+    THE MIGRATION DOOR (Thoth mail 10609): skips this tick outright (returns 0, no
+    exception, no warning -- a held lock is expected traffic, not a failure) if
+    `osiris layout --migrate` is mid-run and already holds the same layout lock --
+    see graph_layout._try_acquire_layout_lock's own docstring for why this is a
+    session-scoped advisory lock and why that's safe here."""
+    from src.orchestrator.graph_layout import (
+        _release_layout_lock,
+        _try_acquire_layout_lock,
+        layout_batch,
+    )
 
     actions: Actions = ctx["cascade"].actions
-    try:
-        placed = await layout_batch(actions)
-    except Exception as exc:  # noqa: BLE001 — a DB hiccup or a bad batch must not kill the cron
-        _log.warning("graph layout heartbeat failed: %r", exc)
-        return 0
+    async with actions.pool.acquire() as lock_conn:
+        if not await _try_acquire_layout_lock(lock_conn):
+            return 0
+        try:
+            placed = await layout_batch(actions)
+        except Exception as exc:  # noqa: BLE001 — a DB hiccup or a bad batch must not kill the cron
+            _log.warning("graph layout heartbeat failed: %r", exc)
+            return 0
+        finally:
+            await _release_layout_lock(lock_conn)
     if placed:
         _log.info("graph layout heartbeat: positioned %d object(s)", placed)
     return placed

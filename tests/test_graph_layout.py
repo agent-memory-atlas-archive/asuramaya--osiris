@@ -15,11 +15,14 @@ from src.orchestrator.graph_layout import (
     _MIN_SEPARATION,
     _declump,
     _intra_project_neighbors,
+    _release_layout_lock,
+    _try_acquire_layout_lock,
     base_position,
     layout_batch,
     positions_for,
     project_center,
     relax,
+    run_layout_migrate,
     unplaced_batch,
 )
 
@@ -114,7 +117,8 @@ def test_base_position_ranks_within_one_group_never_collide_at_realistic_scale()
 def test_intra_project_neighbors_drops_cross_project_edges() -> None:
     a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     neighbors = {a: {b, c}}
-    proj_type = {a: ("repo:x", "Thread"), b: ("repo:x", "Thread"), c: ("repo:y", "Thread")}
+    proj_type: dict[uuid.UUID, tuple[str | None, str]] = {
+        a: ("repo:x", "Thread"), b: ("repo:x", "Thread"), c: ("repo:y", "Thread")}
     out = _intra_project_neighbors([a], neighbors, proj_type)
     assert out[a] == {b}
 
@@ -212,6 +216,72 @@ async def test_layout_batch_returns_zero_when_the_graph_is_fully_positioned(
     assert n1 >= 1
     n2 = await layout_batch(actions, limit=1000)
     assert n2 == 0
+
+
+async def test_layout_batch_with_no_explicit_limit_reads_the_settings_table(
+    actions: Actions,
+) -> None:
+    """`layout.batch_size` (Thoth mail 10609) genuinely reads live -- not the env-
+    overlay path, which only covers effect='immediate' keys."""
+    from src.orchestrator.settings_service import write_setting
+
+    await actions.create_or_find_object("Thread", "thread:gl-settings-a", "test")
+    await actions.create_or_find_object("Thread", "thread:gl-settings-b", "test")
+    await write_setting(actions.pool, "layout.batch_size", 1, actor="analyst:operator")
+
+    n = await layout_batch(actions)  # no explicit limit -- must read the table
+    assert n == 1  # capped to the stored batch_size regardless of total population
+
+
+# --- THE MIGRATION DOOR (Thoth mail 10609) --------------------------------------------
+
+
+async def test_layout_lock_round_trips(actions: Actions) -> None:
+    async with actions.pool.acquire() as conn:
+        assert await _try_acquire_layout_lock(conn) is True
+        # a SECOND session (a fresh connection) can't also acquire it
+        async with actions.pool.acquire() as conn2:
+            assert await _try_acquire_layout_lock(conn2) is False
+        await _release_layout_lock(conn)
+        # released -- a fresh session can now acquire it
+        async with actions.pool.acquire() as conn3:
+            assert await _try_acquire_layout_lock(conn3) is True
+            await _release_layout_lock(conn3)
+
+
+async def test_run_layout_migrate_places_everything_and_yields_a_receipt_per_batch(
+    actions: Actions,
+) -> None:
+    """Never assumes the DB fixture is empty (migrations/fixtures may already seed
+    real objects) -- proves the ACTUAL acceptance shape: drains to quiescence, the
+    receipts' own running total matches, and every object THIS test created ends up
+    positioned."""
+    ids = []
+    for i in range(3):
+        oid = await actions.create_or_find_object("Thread", f"thread:gl-migrate-{i}", "test")
+        ids.append(oid)
+
+    receipts = [r async for r in run_layout_migrate(actions, limit=1000)]
+    assert receipts[-1]["placed"] == 0  # drained to quiescence
+    assert receipts[-1]["total_placed"] == sum(r["placed"] for r in receipts[:-1])
+    assert await unplaced_batch(actions) == []
+    positions = await positions_for(actions, ids)
+    assert set(positions.keys()) == set(ids)
+
+
+async def test_run_layout_migrate_refuses_while_the_lock_is_held(
+    actions: Actions,
+) -> None:
+    await actions.create_or_find_object("Thread", "thread:gl-migrate-locked", "test")
+    async with actions.pool.acquire() as holder:
+        assert await _try_acquire_layout_lock(holder) is True
+        try:
+            receipts = [r async for r in run_layout_migrate(actions)]
+            assert receipts == [{
+                "error": "the layout heartbeat (or another migrate run) currently "
+                        "holds the layout lock -- try again shortly"}]
+        finally:
+            await _release_layout_lock(holder)
 
 
 async def test_layout_batch_keeps_two_projects_separated(actions: Actions) -> None:

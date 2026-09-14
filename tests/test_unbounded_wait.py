@@ -88,7 +88,10 @@ _SUBPROCESS_BASELINE: dict[str, int] = {
     # replacement): one new dispatch line, `asyncio.run(cmd_graph_export(...))`, same
     # false-positive class as every comment above — not a genuine new unbounded
     # subprocess call.
-    "src/cli.py": 82,
+    # 82 -> 83 (2026-09-14, Khnum, THE MIGRATION DOOR, Thoth mail 10609): one new
+    # dispatch line, `asyncio.run(cmd_layout(...))`, same false-positive class as
+    # every comment above — not a genuine new unbounded subprocess call.
+    "src/cli.py": 83,
     "src/ingest/files.py": 3,
     "src/ingest/gitlog.py": 3,
     "src/ingest/sessions.py": 3,
