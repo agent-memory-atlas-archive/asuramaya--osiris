@@ -919,7 +919,9 @@ def _tool_chars(t: Any) -> int:
 # harness-neutral liveness refresh (self-scoped, no target param) a non-Claude MCP
 # client calls to stay reading as live without a whisper hook or statusline. Genuinely
 # new capability, no existing tool exposes a caller-scoped last_seen refresh.
-TOOL_CONTRACT_EXPECTED_COUNT = 86
+# 86 -> 87 (2026-09-14, Khnum, THE MIGRATION DOOR, Thoth mail 10609): layout_migrate —
+# see TOOL_CONTRACT_CEILING_CHARS's own changelog entry just above for the full reason.
+TOOL_CONTRACT_EXPECTED_COUNT = 87
 # 116 -> 117 (2026-09-04, Seshat, #203/Thoth dispatch 6966, decision a49d2730/38755abe):
 # list_unfiled_threads — the H-bucket instrument gap: a Thread filter on absence of an
 # in_repo edge (plus source=/kind= equality), paginated, that no existing door provided
@@ -1589,7 +1591,13 @@ TOOL_CONTRACT_EXPECTED_COUNT = 86
 # `--newest-first`) gained matching flags in the same change, satisfying the CLI/MCP
 # parity gate rather than declaring an exemption. No new @mcp.tool(), tool count
 # unchanged. Measured exact (137,755).
-TOOL_CONTRACT_CEILING_CHARS = 137755
+# 137755 -> 138513 (2026-09-14, Khnum, THE MIGRATION DOOR, Thoth mail 10609): a NEW
+# @mcp.tool() `layout_migrate` (86 -> 87 tools) — drives the layout heartbeat's own
+# graph_layout.layout_batch to quiescence right now instead of waiting on its cron
+# cadence, the SAME function the CLI's `osiris layout --migrate` door and the REST
+# `/layout/migrate` route call. Genuinely new capability, no existing tool covers a
+# bulk placement pass run to quiescence. Measured exact (138,513).
+TOOL_CONTRACT_CEILING_CHARS = 138513
 
 def test_ceiling_has_exactly_one_executable_assignment() -> None:
     """THE RATCHET'S OWN GUARD (thread c655c757). This file used to carry every historical

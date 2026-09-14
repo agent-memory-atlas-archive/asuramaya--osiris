@@ -47,14 +47,40 @@ deterministic correction, not another force-simulation step, so the guarantee ho
 regardless of how attraction behaved before it ran.
 
 INCREMENTAL, NEVER REVISITED: unchanged mechanism -- a tick only ever considers objects
-still missing the CURRENT `graph_layout_v` marker (bumped to 3 here, forcing the same kind
-of one-time migration the 1->2 bump already did), so a re-run over already-placed objects
+still missing the CURRENT `graph_layout_v` marker, so a re-run over already-placed objects
 moves nothing.
 
 WRITE PATH: unchanged -- graph_x/graph_y/graph_layout_v land as ordinary property
 assertions via one multi-row UPDATE+INSERT per property per tick, safe only because
-GRAPH_LAYOUT_SOURCE is this triple's sole writer (see the prior version's own note, still
-true here).
+GRAPH_LAYOUT_SOURCE is this triple's sole writer.
+
+THE READING LAYER (Thoth mail 10595, ruling c5953bb1 -- the operator's own second
+screenshot: clusters far apart, huge cross-cluster bundles). Live measurement: repo:osiris
+degree 20,352, principal:analyst:operator degree 18,472, dev:asuramaya 9,462 -- membership
+edges (in_repo, acts_for, works_in, spawned_by, authored_by...) draw a spoke from nearly
+every object to one of a handful of shared hubs, and the old intra-project relax pulled on
+EVERY same-project edge including those, turning each spoke into a literal spring dragging
+distant objects toward the hub. Two changes fix this:
+  - STRUCTURAL vs SEMANTIC (src.ontology.link_classes, agreed with Seshat by DM before
+    either side committed): relax now pulls ONLY on semantic edges (an actual claim about
+    content -- cites, follows, possible_upstream...); a structural/membership edge still
+    exists as a real fact, it just never exerts a spring force in this layout.
+  - PROJECT CENTERS are no longer a sunflower-by-rank: a weighted force layout over the
+    CONTRACTED project graph (`_place_projects`/`_relax_projects`) pulls two projects
+    together in proportion to how many live links actually cross between their own
+    members, with a hard per-pair minimum (each project's own measured content radius,
+    summed, plus a fixed gutter) so two big projects' clusters can never overlap regardless
+    of how strongly they're linked. SoftwareProject objects are placed and stored exactly
+    like any other object (same graph_layout_v incrementality) -- a member object then
+    looks up ITS OWN project's stored center instead of recomputing one.
+  - HUB PINNING: an object whose STRUCTURAL-edge degree crosses `_HUB_DEGREE_THRESHOLD`
+    (this house's own measured population: 11 objects over 1,000, 84 over 100 -- the
+    principal Persons and the biggest projects) is pinned to rank 0 within its own
+    (project, type) group -- dead center of its own cluster, never spiraled outward by an
+    ordinary creation-order rank, matching the ruling's own "the hub's cluster contains
+    the hub" acceptance line.
+
+graph_layout_v bumped again (3 -> 4) to force the one-time migration this change needs.
 """
 from __future__ import annotations
 
@@ -62,11 +88,15 @@ import hashlib
 import json
 import math
 import uuid
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from typing import Any
 
+import asyncpg
 import numpy as np
 
 from src.actions.core import Actions
+from src.ontology.link_classes import STRUCTURAL_LINK_TYPES
 from src.ontology.schema import _OBJECT_TYPES
 
 GRAPH_LAYOUT_SOURCE = "cron:graph_layout"
@@ -77,7 +107,7 @@ _MAX_STEP = 10.0
 
 # NAVIGABLE SPACE, piece A additions ---------------------------------------------------
 _LAYOUT_VERSION_PROP = "graph_layout_v"
-_LAYOUT_VERSION = 3  # bump this to force one migration pass over every already-placed object
+_LAYOUT_VERSION = 4  # bump this to force one migration pass over every already-placed object
 _RELAX_ITERATIONS = 6  # "a FEW iterations" -- a nudge on top of the deterministic base,
                        # never enough to erase the sunflower structure
 _RING_BASE = 40.0
@@ -92,10 +122,20 @@ _GOLDEN_ANGLE = math.pi * (3.0 - math.sqrt(5.0))
 # (Commit alone 6,273, radius ~1,188 at the same spacing) across 40 real projects total.
 _NODE_SPACING = 15.0  # minimum pairwise spacing within one (project, type) sunflower disc
 _MIN_SEPARATION = _NODE_SPACING  # hard floor the post-relax declump pass enforces
-_PROJECT_SPACING = 5000.0  # minimum spacing between two projects' sunflower rank-points --
-                           # >2x the worst measured single-project content radius (~2,067),
-                           # so two adjacent worst-case projects' own discs can never touch
+_PROJECT_SPACING = 5000.0  # unfiled's own fixed seed spacing (see _UNFILED_KEY below) --
+                           # real projects are placed by _relax_projects instead, below
 _TYPE_RING_INDEX: dict[str, int] = {t.name: i for i, t in enumerate(_OBJECT_TYPES)}
+
+# THE READING LAYER additions ----------------------------------------------------------
+_PROJECT_GUTTER = 300.0  # fixed clearance ON TOP of two projects' own combined content
+                         # radius -- "spacing = the two cluster radii plus a fixed gutter"
+_PROJECT_RELAX_ITERATIONS = 300  # small N (a few dozen projects) -- cheap even at this
+                                 # iteration count, and the weighted spring needs more
+                                 # rounds than the object-level relax to actually settle
+_HUB_DEGREE_THRESHOLD = 1000  # this house's own measured population: 11 objects over
+                              # 1,000 structural-degree, 84 over 100 -- 1,000 catches the
+                              # unambiguous hubs (principal Persons, the biggest projects)
+                              # without pulling in every moderately-busy object
 
 
 def _hash01(key: str) -> float:
@@ -120,11 +160,13 @@ def _sunflower_point(rank: int, spacing: float) -> tuple[float, float]:
 
 
 def project_center(rank: int) -> tuple[float, float]:
-    """A project's center on the plane -- a sunflower point at its own permanent
-    creation-order rank (see `_project_ranks`), never a hash of its canonical. Two
-    projects can never collide: the sunflower's own geometry guarantees consecutive
-    ranks are at least `_PROJECT_SPACING`-ish apart, comfortably clear of even the
-    largest measured project's own content radius."""
+    """A sunflower point at a given rank -- used ONLY for the `unfiled` sentinel's own
+    fixed center (rank 0, i.e. the origin) now that real projects are placed by
+    `_relax_projects`'s weighted force layout instead (THE READING LAYER, ruling
+    c5953bb1): unfiled has no real SoftwareProject row to store a position on, and
+    isn't a node in the contracted project graph a force layout would place it against
+    anyway. Kept as a plain sunflower point (not just a hardcoded origin) so a future
+    caller with a real reason to rank unfiled-like sentinels can still do so."""
     return _sunflower_point(rank, _PROJECT_SPACING)
 
 
@@ -198,15 +240,19 @@ async def positions_for(
 
 async def _project_and_type(
     actions: Actions, ids: list[uuid.UUID],
-) -> dict[uuid.UUID, tuple[str | None, str]]:
-    """Each id's own (project canonical or None, object type) -- the same `in_repo` ->
+) -> dict[uuid.UUID, tuple[uuid.UUID | None, str]]:
+    """Each id's own (project OBJECT ID or None, object type) -- the same `in_repo` ->
     SoftwareProject membership /graph/supernodes already reads, DISTINCT ON the object so
     a rare multi-project membership still yields exactly one (deterministic: the lowest
-    link id) rather than fanning an id out into two placement candidates."""
+    link id) rather than fanning an id out into two placement candidates. The project's
+    own ID (not its canonical) is what a caller needs to look up ITS stored center via
+    `positions_for` -- THE READING LAYER, ruling c5953bb1: a project's position is no
+    longer derivable from a rank alone, it has to be read back from wherever
+    `_place_projects` actually put it."""
     if not ids:
         return {}
     rows = await actions.pool.fetch(
-        "SELECT DISTINCT ON (o.id) o.id, o.type, p.canonical AS project_canonical "
+        "SELECT DISTINCT ON (o.id) o.id, o.type, p.id AS project_id "
         "FROM objects o "
         "LEFT JOIN links l ON l.from_id=o.id AND l.type='in_repo' "
         "  AND (l.valid_until IS NULL OR l.valid_until > now()) "
@@ -214,21 +260,7 @@ async def _project_and_type(
         "WHERE o.id = ANY($1::uuid[]) "
         "ORDER BY o.id, l.id",
         ids)
-    return {r["id"]: (r["project_canonical"], r["type"]) for r in rows}
-
-
-async def _project_ranks(actions: Actions) -> dict[str, int]:
-    """Every active project's own PERMANENT rank by creation order --
-    `ROW_NUMBER() OVER (ORDER BY created_at, id)`, so an existing project's rank never
-    changes: a new project can only ever take a higher, previously-unused index.
-    `_UNFILED_KEY` is pinned to rank 0 so it can never collide with a real project's
-    own index regardless of how many projects exist."""
-    rows = await actions.pool.fetch(
-        "SELECT canonical, row_number() OVER (ORDER BY created_at, id) AS rnk "
-        "FROM objects WHERE type='SoftwareProject' AND status='active'")
-    ranks: dict[str, int] = {_UNFILED_KEY: 0}
-    ranks.update({r["canonical"]: int(r["rnk"]) for r in rows})
-    return ranks
+    return {r["id"]: (r["project_id"], r["type"]) for r in rows}
 
 
 async def _group_ranks(actions: Actions, ids: list[uuid.UUID]) -> dict[uuid.UUID, int]:
@@ -264,17 +296,24 @@ async def _group_ranks(actions: Actions, ids: list[uuid.UUID]) -> dict[uuid.UUID
 
 
 async def _neighbors_of(
-    actions: Actions, ids: list[uuid.UUID],
+    actions: Actions, ids: list[uuid.UUID], *, semantic_only: bool = False,
 ) -> dict[uuid.UUID, set[uuid.UUID]]:
+    """`semantic_only` (THE READING LAYER, ruling c5953bb1): drop every structural/
+    membership edge before it can ever reach the relax pass -- a spoke to a shared
+    hub (in_repo, acts_for, works_in...) is a real fact, it just never gets to act as
+    a spring in this layout, which is exactly the fix for the "huge cross-cluster
+    bundle" the operator's own screenshot showed."""
     if not ids:
         return {}
     rows = await actions.pool.fetch(
-        "SELECT from_id, to_id FROM links "
+        "SELECT from_id, to_id, type FROM links "
         "WHERE from_id = ANY($1::uuid[]) OR to_id = ANY($1::uuid[])",
         ids)
     idset = set(ids)
     out: dict[uuid.UUID, set[uuid.UUID]] = {i: set() for i in ids}
     for r in rows:
+        if semantic_only and r["type"] in STRUCTURAL_LINK_TYPES:
+            continue
         f, t = r["from_id"], r["to_id"]
         if f in idset:
             out[f].add(t)
@@ -430,11 +469,14 @@ def relax(
 def _intra_project_neighbors(
     unplaced: list[uuid.UUID],
     neighbors: dict[uuid.UUID, set[uuid.UUID]],
-    proj_type: dict[uuid.UUID, tuple[str | None, str]],
+    proj_type: dict[uuid.UUID, tuple[uuid.UUID | None, str]],
 ) -> dict[uuid.UUID, set[uuid.UUID]]:
     """`neighbors`, filtered to same-PROJECT pairs only -- the ruling's own "edge
     attraction within a project": a cross-project edge never pulls either endpoint,
-    regardless of how it would have pulled under the old whole-graph relax."""
+    regardless of how it would have pulled under the old whole-graph relax. `neighbors`
+    itself is expected to already be SEMANTIC-only (see `_neighbors_of`'s own
+    `semantic_only` -- THE READING LAYER, ruling c5953bb1: a structural/membership edge
+    never pulls here, project-mate or not)."""
     out: dict[uuid.UUID, set[uuid.UUID]] = {}
     for nid in unplaced:
         proj = proj_type.get(nid, (None, "Unknown"))[0]
@@ -443,6 +485,188 @@ def _intra_project_neighbors(
             if proj_type.get(nb, (object(), ""))[0] == proj
         }
     return out
+
+
+async def _hub_ids(actions: Actions, ids: list[uuid.UUID]) -> set[uuid.UUID]:
+    """Objects whose STRUCTURAL-edge degree meets `_HUB_DEGREE_THRESHOLD` -- these get
+    pinned to rank 0 within their own (project, type) group (dead center of that
+    group's own sunflower disc) rather than an ordinary creation-order rank, per THE
+    READING LAYER's own "the hub's cluster contains the hub" acceptance line."""
+    if not ids:
+        return set()
+    rows = await actions.pool.fetch(
+        "SELECT node, count(*) AS n FROM ("
+        "  SELECT from_id AS node, type FROM links "
+        "    WHERE valid_until IS NULL OR valid_until > now() "
+        "  UNION ALL "
+        "  SELECT to_id AS node, type FROM links "
+        "    WHERE valid_until IS NULL OR valid_until > now()"
+        ") x WHERE type = ANY($2::text[]) AND node = ANY($1::uuid[]) "
+        "GROUP BY node HAVING count(*) >= $3",
+        ids, list(STRUCTURAL_LINK_TYPES), _HUB_DEGREE_THRESHOLD)
+    return {r["node"] for r in rows}
+
+
+async def _project_member_counts(
+    actions: Actions, project_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, int]:
+    """Every project's own active member count -- used as a size PROXY (never the
+    real bounding radius, which would need each type's own sub-disc; the simple
+    sqrt(N) estimate over the TOTAL is deliberately conservative, i.e. an
+    overestimate, so the gutter this feeds into never runs short)."""
+    if not project_ids:
+        return {}
+    rows = await actions.pool.fetch(
+        "SELECT p.id AS project_id, count(*) AS n FROM objects o "
+        "JOIN links l ON l.from_id=o.id AND l.type='in_repo' "
+        "  AND (l.valid_until IS NULL OR l.valid_until > now()) "
+        "JOIN objects p ON p.id=l.to_id AND p.id = ANY($1::uuid[]) "
+        "WHERE o.status NOT IN ('archived','merged','retired') "
+        "GROUP BY p.id",
+        project_ids)
+    return {r["project_id"]: int(r["n"]) for r in rows}
+
+
+async def _project_link_weights(
+    actions: Actions, project_ids: list[uuid.UUID],
+) -> dict[tuple[uuid.UUID, uuid.UUID], int]:
+    """Cross-project edge weight for every pair among `project_ids` -- the SAME
+    contraction /graph/supernodes already computes for its own `project_edges`
+    (live links between two objects whose OWN in_repo project differs), returned as
+    a weighted pair map instead of a UI-shaped list. Every link type counts here
+    (not just semantic ones) -- this is about how much two PROJECTS actually
+    reference each other's work, not what pulls inside a layout's relax pass."""
+    if not project_ids:
+        return {}
+    rows = await actions.pool.fetch(
+        "WITH proj_of AS ("
+        "  SELECT o.id AS object_id, p.id AS project_id FROM objects o "
+        "  JOIN links l ON l.from_id=o.id AND l.type='in_repo' "
+        "    AND (l.valid_until IS NULL OR l.valid_until > now()) "
+        "  JOIN objects p ON p.id=l.to_id AND p.id = ANY($1::uuid[])) "
+        "SELECT LEAST(a.project_id, b.project_id) AS p1, "
+        "  GREATEST(a.project_id, b.project_id) AS p2, count(*) AS weight "
+        "FROM links l "
+        "JOIN proj_of a ON a.object_id = l.from_id "
+        "JOIN proj_of b ON b.object_id = l.to_id "
+        "WHERE a.project_id <> b.project_id "
+        "  AND (l.valid_until IS NULL OR l.valid_until > now()) "
+        "GROUP BY LEAST(a.project_id,b.project_id), GREATEST(a.project_id,b.project_id)",
+        project_ids)
+    return {(r["p1"], r["p2"]): int(r["weight"]) for r in rows}
+
+
+def _relax_projects(
+    unplaced_ids: list[uuid.UUID],
+    anchors: dict[uuid.UUID, tuple[float, float]],
+    radius: dict[uuid.UUID, float],
+    weights: dict[tuple[uuid.UUID, uuid.UUID], int],
+    *, iterations: int = _PROJECT_RELAX_ITERATIONS, gutter: float = _PROJECT_GUTTER,
+) -> dict[uuid.UUID, tuple[float, float]]:
+    """THE READING LAYER's own project-center layout (ruling c5953bb1): plain Python,
+    never vectorized -- N is a few dozen projects, not thousands, so the clarity of a
+    direct pairwise loop matters more than the constant-factor speedup `relax()`
+    needs at object scale. Two differences from `relax()`'s own model: the minimum
+    distance between two centers is THEIR OWN combined content radius plus a fixed
+    gutter (never one flat ideal length), and attraction exists ONLY between projects
+    that actually share cross-project links, scaled by how many -- an unlinked pair
+    only ever repels, which is what makes "no two linked projects farther apart than
+    an unlinked pair of similar radii" true by construction rather than by luck.
+    Already-placed projects (`anchors`) are fixed, exactly like the object-level
+    relax's own anchors. Seeded from a small sunflower point purely for a numerically
+    stable, deterministic starting position -- the FINAL position is force-derived,
+    the seed carries no visual meaning of its own."""
+    pos: dict[uuid.UUID, tuple[float, float]] = {
+        pid: _sunflower_point(i, 10.0) for i, pid in enumerate(unplaced_ids)
+    }
+    all_ids = unplaced_ids + list(anchors.keys())
+
+    def get_pos(pid: uuid.UUID) -> tuple[float, float]:
+        return pos[pid] if pid in pos else anchors[pid]
+
+    def weight_of(a: uuid.UUID, b: uuid.UUID) -> float:
+        key = (a, b) if str(a) < str(b) else (b, a)
+        return float(weights.get(key, 0))
+
+    for _ in range(iterations):
+        disp = {pid: (0.0, 0.0) for pid in unplaced_ids}
+        for a in unplaced_ids:
+            ax, ay = pos[a]
+            for b in all_ids:
+                if b == a:
+                    continue
+                bx, by = get_pos(b)
+                dx, dy = ax - bx, ay - by
+                dist = math.hypot(dx, dy) or 0.01
+                min_dist = radius.get(a, 0.0) + radius.get(b, 0.0) + gutter
+                if dist < min_dist:
+                    f = min_dist - dist
+                    disp[a] = (disp[a][0] + dx / dist * f, disp[a][1] + dy / dist * f)
+                w = weight_of(a, b)
+                if w > 0 and dist > min_dist:
+                    f = w * min(dist - min_dist, 20.0) * 0.02
+                    disp[a] = (disp[a][0] - dx / dist * f, disp[a][1] - dy / dist * f)
+        moved = False
+        for a in unplaced_ids:
+            dx, dy = disp[a]
+            mag = math.hypot(dx, dy)
+            if mag > 0.01:
+                moved = True
+                capped = min(mag, 20.0)
+                pos[a] = (pos[a][0] + dx / mag * capped, pos[a][1] + dy / mag * capped)
+        if not moved:
+            break
+
+    # HARD MINIMUM-DISTANCE CLAMP, same spirit as `_declump` but with a PER-PAIR floor
+    # (two projects' own combined content radius plus the gutter) instead of one flat
+    # constant -- the iterative spring above approaches this floor, this guarantees it.
+    for _ in range(iterations):
+        moved = False
+        for a in unplaced_ids:
+            ax, ay = pos[a]
+            for b in all_ids:
+                if b == a:
+                    continue
+                bx, by = get_pos(b)
+                dx, dy = ax - bx, ay - by
+                dist = math.hypot(dx, dy)
+                min_dist = radius.get(a, 0.0) + radius.get(b, 0.0) + gutter
+                if dist < min_dist:
+                    moved = True
+                    if dist < 1e-9:
+                        angle = _hash01(f"project-declump:{a}:{b}") * 2 * math.pi
+                        dx, dy = math.cos(angle), math.sin(angle)
+                        dist = 1.0
+                    deficit = min_dist - dist
+                    push = deficit if b not in pos else deficit / 2
+                    ax += dx / dist * push
+                    ay += dy / dist * push
+                    pos[a] = (ax, ay)
+        if not moved:
+            break
+    return pos
+
+
+async def _place_projects(
+    actions: Actions, unplaced_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, tuple[float, float]]:
+    """THE READING LAYER (ruling c5953bb1): project centers via a weighted force
+    layout over the CONTRACTED project graph instead of a rank-based sunflower --
+    two projects that actually reference each other's own objects end up closer than
+    two unrelated projects of similar size, never a hash and never independent of the
+    real cross-project link count. Already-placed projects are fixed anchors (never
+    revisited), matching every other object's own incrementality guarantee."""
+    all_active = await actions.pool.fetch(
+        "SELECT id FROM objects WHERE type='SoftwareProject' AND status='active'")
+    all_ids = [r["id"] for r in all_active]
+    unplaced_set = set(unplaced_ids)
+    already_placed = [pid for pid in all_ids if pid not in unplaced_set]
+    anchors = await positions_for(actions, already_placed)
+    member_counts = await _project_member_counts(actions, all_ids)
+    radius = {pid: _NODE_SPACING * math.sqrt(member_counts.get(pid, 0) + 1)
+              for pid in all_ids}
+    weights = await _project_link_weights(actions, all_ids)
+    return _relax_projects(unplaced_ids, anchors, radius, weights)
 
 
 async def _bulk_assert_positions(
@@ -476,32 +700,127 @@ async def _bulk_assert_positions(
                 [json.dumps(v) for v in values])
 
 
-async def layout_batch(actions: Actions, *, limit: int = _BATCH_SIZE) -> int:
+async def layout_batch(actions: Actions, *, limit: int | None = None) -> int:
     """One heartbeat tick: place up to `limit` objects still missing the current layout
-    version -- a deterministic sunflower base position (project center by rank, object
-    by its own rank within the (project, type) group), nudged by a few iterations of
-    intra-project edge attraction anchored on already-placed same-project neighbors,
-    then hard-declumped. Returns how many objects were newly positioned (0 when the
-    graph is fully placed under the current version -- the tick's own natural
-    quiescence, no flag needed)."""
+    version. SoftwareProject objects in the batch get THE READING LAYER's own weighted
+    force-layout placement (`_place_projects`) and are written FIRST, so every other
+    object placed in the SAME tick can look up its own project's real stored center
+    rather than a placeholder. Every other object gets a deterministic sunflower base
+    position (its own project's stored center, its own rank within the (project, type)
+    group -- pinned to rank 0 if it's a structural-degree hub), nudged by a few
+    iterations of intra-project SEMANTIC-only edge attraction anchored on already-
+    placed same-project neighbors, then hard-declumped. Returns how many objects were
+    newly positioned in total (0 when the graph is fully placed under the current
+    version -- the tick's own natural quiescence, no flag needed).
+
+    `limit=None` (every real caller -- the cron heartbeat and `run_layout_migrate`)
+    reads `layout.batch_size` off the LIVE settings table (Thoth mail 10609, product
+    law: every action has a door) via `current_stored_value` -- effect='next_tick' is
+    genuine here, not the env-overlay path that only covers effect='immediate' keys --
+    falling back to `_BATCH_SIZE` when the key has never been written. Passing an
+    explicit `limit` (every test in this module) bypasses the settings lookup
+    entirely, same as before."""
+    if limit is None:
+        from src.orchestrator.settings_service import current_stored_value
+        stored = await current_stored_value(actions.pool, "layout.batch_size")
+        limit = int(stored) if isinstance(stored, int | float) else _BATCH_SIZE
     unplaced = await unplaced_batch(actions, limit)
     if not unplaced:
         return 0
-    neighbors = await _neighbors_of(actions, unplaced)
-    unplaced_set = set(unplaced)
-    neighbor_ids = sorted(
-        ({nb for nbs in neighbors.values() for nb in nbs} - unplaced_set), key=str)
-    proj_type = await _project_and_type(actions, unplaced + neighbor_ids)
-    project_ranks = await _project_ranks(actions)
-    group_ranks = await _group_ranks(actions, unplaced)
-    base = {}
-    for oid in unplaced:
-        proj_canonical, type_name = proj_type.get(oid, (None, "Unknown"))
-        center = project_center(project_ranks.get(proj_canonical or _UNFILED_KEY, 0))
-        base[oid] = base_position(center, type_name, group_ranks.get(oid, 0))
-    anchors = await positions_for(actions, neighbor_ids)
-    intra = _intra_project_neighbors(unplaced, neighbors, proj_type)
-    placed = relax(unplaced, intra, anchors, iterations=_RELAX_ITERATIONS, init=base)
+
+    type_rows = await actions.pool.fetch(
+        "SELECT id, type FROM objects WHERE id = ANY($1::uuid[])", unplaced)
+    type_by_id = {r["id"]: r["type"] for r in type_rows}
+    unplaced_projects = [oid for oid in unplaced if type_by_id.get(oid) == "SoftwareProject"]
+    unplaced_regular = [oid for oid in unplaced if oid not in set(unplaced_projects)]
+
     now = datetime.now(UTC)
-    await _bulk_assert_positions(actions, placed, now)
-    return len(placed)
+    placed_count = 0
+
+    if unplaced_projects:
+        project_positions = await _place_projects(actions, unplaced_projects)
+        await _bulk_assert_positions(actions, project_positions, now)
+        placed_count += len(project_positions)
+
+    if unplaced_regular:
+        neighbors = await _neighbors_of(actions, unplaced_regular, semantic_only=True)
+        unplaced_set = set(unplaced_regular)
+        neighbor_ids = sorted(
+            ({nb for nbs in neighbors.values() for nb in nbs} - unplaced_set), key=str)
+        proj_type = await _project_and_type(actions, unplaced_regular + neighbor_ids)
+        group_ranks = await _group_ranks(actions, unplaced_regular)
+        hub_ids = await _hub_ids(actions, unplaced_regular)
+        project_ids_needed = [pid for pid, _ in proj_type.values() if pid]
+        project_centers = await positions_for(actions, project_ids_needed)
+        unfiled_center = project_center(0)
+
+        base = {}
+        for oid in unplaced_regular:
+            proj_id, type_name = proj_type.get(oid, (None, "Unknown"))
+            center = (project_centers.get(proj_id, unfiled_center)
+                      if proj_id else unfiled_center)
+            rank = 0 if oid in hub_ids else group_ranks.get(oid, 0)
+            base[oid] = base_position(center, type_name, rank)
+
+        anchors = await positions_for(actions, neighbor_ids)
+        intra = _intra_project_neighbors(unplaced_regular, neighbors, proj_type)
+        placed = relax(
+            unplaced_regular, intra, anchors, iterations=_RELAX_ITERATIONS, init=base)
+        await _bulk_assert_positions(actions, placed, now)
+        placed_count += len(placed)
+
+    return placed_count
+
+
+_LAYOUT_LOCK_KEY = "graph_layout_batch"  # advisory-lock name shared by the cron
+                                        # heartbeat and run_layout_migrate below
+
+
+async def _try_acquire_layout_lock(conn: asyncpg.Connection) -> bool:
+    """SESSION-scoped `pg_try_advisory_lock`, deliberately -- a transaction-scoped
+    lock would release the instant the acquiring query's own tiny transaction
+    commits, defeating the entire point of holding it for a whole migration run.
+    The historical outage this house learned from (#172: a connection returned to
+    the pool while still holding a session lock wedged the fleet for 15 minutes) is
+    avoided by construction here, not by avoiding session locks altogether: the ONLY
+    caller, `run_layout_migrate`, always releases via `_release_layout_lock` in a
+    `finally` BEFORE the `async with actions.pool.acquire()` block that owns this
+    connection ever exits -- the lock is never left to the pool's own connection
+    reset to clean up."""
+    return bool(await conn.fetchval(
+        "SELECT pg_try_advisory_lock(hashtext($1))", _LAYOUT_LOCK_KEY))
+
+
+async def _release_layout_lock(conn: asyncpg.Connection) -> None:
+    await conn.execute("SELECT pg_advisory_unlock(hashtext($1))", _LAYOUT_LOCK_KEY)
+
+
+async def run_layout_migrate(
+    actions: Actions, *, limit: int | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    """THE MIGRATION DOOR (Thoth mail 10609): loop `layout_batch` until
+    `unplaced_batch` runs dry, yielding one receipt per batch as it happens rather
+    than collecting a final report -- a `graph_layout_v` bump otherwise waits on the
+    cron heartbeat's own 1000-objects/5-minute pace (hours for a real migration).
+    Refuses outright (yields a single `{"error": ...}` receipt, does no work) if the
+    cron heartbeat is mid-tick and already holds `_LAYOUT_LOCK_KEY` -- see
+    `_try_acquire_layout_lock`'s own docstring for why this is session-scoped and
+    safe. The SAME `layout_batch` the cron heartbeat calls -- never a second
+    implementation of the placement logic, just a tighter loop around it."""
+    async with actions.pool.acquire() as lock_conn:
+        if not await _try_acquire_layout_lock(lock_conn):
+            yield {"error": "the layout heartbeat (or another migrate run) currently "
+                            "holds the layout lock -- try again shortly"}
+            return
+        try:
+            batch_no = 0
+            total_placed = 0
+            while True:
+                n = await layout_batch(actions, limit=limit)
+                batch_no += 1
+                total_placed += n
+                yield {"batch": batch_no, "placed": n, "total_placed": total_placed}
+                if n == 0:
+                    break
+        finally:
+            await _release_layout_lock(lock_conn)

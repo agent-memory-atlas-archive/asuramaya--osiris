@@ -600,6 +600,17 @@ class Settings(BaseSettings):
     osiris_miner_daily_budget_base: int = 5
     osiris_miner_new_pair_starter_budget: int = 1
     osiris_miner_zero_acceptance_window_days: int = 7
+    # LAYOUT KNOBS (Thoth mail 10609, product law -- every action has a door): the
+    # heartbeat's own per-tick batch size and cron cadence, both previously bare
+    # module constants in graph_layout.py/arq_worker.py. batch_size is effect=
+    # 'next_tick' but genuinely table-driven (graph_layout.layout_batch reads it via
+    # settings_service.current_stored_value, not the env-overlay path, which only
+    # covers effect='immediate' keys); tick_seconds is effect='restart:osiris-worker'
+    # -- arq's cron schedule is a static literal evaluated once at WorkerSettings
+    # class-definition time, so a write here only takes effect on the worker's next
+    # restart, same as every other daemon-literal knob in this house.
+    osiris_layout_batch_size: int = 1000
+    osiris_layout_tick_seconds: int = 300
 
 
 def get_settings() -> Settings:

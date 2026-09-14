@@ -476,9 +476,28 @@ _INGEST_SETTINGS: tuple[SettingSpec, ...] = (
                write_name="daemon_unit_literals", env_field="osiris_transcripts"),
 )
 
+# THE LAYOUT HEARTBEAT'S OWN KNOBS (Thoth mail 10609, product law -- every action has a
+# door): batch_size genuinely reads live off the settings table (graph_layout.
+# layout_batch's own current_stored_value lookup, NOT the effect='immediate'-only env
+# overlay) -- a write here changes the very next tick, no restart. tick_seconds governs
+# arq's own cron schedule, a static literal evaluated once at WorkerSettings class-
+# definition time (same reason the pool sizes above are restart-effect), hence
+# write_name="daemon_unit_literals" so a write re-renders the deployed unit's own
+# environment exactly like a pool-size write does.
+_LAYOUT_SETTINGS: tuple[SettingSpec, ...] = (
+    SettingSpec("layout.batch_size", "int", 1000, effect="next_tick",
+               validate=_validate_positive_int, consequence="low",
+               requires_because=False, env_field="osiris_layout_batch_size"),
+    SettingSpec("layout.tick_seconds", "int", 300, effect="restart:osiris-worker",
+               validate=_validate_positive_int, authority="operator_or_ruling",
+               requires_because=True, consequence="high",
+               write_name="daemon_unit_literals", env_field="osiris_layout_tick_seconds"),
+)
+
 SETTINGS: tuple[SettingSpec, ...] = (
     _MANAGER_OVERLAY + _SECRETS + _DAEMON_KILL_SWITCHES + _MINER_BUDGETS + _BACKUP_SETTINGS
     + _WAKE_LADDER + _DIAGNOSTICS + _DAEMON_UNIT_LITERALS + _POOL_SIZES + _INGEST_SETTINGS
+    + _LAYOUT_SETTINGS
 )
 
 

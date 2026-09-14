@@ -727,6 +727,56 @@ async def cmd_graph_export(
     return 0
 
 
+# --- layout ----------------------------------------------------------------------------------
+
+async def cmd_layout(
+    *, limit: int | None = None, pool: asyncpg.Pool | None = None,
+) -> int:
+    """osiris layout --migrate — THE MIGRATION DOOR (Thoth mail 10609, product law:
+    every action has a door): loops the SAME `graph_layout.layout_batch` the cron
+    heartbeat calls until every object carries the current `graph_layout_v`, printing
+    one receipt per batch as it runs rather than waiting on the cron's own 5-minute
+    cadence (a real migration otherwise takes hours). Refuses cleanly (exit 1) if the
+    heartbeat is mid-tick and already holds the layout lock — direct-to-Postgres,
+    headless, same Pattern B shape as `osiris lint`/`osiris graph-export`, since this
+    is a bulk operator act, not an MCP round trip."""
+    from src.actions.core import Actions
+    from src.orchestrator.graph_layout import run_layout_migrate
+
+    owns_pool = pool is None
+    if pool is None:
+        from src.config.dev_env import apply_dev_fallback
+        from src.config.settings import get_settings
+        from src.db.pool import create_pool
+
+        apply_dev_fallback()
+        settings = get_settings()
+        try:
+            pool = await create_pool(
+                settings.database_url, min_size=1, max_size=4,
+                application_name="osiris-cli:layout-migrate")
+        except Exception as exc:  # noqa: BLE001 - the CLI boundary: report, no raw traceback
+            print(f"osiris layout: could not reach postgres at {settings.database_url} "
+                  f"— {exc}. Set DATABASE_URL, or start the dev instance.", file=sys.stderr)
+            return 1
+    try:
+        actions = Actions(pool)
+        rc = 0
+        async for receipt in run_layout_migrate(actions, limit=limit):
+            if "error" in receipt:
+                print(f"osiris layout: {receipt['error']}", file=sys.stderr)
+                rc = 1
+                break
+            print(f"osiris layout: batch {receipt['batch']} placed {receipt['placed']} "
+                  f"(total {receipt['total_placed']})")
+        else:
+            print("osiris layout: done — every object carries the current layout version")
+        return rc
+    finally:
+        if owns_pool:
+            await pool.close()
+
+
 # --- audit -------------------------------------------------------------------------------------
 
 # The 5 audit-shaped siblings graph_lint keeps beside it in the CMD-K palette (WAVE 22 scope
@@ -6476,7 +6526,7 @@ COMMANDS, GROUPED BY WHAT YOU'RE TRYING TO DO:
                         set-project-tag, proposal, settings, retire-assertion,
                         retire-link, cite
   operate               deploy, migrate, seed, bootstrap, retention, rematerialize,
-                        fleet-reconcile, fleet-prune, backfill
+                        fleet-reconcile, fleet-prune, backfill, layout
 
 Every read verb takes --json: one compact line for a script or an agent, instead of the
 human view. Run `osiris <command> --help` for that command's own flags and a worked example.
@@ -6587,6 +6637,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p_graph_export.add_argument("--json", action="store_true", dest="as_json",
                         help="print a header-only summary (schema_version/count/"
                              "edge_count/types/projects, no array bodies)")
+
+    p_layout = sub.add_parser("layout", description=_d(
+        "THE MIGRATION DOOR (Thoth mail 10609) — drives the layout heartbeat's own "
+        "graph_layout.layout_batch to quiescence right now, instead of waiting on "
+        "its 5-minute cron cadence; refuses if the heartbeat is mid-tick"),
+        epilog="example: osiris layout --migrate")
+    p_layout.add_argument("--migrate", action="store_true",
+                          help="the only mode today — loop layout_batch until every "
+                               "object carries the current graph_layout_v, printing "
+                               "one receipt per batch")
+    p_layout.add_argument("--limit", type=int, default=None,
+                          help="objects per batch (default: the live layout.batch_size "
+                               "setting, itself defaulting to 1000)")
 
     p_audit = sub.add_parser("audit", description=_d(
         "headless mirror of graph_lint's own CMD-K audit siblings — one door for all "
@@ -7845,6 +7908,11 @@ def main(argv: list[str] | None = None) -> int:
             stale_days=args.stale_days, limit=args.limit, offset=args.offset))
     if args.command == "graph-export":
         return asyncio.run(cmd_graph_export(out=args.out, as_json=args.as_json))
+    if args.command == "layout":
+        if not args.migrate:
+            print("osiris layout: pass --migrate (the only mode today)", file=sys.stderr)
+            return 1
+        return asyncio.run(cmd_layout(limit=args.limit))
     if args.command == "audit":
         return asyncio.run(cmd_audit(args.name, as_json=args.as_json))
     if args.command == "seed":

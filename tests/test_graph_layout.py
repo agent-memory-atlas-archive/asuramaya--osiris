@@ -1,8 +1,10 @@
 """THE GRAPH VISUALIZER (wave B item 1) + NAVIGABLE SPACE, THE SERVER piece A (rulings
-f832c3a4 + 0a3d6719, thread b6cb1d7c0b36), plus the DECLUMP FIX (Thoth mail 10582,
-PRIORITY): the layout heartbeat places every object under a rank-based sunflower rule
-(never a hash-into-a-fixed-circle), nudged by a bounded intra-project relax that ends
-with a hard minimum-separation pass."""
+f832c3a4 + 0a3d6719, thread b6cb1d7c0b36), the DECLUMP FIX (Thoth mail 10582,
+PRIORITY), and THE READING LAYER (Thoth mail 10595, ruling c5953bb1): the layout
+heartbeat places every object under a rank-based sunflower rule (never a
+hash-into-a-fixed-circle), nudged by a bounded intra-project SEMANTIC-only relax that
+ends with a hard minimum-separation pass; project centers come from a weighted force
+layout over the contracted project graph, never a rank."""
 from __future__ import annotations
 
 import math
@@ -14,12 +16,19 @@ from src.orchestrator.graph_layout import (
     _LAYOUT_VERSION_PROP,
     _MIN_SEPARATION,
     _declump,
+    _hub_ids,
     _intra_project_neighbors,
+    _neighbors_of,
+    _place_projects,
+    _relax_projects,
+    _release_layout_lock,
+    _try_acquire_layout_lock,
     base_position,
     layout_batch,
     positions_for,
     project_center,
     relax,
+    run_layout_migrate,
     unplaced_batch,
 )
 
@@ -113,8 +122,10 @@ def test_base_position_ranks_within_one_group_never_collide_at_realistic_scale()
 
 def test_intra_project_neighbors_drops_cross_project_edges() -> None:
     a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    proj_x, proj_y = uuid.uuid4(), uuid.uuid4()
     neighbors = {a: {b, c}}
-    proj_type = {a: ("repo:x", "Thread"), b: ("repo:x", "Thread"), c: ("repo:y", "Thread")}
+    proj_type: dict[uuid.UUID, tuple[uuid.UUID | None, str]] = {
+        a: (proj_x, "Thread"), b: (proj_x, "Thread"), c: (proj_y, "Thread")}
     out = _intra_project_neighbors([a], neighbors, proj_type)
     assert out[a] == {b}
 
@@ -214,6 +225,72 @@ async def test_layout_batch_returns_zero_when_the_graph_is_fully_positioned(
     assert n2 == 0
 
 
+async def test_layout_batch_with_no_explicit_limit_reads_the_settings_table(
+    actions: Actions,
+) -> None:
+    """`layout.batch_size` (Thoth mail 10609) genuinely reads live -- not the env-
+    overlay path, which only covers effect='immediate' keys."""
+    from src.orchestrator.settings_service import write_setting
+
+    await actions.create_or_find_object("Thread", "thread:gl-settings-a", "test")
+    await actions.create_or_find_object("Thread", "thread:gl-settings-b", "test")
+    await write_setting(actions.pool, "layout.batch_size", 1, actor="analyst:operator")
+
+    n = await layout_batch(actions)  # no explicit limit -- must read the table
+    assert n == 1  # capped to the stored batch_size regardless of total population
+
+
+# --- THE MIGRATION DOOR (Thoth mail 10609) --------------------------------------------
+
+
+async def test_layout_lock_round_trips(actions: Actions) -> None:
+    async with actions.pool.acquire() as conn:
+        assert await _try_acquire_layout_lock(conn) is True
+        # a SECOND session (a fresh connection) can't also acquire it
+        async with actions.pool.acquire() as conn2:
+            assert await _try_acquire_layout_lock(conn2) is False
+        await _release_layout_lock(conn)
+        # released -- a fresh session can now acquire it
+        async with actions.pool.acquire() as conn3:
+            assert await _try_acquire_layout_lock(conn3) is True
+            await _release_layout_lock(conn3)
+
+
+async def test_run_layout_migrate_places_everything_and_yields_a_receipt_per_batch(
+    actions: Actions,
+) -> None:
+    """Never assumes the DB fixture is empty (migrations/fixtures may already seed
+    real objects) -- proves the ACTUAL acceptance shape: drains to quiescence, the
+    receipts' own running total matches, and every object THIS test created ends up
+    positioned."""
+    ids = []
+    for i in range(3):
+        oid = await actions.create_or_find_object("Thread", f"thread:gl-migrate-{i}", "test")
+        ids.append(oid)
+
+    receipts = [r async for r in run_layout_migrate(actions, limit=1000)]
+    assert receipts[-1]["placed"] == 0  # drained to quiescence
+    assert receipts[-1]["total_placed"] == sum(r["placed"] for r in receipts[:-1])
+    assert await unplaced_batch(actions) == []
+    positions = await positions_for(actions, ids)
+    assert set(positions.keys()) == set(ids)
+
+
+async def test_run_layout_migrate_refuses_while_the_lock_is_held(
+    actions: Actions,
+) -> None:
+    await actions.create_or_find_object("Thread", "thread:gl-migrate-locked", "test")
+    async with actions.pool.acquire() as holder:
+        assert await _try_acquire_layout_lock(holder) is True
+        try:
+            receipts = [r async for r in run_layout_migrate(actions)]
+            assert receipts == [{
+                "error": "the layout heartbeat (or another migrate run) currently "
+                        "holds the layout lock -- try again shortly"}]
+        finally:
+            await _release_layout_lock(holder)
+
+
 async def test_layout_batch_keeps_two_projects_separated(actions: Actions) -> None:
     now = datetime.now(UTC)
     proj_a = await actions.create_or_find_object("SoftwareProject", "repo:gl-proj-a", "test")
@@ -276,3 +353,147 @@ async def test_layout_batch_migrates_an_object_placed_under_a_prior_version(
     pos = (await positions_for(actions, [oid]))[oid]
     assert pos != (-999.0, -999.0)
     assert oid not in await unplaced_batch(actions)
+
+
+# --- THE READING LAYER (Thoth mail 10595, ruling c5953bb1) ---------------------------
+
+
+async def test_neighbors_of_semantic_only_drops_structural_edges(actions: Actions) -> None:
+    now = datetime.now(UTC)
+    proj = await actions.create_or_find_object("SoftwareProject", "repo:gl-rl-proj", "test")
+    a = await actions.create_or_find_object("Thread", "thread:gl-rl-a", "test")
+    b = await actions.create_or_find_object("Thread", "thread:gl-rl-b", "test")
+    await actions.create_link(a, proj, "in_repo", "test", now, 1.0)  # structural
+    await actions.create_link(a, b, "cites", "test", now, 1.0)  # semantic
+
+    all_neighbors = await _neighbors_of(actions, [a])
+    semantic_neighbors = await _neighbors_of(actions, [a], semantic_only=True)
+    assert proj in all_neighbors[a] and b in all_neighbors[a]
+    assert proj not in semantic_neighbors[a]
+    assert b in semantic_neighbors[a]
+
+
+async def test_layout_batch_never_pulls_two_objects_together_over_a_structural_edge(
+    actions: Actions,
+) -> None:
+    """The exact regression THE READING LAYER fixes: a shared structural hub (here, a
+    project acting as the hub every member links to via in_repo) must never pull
+    members toward it via relax -- only a real semantic edge should ever attract."""
+    now = datetime.now(UTC)
+    proj = await actions.create_or_find_object("SoftwareProject", "repo:gl-rl-hub", "test")
+    members = []
+    for i in range(6):
+        oid = await actions.create_or_find_object("Thread", f"thread:gl-rl-member-{i}", "test")
+        await actions.create_link(oid, proj, "in_repo", "test", now, 1.0)
+        members.append(oid)
+
+    while await layout_batch(actions, limit=1000) > 0:
+        pass
+
+    proj_pos = (await positions_for(actions, [proj]))[proj]
+    member_pos = await positions_for(actions, members)
+    # members sit on their own type's ring around the project center, not collapsed
+    # onto the project's own position the way an in_repo-as-attraction bug would do
+    for oid in members:
+        assert math.dist(proj_pos, member_pos[oid]) > 10
+
+
+async def test_place_projects_pulls_a_linked_project_closer_than_an_unlinked_one(
+    actions: Actions,
+) -> None:
+    """THE READING LAYER's own acceptance line: no two linked projects' centers
+    farther apart than an unlinked pair with similar radii."""
+    now = datetime.now(UTC)
+    hub = await actions.create_or_find_object("SoftwareProject", "repo:gl-rl-hub-p", "test")
+    linked = await actions.create_or_find_object("SoftwareProject", "repo:gl-rl-linked-p",
+                                                  "test")
+    unlinked = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gl-rl-unlinked-p", "test")
+
+    hub_member = await actions.create_or_find_object("Thread", "thread:gl-rl-hub-m", "test")
+    linked_member = await actions.create_or_find_object(
+        "Thread", "thread:gl-rl-linked-m", "test")
+    unlinked_member = await actions.create_or_find_object(
+        "Thread", "thread:gl-rl-unlinked-m", "test")
+    await actions.create_link(hub_member, hub, "in_repo", "test", now, 1.0)
+    await actions.create_link(linked_member, linked, "in_repo", "test", now, 1.0)
+    await actions.create_link(unlinked_member, unlinked, "in_repo", "test", now, 1.0)
+    # a real cross-project reference: hub <-> linked, nothing to unlinked
+    await actions.create_link(hub_member, linked_member, "cites", "test", now, 1.0)
+
+    while await layout_batch(actions, limit=1000) > 0:
+        pass
+
+    pos = await positions_for(actions, [hub, linked, unlinked])
+    dist_linked = math.dist(pos[hub], pos[linked])
+    dist_unlinked = math.dist(pos[hub], pos[unlinked])
+    assert dist_linked < dist_unlinked
+
+
+async def test_place_projects_positions_every_unplaced_project(actions: Actions) -> None:
+    a = await actions.create_or_find_object("SoftwareProject", "repo:gl-rl-direct-a", "test")
+    b = await actions.create_or_find_object("SoftwareProject", "repo:gl-rl-direct-b", "test")
+    out = await _place_projects(actions, [a, b])
+    assert set(out.keys()) == {a, b}
+    for x, y in out.values():
+        assert math.isfinite(x) and math.isfinite(y)
+
+
+async def test_place_projects_never_overlaps_two_projects_content_radii(
+    actions: Actions,
+) -> None:
+    a_id = uuid.uuid4()
+    b_id = uuid.uuid4()
+    radius = {a_id: 100.0, b_id: 100.0}
+    out = _relax_projects([a_id, b_id], {}, radius, {})
+    dist = math.dist(out[a_id], out[b_id])
+    assert dist >= radius[a_id] + radius[b_id] + 300.0 - 1e-6  # + the fixed gutter
+
+
+async def test_hub_ids_finds_a_structural_high_degree_object(actions: Actions) -> None:
+    from src.orchestrator.graph_layout import _HUB_DEGREE_THRESHOLD
+
+    hub = await actions.create_or_find_object("Person", "principal:gl-rl-hub-person", "test")
+    now = datetime.now(UTC)
+    for i in range(_HUB_DEGREE_THRESHOLD + 1):
+        agent = await actions.create_or_find_object("Agent", f"agent:gl-rl-hub-{i}", "test")
+        await actions.create_link(agent, hub, "acts_for", "test", now, 1.0)
+
+    found = await _hub_ids(actions, [hub])
+    assert hub in found
+
+
+async def test_hub_ids_excludes_an_ordinary_low_degree_object(actions: Actions) -> None:
+    oid = await actions.create_or_find_object("Thread", "thread:gl-rl-not-a-hub", "test")
+    found = await _hub_ids(actions, [oid])
+    assert oid not in found
+
+
+async def test_layout_batch_pins_a_hub_at_rank_zero_of_its_own_group(
+    actions: Actions,
+) -> None:
+    from src.orchestrator.graph_layout import _HUB_DEGREE_THRESHOLD
+
+    now = datetime.now(UTC)
+    # seed enough OTHER Persons first (same TYPE as the hub -- same (project, type)
+    # group) so a naive creation-order rank would NOT be 0
+    for i in range(5):
+        await actions.create_or_find_object("Person", f"principal:gl-rl-pin-filler-{i}", "test")
+    hub = await actions.create_or_find_object("Person", "principal:gl-rl-pin-hub", "test")
+    for i in range(_HUB_DEGREE_THRESHOLD + 1):
+        agent = await actions.create_or_find_object("Agent", f"agent:gl-rl-pin-{i}", "test")
+        await actions.create_link(agent, hub, "acts_for", "test", now, 1.0)
+
+    while await layout_batch(actions, limit=1000) > 0:
+        pass
+
+    from src.orchestrator.graph_layout import base_position as _bp
+    from src.orchestrator.graph_layout import project_center as _pc
+
+    expected_rank_0 = _bp(_pc(0), "Person", 0)
+    expected_naive_rank_5 = _bp(_pc(0), "Person", 5)
+    got = (await positions_for(actions, [hub]))[hub]
+    # a small declump/relax nudge is expected and fine -- what matters is landing
+    # near rank 0's own point, not near where its true creation-order rank (5) would
+    # otherwise have put it
+    assert math.dist(expected_rank_0, got) < math.dist(expected_naive_rank_5, got)

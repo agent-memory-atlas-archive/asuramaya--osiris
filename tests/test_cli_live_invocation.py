@@ -326,6 +326,12 @@ NO_WRITE_INVOCATIONS: dict[str, Any] = {
 # alone. mint-seat/new/bootstrap are flagged separately: they mint or spawn for real,
 # with no confirmed refusal-only path found anywhere in this suite.
 NEEDS_SAFE_INVOCATION: dict[str, str] = {
+    "layout": "genuinely writes unconditionally (own body read) — graph_layout."
+              "run_layout_migrate loops layout_batch, which asserts real graph_x/"
+              "graph_y/graph_layout_v on every unplaced object it finds; no dry-run "
+              "switch, and a hermetic test DB is never guaranteed to already be fully "
+              "placed under the current version, so a 'safe' invocation would still "
+              "write for real",
     "smoke": "needs a live osiris-mcp pool + real chrome routes per its own docstring "
              "(\"8 chrome routes + the live mcp pool\") — a different, heavier infra "
              "assumption than the plain MCP search/fleet calls above",

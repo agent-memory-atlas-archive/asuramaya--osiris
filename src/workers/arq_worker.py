@@ -1321,15 +1321,30 @@ async def graph_layout_heartbeat(ctx: dict[str, Any]) -> int:
     module's own docstring for why this is a LOCAL relaxation anchored on already-placed
     neighbors, never a global recompute. Read-mostly (the only writes are graph_x/graph_y
     assertions on objects that had none); one bad batch must not kill the cron, same "log
-    and wait for the next tick" law every other heartbeat here already holds itself to."""
-    from src.orchestrator.graph_layout import layout_batch
+    and wait for the next tick" law every other heartbeat here already holds itself to.
+
+    THE MIGRATION DOOR (Thoth mail 10609): skips this tick outright (returns 0, no
+    exception, no warning -- a held lock is expected traffic, not a failure) if
+    `osiris layout --migrate` is mid-run and already holds the same layout lock --
+    see graph_layout._try_acquire_layout_lock's own docstring for why this is a
+    session-scoped advisory lock and why that's safe here."""
+    from src.orchestrator.graph_layout import (
+        _release_layout_lock,
+        _try_acquire_layout_lock,
+        layout_batch,
+    )
 
     actions: Actions = ctx["cascade"].actions
-    try:
-        placed = await layout_batch(actions)
-    except Exception as exc:  # noqa: BLE001 — a DB hiccup or a bad batch must not kill the cron
-        _log.warning("graph layout heartbeat failed: %r", exc)
-        return 0
+    async with actions.pool.acquire() as lock_conn:
+        if not await _try_acquire_layout_lock(lock_conn):
+            return 0
+        try:
+            placed = await layout_batch(actions)
+        except Exception as exc:  # noqa: BLE001 — a DB hiccup or a bad batch must not kill the cron
+            _log.warning("graph layout heartbeat failed: %r", exc)
+            return 0
+        finally:
+            await _release_layout_lock(lock_conn)
     if placed:
         _log.info("graph layout heartbeat: positioned %d object(s)", placed)
     return placed
@@ -1385,6 +1400,22 @@ async def _run_watched(fn: Any, ctx: dict[str, Any], every: int) -> int:
     with contextlib.suppress(Exception):  # telemetry must never fail the work it watched
         await record_job(pool, fn.__name__, every=every, secs=time.monotonic() - t0)
     return n
+
+
+# THE LAYOUT HEARTBEAT'S OWN CADENCE (Thoth mail 10609/10638, effect=restart:osiris-worker
+# made real, not just registered): read once here at import time -- the same moment
+# `redis_settings` below reads `get_settings()` -- since `cron_jobs` is a plain class
+# attribute built once when this module loads, exactly when a worker restart re-reads its
+# environment. arq's own cadence unit is a minute set, not a raw seconds interval, so a
+# tick_seconds that isn't a clean multiple of 60 can't be expressed exactly; round to the
+# nearest minute (floor 1, ceiling 30) and say so loudly rather than silently drifting.
+_layout_tick_seconds = get_settings().osiris_layout_tick_seconds
+_layout_tick_minutes = max(1, min(30, round(_layout_tick_seconds / 60)))
+if _layout_tick_minutes * 60 != _layout_tick_seconds:
+    _log.warning(
+        "layout.tick_seconds=%d isn't a clean multiple of 60 -- rounding the cron cadence "
+        "to every %d minute(s); use a multiple of 60 (300, 600, ...) for an exact match",
+        _layout_tick_seconds, _layout_tick_minutes)
 
 
 class WorkerSettings:
@@ -1585,12 +1616,14 @@ class WorkerSettings:
         cron(watched(harness_backfill_heartbeat, every=900), minute={8, 23, 38, 53},
              second={50}, timeout=600, run_at_startup=True),
         # WAVE B item 1 (thread 8839): positions the whole graph incrementally, one
-        # bounded batch (1000 objects, local relaxation only) every 5 minutes -- a fresh
-        # graph reaches full coverage in ~41 ticks (~3.5h) without ever paying for a
+        # bounded batch (layout.batch_size objects, local relaxation only) every
+        # layout.tick_seconds (default 5 min, module-level above) -- a fresh graph
+        # reaches full coverage in a bounded number of ticks without ever paying for a
         # global recompute; a settled graph's steady-state cost converges toward zero
         # (unpositioned_batch finds nothing left to do). run_at_startup=True so a
-        # restart doesn't cost this wave's own first batch a 5-minute wait.
-        cron(watched(graph_layout_heartbeat, every=300), minute=set(range(0, 60, 5)),
+        # restart doesn't cost this wave's own first batch a full tick's wait.
+        cron(watched(graph_layout_heartbeat, every=_layout_tick_seconds),
+             minute=set(range(0, 60, _layout_tick_minutes)),
              second={5}, timeout=300, run_at_startup=True),
     ]
     on_startup = startup

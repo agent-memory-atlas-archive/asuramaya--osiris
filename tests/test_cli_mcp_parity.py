@@ -52,6 +52,11 @@ NO_MCP_EQUIVALENT = {
         "function (comp.run_spec over the 'lint' Function), same call graph_lint itself "
         "makes; named 'lint' on the CLI (WAVE 22 item 2, mail 10109) rather than "
         "'graph-lint' for a shorter headless-cron command, deliberately not name-matched.",
+    "layout": "NOT actually MCP-less — wraps the layout_migrate MCP tool's own shared "
+        "function (graph_layout.run_layout_migrate, the SAME loop the CLI, MCP, and "
+        "REST doors all call); named 'layout --migrate' on the CLI (Thoth mail 10609) "
+        "since --migrate is the only mode today and a bare verb reads better than "
+        "'layout-migrate' for an operator's own shell, deliberately not name-matched.",
     "graph-export": "operator/cron-shaped bulk act, not an agent verb — the CLI mirror "
         "of GET /graph/stream (NAVIGABLE SPACE piece B, thread b6cb1d7c0b36), "
         "direct-to-Postgres and headless like lint's own entry above, but exporting "
@@ -1342,6 +1347,12 @@ class NewToolDeclaration(TypedDict, total=False):
 # adding an entry here, in the same PR that adds the tool. See the block comment above for
 # what each field means.
 NEW_TOOL_DECLARATIONS: dict[str, NewToolDeclaration] = {
+    # layout_migrate — THE MIGRATION DOOR (Thoth mail 10609, product law): drives the
+    # layout heartbeat's own graph_layout.layout_batch to quiescence right now instead
+    # of waiting on its cron cadence. Not a seat/office/project binding-mover; not a
+    # parameterization of any existing tool — no existing door loops a bulk placement
+    # pass to quiescence.
+    "layout_migrate": {"binding_verb": False},
     "resume": {"binding_verb": True},
     # proposal(action=...) — miners as last resort, item 2 (decision ac892cd9, Thoth
     # mail 8842/8920/8945): propose/accept/reject over a NEW Proposal object type. Not

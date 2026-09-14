@@ -6449,6 +6449,31 @@ async def unwire_informs_fanout(
         dry_run=dry_run, because=because)
 
 
+@mcp.tool()
+async def layout_migrate(limit: int | None = None, ctx: Context | None = None) -> dict[str, Any]:
+    """THE MIGRATION DOOR (Thoth mail 10609, product law: every action has a door):
+    drives the layout heartbeat's own `graph_layout.layout_batch` to quiescence right
+    now instead of waiting on its 5-minute cron cadence -- the SAME function the cron
+    heartbeat and the CLI's `osiris layout --migrate` door call, never a second
+    implementation of the placement logic. Refuses (an `error` key, no work done) if
+    the heartbeat is mid-tick and already holds the layout lock. `limit` overrides the
+    live `layout.batch_size` setting for this run only; omit it to use the setting."""
+    from src.actions.core import Actions
+    from src.orchestrator.graph_layout import run_layout_migrate
+
+    ident = await _ident_for(ctx)
+    if ident is None:
+        return {"error": "mount first — a layout migration is a mind's act, and the "
+                         "graph must know whose", "why": _anchorless(ctx)}
+    pool = await _pool_get()
+    actions = Actions(pool)
+    receipts = [r async for r in run_layout_migrate(actions, limit=limit)]
+    if receipts and "error" in receipts[0]:
+        return receipts[0]
+    total_placed = receipts[-1]["total_placed"] if receipts else 0
+    return {"batches": receipts, "total_placed": total_placed}
+
+
 async def _dispatch_backfill(
     target: str, dry_run: bool, because: str | None, only_bases: list[str] | None,
     ctx: Context | None, *, limit: int | None = None, newest_first: bool = False,

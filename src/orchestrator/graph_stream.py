@@ -12,7 +12,7 @@ the rest reserved), edge_src/edge_dst (Uint32), edge_type_code (Uint8). Array PO
 is the object index -- no redundant index column, per Seshat's own read of the proposal
 (mail 10449).
 
-THREE ADDITIONS BEYOND THE FROZEN BINARY SHAPE, all header-only (never touching the
+FOUR ADDITIONS BEYOND THE FROZEN BINARY SHAPE, all header-only (never touching the
 arrays Seshat signed off on), flagged here and in the build report rather than done
 quietly:
   1. `object_ids` -- an index-aligned array of UUID strings in the JSON header. Needed
@@ -29,6 +29,12 @@ quietly:
      the frozen shape resolved node type/project codes but left `edge_type_code`
      nameless, which she needs for real relationship color-coding rather than a raw
      hash-on-int placeholder.
+  4. `link_type_class` -- index-aligned to `edge_types`, "structural"|"semantic" per
+     Thoth's THE READING LAYER dispatch (ruling c5953bb1) and src.ontology.link_classes
+     (agreed with Seshat by DM, mail 10604, before this was committed). She reads the
+     classification off the wire rather than hardcoding a second copy client-side --
+     graph_layout.py's own relax pass reads the SAME table to decide which edges are
+     allowed to pull two objects together (semantic only, never structural/membership).
 
 NOTE ON THE RETIRED BIT (worth naming, not a bug): today's snapshot query only ever
 includes objects the layout heartbeat has actually placed, which itself only ever
@@ -46,6 +52,7 @@ from typing import Any
 
 import asyncpg
 
+from src.ontology.link_classes import link_class
 from src.orchestrator.capture import CONTESTED_SQL
 
 SCHEMA_VERSION = 1
@@ -67,7 +74,7 @@ def encode_snapshot(
     type_code: list[int], project_code: list[int], weight: list[float],
     status_flag: list[int], edge_src: list[int], edge_dst: list[int],
     edge_type_code: list[int], types: list[str], projects: list[str],
-    edge_types: list[str],
+    edge_types: list[str], link_type_class: list[str],
 ) -> bytes:
     """Pure function, no DB: builds the exact wire bytes from already-resolved
     columns -- the DB-facing half (`fetch_snapshot`) is the only caller that ever
@@ -88,6 +95,10 @@ def encode_snapshot(
             raise ValueError(
                 f"{name} has {len(arrays[name])} entries, expected {edge_count} "
                 f"(edge_count)")
+    if len(link_type_class) != len(edge_types):
+        raise ValueError(
+            f"link_type_class has {len(link_type_class)} entries, expected "
+            f"{len(edge_types)} (len(edge_types))")
     body = bytearray()
     offsets: dict[str, dict[str, int | str]] = {}
     for name, code in _ARRAY_ORDER:
@@ -99,7 +110,8 @@ def encode_snapshot(
     header = {
         "schema_version": SCHEMA_VERSION, "count": count, "edge_count": edge_count,
         "types": types, "projects": projects, "edge_types": edge_types,
-        "object_ids": object_ids, "arrays": offsets,
+        "link_type_class": link_type_class, "object_ids": object_ids,
+        "arrays": offsets,
     }
     header_bytes = json.dumps(header).encode()
     return struct.pack("<I", len(header_bytes)) + header_bytes + bytes(body)
@@ -115,7 +127,7 @@ def decode_snapshot(data: bytes) -> dict[str, Any]:
     out: dict[str, Any] = {
         k: header[k] for k in
         ("schema_version", "count", "edge_count", "types", "projects", "edge_types",
-         "object_ids")
+         "link_type_class", "object_ids")
     }
     for name, meta in header["arrays"].items():
         code = str(meta["dtype"])
@@ -202,11 +214,13 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
     types = [name for name, _ in sorted(type_index.items(), key=lambda kv: kv[1])]
     projects = [name for name, _ in sorted(project_index.items(), key=lambda kv: kv[1])]
     edge_types = [name for name, _ in sorted(edge_type_index.items(), key=lambda kv: kv[1])]
+    link_type_class = [link_class(name) for name in edge_types]
     return encode_snapshot(
         object_ids=object_ids, x=xs, y=ys, type_code=type_codes,
         project_code=project_codes, weight=weights, status_flag=statuses,
         edge_src=edge_src, edge_dst=edge_dst, edge_type_code=edge_type_codes,
         types=types, projects=projects, edge_types=edge_types,
+        link_type_class=link_type_class,
     )
 
 
