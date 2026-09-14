@@ -1834,6 +1834,107 @@ async def citation_verification_census(pool: asyncpg.Pool) -> dict[str, Any]:
     return {"rows": findings, "total": len(findings)}
 
 
+async def grounds_law_measure(pool: asyncpg.Pool, *, days: int = 30) -> dict[str, Any]:
+    """PROVENANCE PIECE 3(c), THE GROUNDS-LAW MEASURE (thread b4477e9e, ruling bb3e4422,
+    operator 2026-09-14): MEASURE ONLY, no enforcement anywhere — over the last `days` of
+    fact writes, count what a hypothetical grounds law would have refused, by writer and
+    by channel, so the operator sets the ceremony threshold from data rather than a guess.
+
+    A write (an `assertions` row) is REFUSED iff NONE of five signals hold:
+      observation — `backed_by_observation` is a per-AGENT property (credence.py's own
+                    `_looked_map`), resolved off the WRITER's Agent object, not per-write.
+      grounds     — a live `grounded_by` link from the written object (the real link type
+                    `record_decision`'s own `grounds=` mints, capture.py's
+                    `_REQUIRED_LINK_KIND_TABLE`).
+      cites       — a live `cites` link from the written object.
+      refs        — no distinct `refs` link type exists anywhere in the schema; the closest
+                    real thing is a live link from the written object to a `Reference`
+                    object, so that stands in for "refs" here (scope note on this thread).
+      read-set    — a `session_reads` row for this writer (`agent_id` = the assertion's
+                    `source_id`) at `read_at < assertions.created_at` — any prior read
+                    counts, no window, matching `stamp_possible_upstream`'s own convention.
+
+    Population is `assertions` (not `current_assertions` — a same-source supersession
+    inside the window would silently drop an earlier write that still happened), scoped by
+    `created_at` (wall-clock write time) over the last `days`.
+
+    "BY DOOR": assertions carry no per-write door column — door/channel instrumentation
+    (`READ_DOORS`/`stamp_read`) is wired only for reads, at the MCP dispatch layer. The one
+    channel-shaped signal that DOES exist per-write is the writer's own `source_id` prefix
+    (`agent:`/`analyst:`/`miner:`/…) — ruling bb3e4422 is itself titled "provenance BY
+    CHANNEL, not by text," so that prefix stands in for "door" here. `by_writer` is exact;
+    `by_channel` is this substitution, named so a reader can tell the two apart."""
+    since = f"now() - interval '{int(days)} days'"
+    pop = await pool.fetch(
+        f"SELECT a.id, a.object_id, a.source_id, a.created_at FROM assertions a "
+        f"WHERE a.created_at >= {since}")
+    if not pop:
+        return {"total": 0, "refused": 0, "by_writer": {}, "by_channel": {}, "days": days}
+
+    writers = {r["source_id"] for r in pop}
+    obj_ids = list({r["object_id"] for r in pop})
+
+    looked_rows = await pool.fetch(
+        "SELECT o.canonical AS src, ca.value AS looked FROM objects o "
+        "JOIN current_assertions ca ON ca.object_id = o.id AND ca.name = 'backed_by_observation' "
+        "WHERE o.type = 'Agent' AND o.canonical = ANY($1::text[])", list(writers))
+    looked = {r["src"]: bool(r["looked"]) for r in looked_rows}
+
+    grounded_rows = await pool.fetch(
+        "SELECT DISTINCT l.from_id FROM links l "
+        "WHERE l.type IN ('grounded_by', 'cites') AND l.from_id = ANY($1::uuid[]) "
+        "AND (l.valid_until IS NULL OR l.valid_until > now())", obj_ids)
+    grounded_or_cited = {r["from_id"] for r in grounded_rows}
+
+    ref_rows = await pool.fetch(
+        "SELECT DISTINCT l.from_id FROM links l JOIN objects o ON o.id = l.to_id "
+        "WHERE o.type = 'Reference' AND l.from_id = ANY($1::uuid[]) "
+        "AND (l.valid_until IS NULL OR l.valid_until > now())", obj_ids)
+    refed = {r["from_id"] for r in ref_rows}
+
+    read_rows = await pool.fetch(
+        "SELECT DISTINCT sr.agent_id FROM session_reads sr WHERE sr.agent_id = ANY($1::text[])",
+        list(writers))
+    ever_read_writers = {r["agent_id"] for r in read_rows}
+    # per-writer earliest read is enough to decide most rows; correlate exactly for the
+    # writers who both wrote and read in-window, avoiding a per-row correlated subquery
+    # for everyone else.
+    read_before: dict[tuple[str, uuid.UUID], bool] = {}
+    if ever_read_writers:
+        pair_rows = await pool.fetch(
+            "SELECT a.source_id, a.object_id, "
+            "EXISTS(SELECT 1 FROM session_reads sr WHERE sr.agent_id = a.source_id "
+            "AND sr.read_at < a.created_at) AS has_read "
+            f"FROM assertions a WHERE a.created_at >= {since} "
+            "AND a.source_id = ANY($1::text[])", list(ever_read_writers))
+        read_before = {(r["source_id"], r["object_id"]): r["has_read"] for r in pair_rows}
+
+    by_writer: dict[str, dict[str, int]] = {}
+    by_channel: dict[str, dict[str, int]] = {}
+    refused_total = 0
+    for r in pop:
+        writer, oid = r["source_id"], r["object_id"]
+        has_signal = (
+            looked.get(writer, False)
+            or oid in grounded_or_cited
+            or oid in refed
+            or read_before.get((writer, oid), False)
+        )
+        refused = not has_signal
+        channel = writer.split(":", 1)[0] if ":" in writer else writer
+        wb = by_writer.setdefault(writer, {"total": 0, "refused": 0})
+        wb["total"] += 1
+        cb = by_channel.setdefault(channel, {"total": 0, "refused": 0})
+        cb["total"] += 1
+        if refused:
+            refused_total += 1
+            wb["refused"] += 1
+            cb["refused"] += 1
+
+    return {"total": len(pop), "refused": refused_total, "by_writer": by_writer,
+            "by_channel": by_channel, "days": days}
+
+
 async def _fn_lint(pool: asyncpg.Pool, subject: uuid.UUID | None, args: dict[str, Any]) -> Any:
     """rung 2 — GRAPH LINT (campaign 5c57f54d): the knowledge layer's immune system. Audits
     the graph ITSELF — report-only, pure SQL + credence, no LLM, and NO WRITES (rule #7: a
