@@ -48,6 +48,71 @@ function colorForEdgeType(type) {
   return c;
 }
 
+// THE READING LAYER, part A: EDGE CLASSES (ruling c5953bb1, Thoth DM 10596). Structural
+// edges are pure containment/membership (an object belongs to a repo, an agent operates in
+// a project, a seat holds a mind) — real, but not what a reader is tracing when they ask
+// "how did we get here"; their degree dwarfs everything else (repo:osiris alone: 20,352).
+// Semantic edges are the actual provenance/evidence trail (possible_upstream, cites,
+// derived_from, spawned_by, succeeded_from, supersedes, resolves, grounded_by, and the
+// rest) — what "focus really focusing" (the operator's own words) needs to walk and show.
+//
+// DEFAULT, picked and noted here per Thoth's own instruction not to park on visual choices
+// (thread 71c4ca0d carries this note too): every link type in src/ontology/schema.py whose
+// own docstring reads as "X belongs to / operates in / is a member or officer of Y" is
+// structural; everything else defaults to semantic (the safer default — an edge that's
+// actually structural but misclassified just draws a bit more clutter; one that's actually
+// meaningful but misclassified as structural would go invisible, the worse failure).
+// Swaps to Khnum's real per-request `edge_classes` header field the moment it lands (DM
+// 10603), same fallback pattern as colorForEdgeType/edge_types before it.
+const STRUCTURAL_EDGE_TYPES = new Set([
+  "in_repo", "works_in", "governs", "holds", "acts_for", "member_of", "employs",
+  "worktree_of", "succeeds_seat", "owns", "owned_by", "subsidiary_of", "ultimate_parent",
+  "sent_by", "addressed_to", "broadcast_to", "in_thread",
+]);
+function classOfEdgeType(type) {
+  return STRUCTURAL_EDGE_TYPES.has(type) ? "structural" : "semantic";
+}
+
+// THE READING LAYER, part B (ruling c5953bb1): the curated provenance/evidence edge-type
+// allowlist a real FOCUS walks — the actual "long paths leading back and upstream" the
+// operator asked to see, as opposed to part A's structural containment edges, which never
+// widen a path. Pure, DOM-free module-level functions (not closures inside initSpace) so
+// the acceptance test Thoth's own dispatch named — "a synthetic 5-hop chain where focus at
+// the tail lights exactly the chain and nothing else" — can exercise the real algorithm
+// directly via Node, not a string-presence proof.
+export const PATH_EDGE_TYPES = new Set([
+  "possible_upstream", "cites", "derived_from", "spawned_by",
+  "succeeded_from", "supersedes", "resolves",
+]);
+export function buildPathAdjacency(edges) {
+  const outAdj = new Map(), inAdj = new Map(); // node id -> [neighbor ids]
+  for (const e of edges) {
+    if (!PATH_EDGE_TYPES.has(e.type)) continue;
+    if (!outAdj.has(e.source)) outAdj.set(e.source, []);
+    outAdj.get(e.source).push(e.target);
+    if (!inAdj.has(e.target)) inAdj.set(e.target, []);
+    inAdj.get(e.target).push(e.source);
+  }
+  return { outAdj, inAdj };
+}
+// bidirectional BFS, depth-limited (a widen control raises depth interactively rather than
+// a hardcoded ceiling) — Osiris convention: from_id = the dependent/newer fact, to_id =
+// what it points at, so "upstream" follows outAdj (X.source -> target) and "downstream...
+// over the same reversed" follows inAdj.
+export function walkPath(outAdj, inAdj, startId, depth) {
+  const seen = new Set([startId]);
+  let frontier = [startId];
+  for (let d = 0; d < depth && frontier.length; d++) {
+    const next = [];
+    for (const cur of frontier) {
+      for (const t of outAdj.get(cur) || []) { if (!seen.has(t)) { seen.add(t); next.push(t); } }
+      for (const t of inAdj.get(cur) || []) { if (!seen.has(t)) { seen.add(t); next.push(t); } }
+    }
+    frontier = next;
+  }
+  return seen;
+}
+
 // ---- GET /graph/stream wire decode (a JS twin of graph_stream.decode_snapshot) ---------
 // 4-byte LE uint32 header length, that many bytes of UTF-8 JSON header, then the raw arrays
 // back to back at the byte offsets the header's own `arrays` map names.
@@ -88,10 +153,16 @@ async function fetchStreamSnapshot() {
   }
   const edges = [];
   for (let i = 0; i < snap.edge_count; i++) {
+    const type = (snap.edge_types && snap.edge_types[snap.edge_type_code[i]]) ?? snap.edge_type_code[i];
+    // prefers Khnum's own real per-type classification (DM 10603) once the header carries
+    // one; falls back to the client-side default (classOfEdgeType) until then.
+    const edgeClass = snap.edge_classes && snap.edge_classes[snap.edge_type_code[i]]
+      ? snap.edge_classes[snap.edge_type_code[i]]
+      : classOfEdgeType(type);
     edges.push({
       source: snap.object_ids[snap.edge_src[i]],
       target: snap.object_ids[snap.edge_dst[i]],
-      type: (snap.edge_types && snap.edge_types[snap.edge_type_code[i]]) ?? snap.edge_type_code[i],
+      type, edgeClass,
     });
   }
   return { nodes, edges };
@@ -112,12 +183,17 @@ function resolveContainer(container) {
     rightRail: (container && container.rightRail) || byId("right"),
     fitBtn: (container && container.fitBtn) || byId("fit-btn"),
     upBtn: (container && container.upBtn) || byId("up-btn"),
+    legendBtn: (container && container.legendBtn) || byId("legend-btn"),
+    legendPanel: (container && container.legendPanel) || byId("legend-panel"),
+    backBtn: (container && container.backBtn) || byId("back-btn"),
+    widenBtn: (container && container.widenBtn) || byId("widen-btn"),
     onFocus: (container && container.onFocus) || null, // (id) => void, shares selection with the table
   };
 }
 
 export async function initSpace(container) {
-  const { wrap, labelsEl, statusEl, levelBadge, searchInput, searchDd, rightRail, fitBtn, upBtn, onFocus } =
+  const { wrap, labelsEl, statusEl, levelBadge, searchInput, searchDd, rightRail, fitBtn, upBtn,
+    legendBtn, legendPanel, backBtn, widenBtn, onFocus } =
     resolveContainer(container);
   function setStatus(text) { statusEl.textContent = text; }
 
@@ -168,6 +244,7 @@ export async function initSpace(container) {
   window.addEventListener("resize", () => {
     renderer.setSize(wrap.clientWidth, wrap.clientHeight);
     updateFrustum();
+    edgeFadeUniforms.uViewportPx.value.set(wrap.clientWidth, wrap.clientHeight);
     markDirty();
   });
 
@@ -221,8 +298,14 @@ export async function initSpace(container) {
   let mesh = null, pickMesh = null, edgeLines = null;
   let meshUniforms = null, pickUniforms = null;
   let idToNode = [];
-  let focusId = null;
-  let litIds = new Set();
+  // THE READING LAYER, part B: FOCUS = PATH LENS (ruling c5953bb1, Thoth DM 10596). SELECT
+  // (a plain click) and FOCUS (double-click, Enter, or the inspector's Focus button) are now
+  // two different acts — selectedId just shows the inspector; pathFocusId/pathReachable are
+  // the real path-lens state (only non-empty while an actual focus is active).
+  let selectedId = null;
+  let pathFocusId = null;
+  let pathReachable = new Set();
+  let focusStack = []; // ids, most recent last — back() pops, Escape/Clear focus wipes the overlay
 
   function disposeCurrent() {
     for (const m of [mesh, pickMesh, edgeLines]) {
@@ -284,6 +367,138 @@ export async function initSpace(container) {
     return { material: mat, uniforms };
   }
 
+  // THE READING LAYER, part A: edges fade by SCREEN length, not by zoom level — a long line
+  // crossing most of the view (two clusters that happen to be linked) reads as noise; a
+  // short local one is the actual signal. Same GPU-uniform discipline as node sizing (mail
+  // 10581): each vertex carries the OTHER endpoint's world position too (`otherPosition`),
+  // so the vertex shader can project both ends to screen pixels and compute the segment's
+  // own on-screen length using nothing but modelViewMatrix/projectionMatrix — already
+  // updated by three.js every frame for free. No per-zoom CPU work, no material.opacity
+  // scalar to keep in sync (replaces the old viewSize-based updateEdgeStyle entirely).
+  const edgeFadeUniforms = {
+    uViewportPx: { value: new THREE.Vector2(wrap.clientWidth, wrap.clientHeight) },
+    uMaxFadePx: { value: 320 },
+    uMinAlpha: { value: 0.04 },
+    uMaxAlpha: { value: 0.5 },
+  };
+  function makeEdgeFadeMaterial() {
+    return new THREE.ShaderMaterial({
+      uniforms: edgeFadeUniforms,
+      transparent: true,
+      depthWrite: false,
+      vertexShader: `
+        attribute vec3 color;
+        attribute vec3 otherPosition;
+        uniform vec2 uViewportPx;
+        uniform float uMaxFadePx;
+        uniform float uMinAlpha;
+        uniform float uMaxAlpha;
+        varying vec3 vColor;
+        varying float vAlpha;
+        void main() {
+          vColor = color;
+          vec4 clip = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          vec4 otherClip = projectionMatrix * modelViewMatrix * vec4(otherPosition, 1.0);
+          vec2 pxA = (clip.xy / clip.w * 0.5 + 0.5) * uViewportPx;
+          vec2 pxB = (otherClip.xy / otherClip.w * 0.5 + 0.5) * uViewportPx;
+          float screenLen = distance(pxA, pxB);
+          vAlpha = mix(uMaxAlpha, uMinAlpha, clamp(screenLen / uMaxFadePx, 0.0, 1.0));
+          gl_Position = clip;
+        }
+      `,
+      fragmentShader: `
+        varying vec3 vColor;
+        varying float vAlpha;
+        void main() { gl_FragColor = vec4(vColor, vAlpha); }
+      `,
+    });
+  }
+
+  // legend state: which edge classes/types are hidden from the base render. Structural is
+  // hidden by DEFAULT ("not drawn at rest", ruling c5953bb1) — the legend is how a reader
+  // opts back into seeing it without needing to focus a specific node.
+  const hiddenEdgeClasses = new Set(["structural"]);
+  const hiddenEdgeTypes = new Set();
+  function buildEdgeLines(nodes, edgeList) {
+    if (edgeLines) { scene.remove(edgeLines); edgeLines.geometry.dispose(); edgeLines.material.dispose(); edgeLines = null; }
+    const visible = edgeList.filter((e) => !hiddenEdgeClasses.has(e.edgeClass) && !hiddenEdgeTypes.has(e.type));
+    const positions = new Float32Array(visible.length * 6);
+    const otherPositions = new Float32Array(visible.length * 6);
+    const edgeColors = new Float32Array(visible.length * 6);
+    const idx = new Map(nodes.map((nd, i) => [nd.id, i]));
+    const ec = new THREE.Color();
+    let vi = 0;
+    for (const e of visible) {
+      const a = idx.get(e.source), b = idx.get(e.target);
+      if (a == null || b == null) continue;
+      const na = nodes[a], nb = nodes[b];
+      positions[vi] = na.x || 0; positions[vi + 1] = na.y || 0; positions[vi + 2] = -0.1;
+      otherPositions[vi] = nb.x || 0; otherPositions[vi + 1] = nb.y || 0; otherPositions[vi + 2] = -0.1;
+      vi += 3;
+      positions[vi] = nb.x || 0; positions[vi + 1] = nb.y || 0; positions[vi + 2] = -0.1;
+      otherPositions[vi] = na.x || 0; otherPositions[vi + 1] = na.y || 0; otherPositions[vi + 2] = -0.1;
+      vi += 3;
+      // colour-coded by relationship type ("that would make a ton of sense" — no link-type
+      // palette exists server-side, so a stable hash-to-hue keeps a given edge type the
+      // same colour across reloads without inventing new server state).
+      ec.set(colorForEdgeType(e.type));
+      edgeColors[vi - 6] = ec.r; edgeColors[vi - 5] = ec.g; edgeColors[vi - 4] = ec.b;
+      edgeColors[vi - 3] = ec.r; edgeColors[vi - 2] = ec.g; edgeColors[vi - 1] = ec.b;
+    }
+    const edgeGeo = new THREE.BufferGeometry();
+    edgeGeo.setAttribute("position", new THREE.BufferAttribute(positions.subarray(0, vi), 3));
+    edgeGeo.setAttribute("otherPosition", new THREE.BufferAttribute(otherPositions.subarray(0, vi), 3));
+    edgeGeo.setAttribute("color", new THREE.BufferAttribute(edgeColors.subarray(0, vi), 3));
+    edgeLines = new THREE.LineSegments(edgeGeo, makeEdgeFadeMaterial());
+    scene.add(edgeLines);
+    renderLegend(edgeList);
+    markDirty();
+  }
+
+  // legend: lists every class + type actually present in the loaded data, checkbox per
+  // row, toggling straight into hiddenEdgeClasses/hiddenEdgeTypes and rebuilding the edge
+  // geometry — a legend toggle is a rare, deliberate act, never a per-frame cost.
+  function renderLegend(edgeList) {
+    if (!legendPanel) return;
+    const classOf = new Map();
+    for (const e of edgeList) classOf.set(e.type, e.edgeClass);
+    const byClass = { semantic: [], structural: [] };
+    for (const [type, cls] of classOf) (byClass[cls] || (byClass[cls] = [])).push(type);
+    for (const k of Object.keys(byClass)) byClass[k].sort();
+
+    const classRow = (cls) => {
+      const checked = hiddenEdgeClasses.has(cls) ? "" : "checked";
+      const count = (byClass[cls] || []).length;
+      return `<label class="legend-row legend-class"><input type="checkbox" data-legend-class="${cls}" ${checked} /> <strong>${cls}</strong> <span class="o-faint">(${count})</span></label>`;
+    };
+    const typeRow = (type) => {
+      const checked = hiddenEdgeTypes.has(type) ? "" : "checked";
+      const esc = String(type).replace(/"/g, "&quot;");
+      return `<label class="legend-row legend-type"><input type="checkbox" data-legend-type="${esc}" ${checked} /> <span class="legend-swatch" style="background:${colorForEdgeType(type)}"></span>${esc}</label>`;
+    };
+    legendPanel.innerHTML =
+      classRow("semantic") + (byClass.semantic || []).map(typeRow).join("") +
+      classRow("structural") + (byClass.structural || []).map(typeRow).join("");
+
+    legendPanel.querySelectorAll("[data-legend-class]").forEach((el) => {
+      el.addEventListener("change", () => {
+        const cls = el.dataset.legendClass;
+        if (el.checked) hiddenEdgeClasses.delete(cls); else hiddenEdgeClasses.add(cls);
+        buildEdgeLines(idToNode, edges);
+      });
+    });
+    legendPanel.querySelectorAll("[data-legend-type]").forEach((el) => {
+      el.addEventListener("change", () => {
+        const type = el.dataset.legendType;
+        if (el.checked) hiddenEdgeTypes.delete(type); else hiddenEdgeTypes.add(type);
+        buildEdgeLines(idToNode, edges);
+      });
+    });
+  }
+  if (legendBtn && legendPanel) {
+    legendBtn.addEventListener("click", () => { legendPanel.hidden = !legendPanel.hidden; });
+  }
+
   function buildScene(nodes, edges) {
     disposeCurrent();
     idToNode = nodes;
@@ -340,57 +555,28 @@ export async function initSpace(container) {
     scene.add(mesh);
     pickScene.add(pickMesh);
 
-    const positions = new Float32Array(edges.length * 6);
-    const edgeColors = new Float32Array(edges.length * 6);
-    let ei = 0, eci = 0;
-    const idx = new Map(nodes.map((nd, i) => [nd.id, i]));
-    const ec = new THREE.Color();
-    for (const e of edges) {
-      const a = idx.get(e.source), b = idx.get(e.target);
-      if (a == null || b == null) continue;
-      const na = nodes[a], nb = nodes[b];
-      positions[ei++] = na.x || 0; positions[ei++] = na.y || 0; positions[ei++] = -0.1;
-      positions[ei++] = nb.x || 0; positions[ei++] = nb.y || 0; positions[ei++] = -0.1;
-      // colour-coded by relationship type ("that would make a ton of sense" — no link-type
-      // palette exists server-side, so a stable hash-to-hue keeps a given edge type the
-      // same colour across reloads without inventing new server state).
-      ec.set(colorForEdgeType(e.type));
-      edgeColors[eci++] = ec.r; edgeColors[eci++] = ec.g; edgeColors[eci++] = ec.b;
-      edgeColors[eci++] = ec.r; edgeColors[eci++] = ec.g; edgeColors[eci++] = ec.b;
-    }
-    const edgeGeo = new THREE.BufferGeometry();
-    edgeGeo.setAttribute("position", new THREE.BufferAttribute(positions.subarray(0, ei), 3));
-    edgeGeo.setAttribute("color", new THREE.BufferAttribute(edgeColors.subarray(0, ei), 3));
-    const edgeMat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.4 });
-    edgeLines = new THREE.LineSegments(edgeGeo, edgeMat);
-    scene.add(edgeLines);
+    buildEdgeLines(nodes, edges);
     applyDim();
-    updateEdgeStyle();
     markDirty();
   }
 
-  // edges thin and fade with zoom-out — legible up close, never a solid mesh of lines once
-  // you're far enough out to see everything at once.
-  function updateEdgeStyle() {
-    if (!edgeLines) return;
-    const t = Math.min(1, Math.max(0, (viewSize - 100) / 1200)); // 0 near, 1 far
-    // base edges stay quiet at every zoom now that a focus gets its own brighter overlay
-    // (updateHighlightEdges) — this layer is texture/context, never the signal.
-    edgeLines.material.opacity = 0.28 - t * 0.22;
-  }
-
-  // click = HIGHLIGHT, never a data change: dim everything except the focused node + its
-  // lit neighborhood (empty litIds = nothing dimmed, the normal unfocused view).
+  // SELECT (a plain click) never dims the graph — only FOCUS does, and only focus dims
+  // "to near invisible" (ruling c5953bb1's own wording, stronger than the old 0.12 factor):
+  // a real path lens has to actually read as a lens, not a faint tint.
+  const FOCUS_DIM_FACTOR = 0.03;
   function applyDim() {
     if (!mesh) return;
     const color = new THREE.Color();
-    const dimmed = litIds.size > 0 || focusId;
+    const focused = !!pathFocusId;
     for (let i = 0; i < idToNode.length; i++) {
       const nd = idToNode[i];
       color.set(typeColors.get(nd.type) || "#6e7681");
-      if (dimmed && nd.id !== focusId && !litIds.has(nd.id)) {
-        color.multiplyScalar(0.12); // dim hard — colour as signal, not decoration
-      } else if (nd.id === focusId) {
+      if (focused) {
+        if (nd.id === pathFocusId) color.set("#58a6ff");
+        else if (!pathReachable.has(nd.id)) color.multiplyScalar(FOCUS_DIM_FACTOR);
+        // else: reachable-but-not-focused nodes keep their normal type colour — still
+        // legible as part of the path, the focused node alone gets the accent colour.
+      } else if (nd.id === selectedId) {
         color.set("#58a6ff");
       }
       mesh.instanceColor.setXYZ(i, color.r, color.g, color.b);
@@ -454,7 +640,7 @@ export async function initSpace(container) {
       pendingRebuild = false;
       nodes = Array.from(nodesById.values());
       buildScene(nodes, edges);
-      if (focusId) applyDim();
+      if (pathFocusId || selectedId) applyDim();
       setStatus(`${nodes.length} objects, ${edges.length} edges (live)`);
     }, 250);
   }
@@ -476,55 +662,59 @@ export async function initSpace(container) {
     console.error("graph/stream/deltas unavailable", err);
   }
 
-  // "highlight nodes all the way upstream" — walked CLIENT-SIDE off the already-loaded
-  // edge list (the whole-graph load makes this free: no new endpoint). Osiris convention
-  // is from_id = the dependent/newer fact, to_id = what it points at (grounds/cites/
-  // spawned_by/etc all read this way) — so upstream from X follows OUTGOING edges
-  // (X.source -> target), repeated until nothing new turns up. Capped so one hyper-
-  // connected node can't pull in a meaningful fraction of the whole graph.
-  const outAdj = new Map(); // node id -> [target ids]
-  for (const e of edges) {
-    if (!outAdj.has(e.source)) outAdj.set(e.source, []);
-    outAdj.get(e.source).push(e.target);
-  }
-  const UPSTREAM_CAP = 400;
-  function walkUpstream(startId) {
-    const seen = new Set([startId]);
-    const frontier = [startId];
-    while (frontier.length && seen.size < UPSTREAM_CAP) {
-      const cur = frontier.shift();
-      for (const t of outAdj.get(cur) || []) {
-        if (seen.has(t)) continue;
-        seen.add(t);
-        frontier.push(t);
-        if (seen.size >= UPSTREAM_CAP) break;
-      }
-    }
-    return seen;
-  }
+  // THE READING LAYER, part B: the PATH — walked CLIENT-SIDE off the already-loaded edge
+  // list, over a curated allowlist of provenance/evidence link types only (ruling c5953bb1's
+  // own list) — structural containment (in_repo, works_in, ...) never widens a path, that's
+  // exactly what part A excludes from "what a reader is tracing". Osiris convention: from_id
+  // = the dependent/newer fact, to_id = what it points at — "upstream" from X follows
+  // OUTGOING edges (X.source -> target); "downstream... over the same reversed" follows
+  // INCOMING edges. Both directions, one BFS, depth-limited (not count-capped like the old
+  // walkUpstream) with a widen control (focusDepth) instead of a hardcoded ceiling.
+  // buildPathAdjacency/walkPath are pure, DOM-free, module-level functions (below the
+  // module docstring) precisely so THE ACCEPTANCE TEST Thoth's own dispatch named — "a
+  // synthetic 5-hop chain where focus at the tail lights exactly the chain and nothing
+  // else" — can exercise the real algorithm directly via Node, not a string-presence proof.
+  const FOCUS_DEPTH_DEFAULT = 4;
+  let focusDepth = FOCUS_DEPTH_DEFAULT;
+  const { outAdj: outAdjPath, inAdj: inAdjPath } = buildPathAdjacency(edges);
 
-  // a second, brighter LineSegments drawn OVER the dim base edges — only edges strictly
-  // between two currently-lit nodes, so the focus's own provenance chain visually pops
-  // instead of reading as the same grey wash as everything else.
-  let highlightEdges = null;
-  function updateHighlightEdges() {
-    if (highlightEdges) { scene.remove(highlightEdges); highlightEdges.geometry.dispose(); highlightEdges.material.dispose(); highlightEdges = null; }
+  // a second LineSegments drawn OVER the dim base edges: the reachable PATH edges (bright,
+  // WITH DIRECTION — a vertex-colour gradient, brighter at the source/dependent end, dimmer
+  // at the target/depended-on end, per Osiris's own from_id->to_id convention) plus, per
+  // ruling c5953bb1, "the focused object's structural edges draw on focus only" — the
+  // focused node's own containment (which project, which agent) becomes visible exactly
+  // because it's focused, even though part A hides structural edges at rest.
+  let pathHighlightEdges = null;
+  const PATH_EDGE_BRIGHT = new THREE.Color(0x58a6ff);
+  const PATH_EDGE_DIM = new THREE.Color(0x58a6ff).multiplyScalar(0.35);
+  function updatePathEdges() {
+    if (pathHighlightEdges) {
+      scene.remove(pathHighlightEdges);
+      pathHighlightEdges.geometry.dispose();
+      pathHighlightEdges.material.dispose();
+      pathHighlightEdges = null;
+    }
     markDirty();
-    if (!litIds.size) return;
-    const idx = new Map(idToNode.map((nd, i) => [nd.id, nd]));
-    const pos = [];
+    if (!pathFocusId) return;
+    const idx = new Map(idToNode.map((nd) => [nd.id, nd]));
+    const pos = [], col = [];
     for (const e of edges) {
-      if (!litIds.has(e.source) || !litIds.has(e.target)) continue;
+      const onPath = PATH_EDGE_TYPES.has(e.type) && pathReachable.has(e.source) && pathReachable.has(e.target);
+      const structuralOfFocus = e.edgeClass === "structural" && (e.source === pathFocusId || e.target === pathFocusId);
+      if (!onPath && !structuralOfFocus) continue;
       const a = idx.get(e.source), b = idx.get(e.target);
       if (!a || !b) continue;
       pos.push(a.x || 0, a.y || 0, -0.05, b.x || 0, b.y || 0, -0.05);
+      col.push(PATH_EDGE_BRIGHT.r, PATH_EDGE_BRIGHT.g, PATH_EDGE_BRIGHT.b,
+        PATH_EDGE_DIM.r, PATH_EDGE_DIM.g, PATH_EDGE_DIM.b);
     }
     if (!pos.length) return;
     const geo = new THREE.BufferGeometry();
     geo.setAttribute("position", new THREE.Float32BufferAttribute(new Float32Array(pos), 3));
-    highlightEdges = new THREE.LineSegments(
-      geo, new THREE.LineBasicMaterial({ color: 0x58a6ff, transparent: true, opacity: 0.8 }));
-    scene.add(highlightEdges);
+    geo.setAttribute("color", new THREE.Float32BufferAttribute(new Float32Array(col), 3));
+    pathHighlightEdges = new THREE.LineSegments(
+      geo, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.85 }));
+    scene.add(pathHighlightEdges);
   }
 
   // ---- pan + zoom — LOOKING ONLY, never changes what's loaded ------------------------
@@ -562,7 +752,9 @@ export async function initSpace(container) {
     const wpp = worldPerPx();
     if (meshUniforms) meshUniforms.uWorldPerPx.value = wpp;
     if (pickUniforms) pickUniforms.uWorldPerPx.value = wpp;
-    updateEdgeStyle();
+    // no edge-style call here any more — the edge-fade shader (makeEdgeFadeMaterial) reads
+    // screen length straight off projectionMatrix/modelViewMatrix every render, already
+    // current every frame with zero extra work on a zoom step.
   }
 
   // wheel = LOOKING ONLY, cursor-anchored (Thoth's own live fix, mail 10581 item 5: "zoom
@@ -625,17 +817,27 @@ export async function initSpace(container) {
     return id === 0 ? null : idToNode[id - 1];
   }
 
+  // click = SELECT (inspector only, no dim, no camera move); dblclick/Enter/the inspector's
+  // own Focus button = the real path lens (focusObject, below). A plain click also clears
+  // any active focus overlay first — a fresh inspection supersedes the last path, only the
+  // explicit Back/Escape acts are about navigating the focus history itself.
   renderer.domElement.addEventListener("click", (ev) => {
     if (dragDistance > CLICK_SLOP_PX) return; // the trailing click after a real pan/drag
     const hit = pickAt(ev.clientX, ev.clientY);
-    if (hit) focusObject(hit.id);
+    if (hit) selectObject(hit.id);
     else clearFocus();
+  });
+  renderer.domElement.addEventListener("dblclick", (ev) => {
+    const hit = pickAt(ev.clientX, ev.clientY);
+    if (hit) focusObject(hit.id);
   });
 
   function clearFocus() {
-    focusId = null; litIds = new Set();
+    selectedId = null;
+    pathFocusId = null;
+    pathReachable = new Set();
     applyDim();
-    updateHighlightEdges();
+    updatePathEdges();
     rightRail.className = "rail";
     rightRail.innerHTML =
       '<div class="insp-empty" id="insp"><div style="font-weight:700;font-size:13px;' +
@@ -645,26 +847,62 @@ export async function initSpace(container) {
     if (onFocus) onFocus(null); // shares the clear with an embedding table (console.js)
   }
 
+  // SELECT: inspector only, no dim, no camera move, no path walk — the lightweight act.
+  async function selectObject(id) {
+    selectedId = id;
+    pathFocusId = null;
+    pathReachable = new Set();
+    if (onFocus) onFocus(id);
+    applyDim();
+    updatePathEdges();
+    await inspect(id);
+  }
+
   fitBtn.addEventListener("click", () => {
     fitToNodes(idToNode);
     scheduleLabelPick();
   });
   upBtn.addEventListener("click", clearFocus);
+  if (backBtn) backBtn.addEventListener("click", goBack);
+  if (widenBtn) widenBtn.addEventListener("click", () => {
+    focusDepth = Math.min(focusDepth + 1, 20);
+    if (pathFocusId) focusObject(pathFocusId, { skipStackPush: true, depth: focusDepth });
+  });
 
-  // ---- focus = HIGHLIGHT, never a reload (inspector stays HTML) ---------------------
-  async function focusObject(id) {
-    focusId = id;
-    litIds = walkUpstream(id);
+  function pushFocusStack(id) {
+    if (focusStack[focusStack.length - 1] === id) return;
+    focusStack.push(id);
+    if (focusStack.length > 50) focusStack.shift();
+  }
+  function goBack() {
+    if (focusStack.length < 2) { clearFocus(); return; }
+    focusStack.pop(); // the current focus
+    const prev = focusStack[focusStack.length - 1];
+    focusObject(prev, { skipStackPush: true });
+  }
+
+  // ---- FOCUS = PATH LENS (ruling c5953bb1): walks upstream+downstream over the curated
+  // provenance edge types, dims everything unreachable to near invisible, draws the
+  // reachable path bright with direction, fits the camera to the reachable set, labels the
+  // path, reveals the focused object's own structural edges. Never a data reload — the
+  // whole graph is already loaded, this only ever changes what's highlighted.
+  async function focusObject(id, opts) {
+    const options = opts || {};
+    selectedId = id;
+    pathFocusId = id;
+    focusDepth = options.depth || FOCUS_DEPTH_DEFAULT;
+    pathReachable = walkPath(outAdjPath, inAdjPath, id, focusDepth);
+    if (!options.skipStackPush) pushFocusStack(id);
     if (onFocus) onFocus(id); // shares the selection with an embedding table (console.js)
 
-    // zoom-to-fit: frame the camera around exactly the lit set's own bounding box (padded),
-    // not a fixed small viewSize centered on the click — "zooming them to where they make
-    // sense," per the operator. A single-node upstream (nothing else lit) still gets a
-    // sane close-in view rather than a zero-size frustum.
+    // zoom-to-fit: frame the camera around exactly the reachable set's own bounding box
+    // (padded), not a fixed small viewSize centered on the click — "zooming them to where
+    // they make sense," per the operator. A single-node path (nothing else reachable) still
+    // gets a sane close-in view rather than a zero-size frustum.
     const idx = new Map(idToNode.map((nd) => [nd.id, nd]));
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-    for (const litId of litIds) {
-      const nd = idx.get(litId);
+    for (const rid of pathReachable) {
+      const nd = idx.get(rid);
       if (!nd || nd.x == null || nd.y == null) continue;
       minX = Math.min(minX, nd.x); maxX = Math.max(maxX, nd.x);
       minY = Math.min(minY, nd.y); maxY = Math.max(maxY, nd.y);
@@ -676,15 +914,16 @@ export async function initSpace(container) {
       // padding + a sane floor/ceiling — the ceiling rides maxViewSize (the real fitted
       // graph's own extent, set in fitToNodes) rather than a hardcoded 1300: the same class
       // of stale-constant bug Thoth caught in the wheel clamp (mail 10581) would otherwise
-      // clip a legitimately wide-spread upstream chain back down to a fixed small view.
+      // clip a legitimately wide-spread path back down to a fixed small view.
       viewSize = Math.max(30, Math.min(maxViewSize, span * 1.6 + 40));
       updateFrustum();
       rescaleForZoom();
     }
 
     applyDim();
-    updateHighlightEdges();
-    setStatus(`focused: ${litIds.size} upstream (capped at ${UPSTREAM_CAP})`);
+    updatePathEdges();
+    if (widenBtn) widenBtn.textContent = `Widen (${focusDepth})`;
+    setStatus(`focused: ${pathReachable.size} reachable within ${focusDepth} hops`);
     scheduleLabelPick();
     markDirty();
     await inspect(id);
@@ -694,9 +933,30 @@ export async function initSpace(container) {
     const obj = await fetch(`/objects/${id}`).then((r) => r.json());
     rightRail.className = "rail";
     rightRail.innerHTML = Osiris.objectDetail(obj, "");
+    // the inspector's own Focus button — one of the three ways to trigger a real focus
+    // (ruling c5953bb1: double-click, Enter, or this button).
+    const focusBtn = document.createElement("button");
+    focusBtn.className = "iconbtn";
+    focusBtn.textContent = pathFocusId === id ? "Focused" : "Focus";
+    focusBtn.style.cssText = "margin-bottom:10px";
+    focusBtn.addEventListener("click", () => focusObject(id));
+    rightRail.prepend(focusBtn);
+    // every object reference in the inspector (upstream_ids, readers, links) walks the
+    // focus — ruling c5953bb1's own "harmony" requirement, part C, but the wiring lives
+    // here since it's the same click-through this inspector has always used.
     const relsEl = rightRail.querySelector("[data-rels]");
     if (relsEl) await Osiris.loadRels(relsEl, id, (pickId) => focusObject(pickId), () => {});
   }
+
+  // Enter focuses the currently selected node (ruling c5953bb1's own second trigger) —
+  // guarded the same way console.js's own keydown handler guards Ctrl+K/Escape, never
+  // firing while a real text field has focus.
+  window.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter") return;
+    const tag = document.activeElement && document.activeElement.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+    if (selectedId) focusObject(selectedId);
+  });
 
   // ---- search (stays HTML) -----------------------------------------------------------
   let searchTimer = null, searchToken = 0;
@@ -751,7 +1011,7 @@ export async function initSpace(container) {
   function pickLabels() {
     const cx = camera.position.x, cy = camera.position.y;
     const n = Math.max(10, Math.round(N_LABELS - (viewSize / 2000) * 30));
-    const pool = litIds.size ? idToNode.filter((nd) => nd.id === focusId || litIds.has(nd.id)) : idToNode;
+    const pool = pathFocusId ? idToNode.filter((nd) => pathReachable.has(nd.id)) : idToNode;
     labeledNodes = pool
       .map((nd) => ({ nd, d: (nd.x - cx) ** 2 + (nd.y - cy) ** 2 }))
       .sort((a, b) => a.d - b.d)
@@ -799,7 +1059,7 @@ export async function initSpace(container) {
       _v.set(nd.x || 0, nd.y || 0, 0).project(camera);
       const x = (_v.x * 0.5 + 0.5) * wrap.clientWidth;
       const y = (-_v.y * 0.5 + 0.5) * wrap.clientHeight;
-      const lit = nd.id === focusId || litIds.has(nd.id);
+      const lit = nd.id === pathFocusId || pathReachable.has(nd.id) || nd.id === selectedId;
       // lit/focused labels always win their spot (never declutter the thing you asked to
       // see); ordinary labels yield to anything already placed.
       if (!lit && overlapsPlaced(x, y)) { div.hidden = true; continue; }
@@ -820,8 +1080,11 @@ export async function initSpace(container) {
   markDirty();
 
   const api = {
-    focusObject, clearFocus, inspect, pause, resume,
+    focusObject, selectObject, clearFocus, inspect, pause, resume, goBack,
     get idToNode() { return idToNode; },
+    get pathReachable() { return pathReachable; },
+    get pathFocusId() { return pathFocusId; },
+    get selectedId() { return selectedId; },
     camera, pickAt, mesh: () => mesh, worldPerPx, nodeRadiusPx, renderer,
     // debug/test hooks only (same convention as window.__space always being exposed) —
     // zoomAt bypasses the rAF-coalesced wheel path for direct exercise; forceRender skips

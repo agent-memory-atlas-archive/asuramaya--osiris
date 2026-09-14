@@ -964,9 +964,11 @@ function inspectOnly(id) {
     badge.textContent = "Inspect: " + id.slice(0, 8) + "";
   }
   // a table-drawer row click "shares the selection" with the space canvas (mail 10550) —
-  // focusObject also opens the inspector itself, so this replaces the plain inspect(id)
-  // call whenever the canvas is actually mounted and visible (browse).
-  if (ACTIVE_SURFACE === 'browse' && window.OsirisSpace) window.OsirisSpace.focusObject(id);
+  // selectObject also opens the inspector itself, so this replaces the plain inspect(id)
+  // call whenever the canvas is actually mounted and visible (browse). A table click is
+  // SELECT, not FOCUS (ruling c5953bb1): it doesn't dim the graph or walk a path — that's
+  // reserved for a double-click, Enter, or the inspector's own Focus button.
+  if (ACTIVE_SURFACE === 'browse' && window.OsirisSpace) window.OsirisSpace.selectObject(id);
   else inspect(id);
 }
 async function openAsSet(oid, type, dir, label) {

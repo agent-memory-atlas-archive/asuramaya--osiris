@@ -33,7 +33,9 @@ def test_the_old_hardcoded_wheel_clamp_is_gone() -> None:
 def test_focus_zoom_to_fit_no_longer_clips_to_a_stale_1300_ceiling() -> None:
     # the same stale-constant bug class Thoth caught in the wheel clamp -- a wide-spread
     # upstream chain was being clipped back down to a fixed small view.
-    body = _SPACE_JS.split("async function focusObject(id)", 1)[1].split("\n  }\n", 1)[0]
+    # THE READING LAYER, part B (ruling c5953bb1) later gave focusObject a second `opts`
+    # parameter (depth/skipStackPush) -- the signature changed, the ceiling fix didn't.
+    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1].split("\n  }\n", 1)[0]
     assert "Math.min(maxViewSize, span * 1.6 + 40)" in body
     assert "Math.min(1300" not in body
 
