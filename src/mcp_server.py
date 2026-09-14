@@ -14,8 +14,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import faulthandler
+import itertools
 import json
+import signal
+import sys
 import time
+import traceback
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -198,7 +203,17 @@ class BoundedMCP(FastMCP):
         ctx = self.get_context()
         await _nudge_tool_list_refresh(ctx)
         _ensure_tool_stats_flush_task()
+        _ensure_watchdog_task()
         t0 = time.monotonic()
+        call_id = next(_in_flight_next_id)
+        # Best-effort caller for the in-flight/watchdog view ONLY — a mount() call's own
+        # identity may not be cached yet at call START, so this can legitimately read
+        # 'unattributed' here even when the FINAL stats row (below, resolved fresh after
+        # the call completes, unchanged from before this watchdog existed) attributes
+        # correctly. Never conflate the two: the watchdog trades attribution precision
+        # for a value available the instant the call begins.
+        _in_flight_calls[call_id] = {
+            "tool": name, "caller": _caller_for(ctx), "started_at": t0, "logged": False}
         result_bytes = 0
         try:
             result = await self._tool_manager.call_tool(
@@ -213,6 +228,7 @@ class BoundedMCP(FastMCP):
             result_bytes = _response_byte_size(bounded)
             return tool.fn_metadata.convert_result(bounded)
         finally:
+            _in_flight_calls.pop(call_id, None)
             action = arguments.get("action")
             _record_tool_call(name, _caller_for(ctx), (time.monotonic() - t0) * 1000,
                               action if isinstance(action, str) else "", result_bytes)
@@ -364,6 +380,73 @@ _TOOL_STATS_BLIND_SPOTS = (
     "disuse until confirmed otherwise; check src/cli.py before ever acting on a zero "
     "reading for these names, same discipline unmerge's own incident already demands",
 )
+
+
+# THE STALL WATCHDOG (thread 0be2f790, THE OSIRIS-MCP MAIN-THREAD STALL, Thoth mail
+# 10625, PRIORITY): the 2026-09-14 incident had no stack trace at all when it happened —
+# py-spy needs ptrace scope 1 (not set), and nothing in this module registered a signal
+# handler to dump frames on demand. Two independent, complementary doors, never one:
+#
+#   1. faulthandler.register(SIGUSR1, all_threads=True) below (module scope, always on,
+#      zero runtime cost until signaled) — `kill -USR1 <pid>` dumps every thread's Python
+#      stack to stderr (systemd's own journal) on demand, the operator's own manual door.
+#
+#   2. This watchdog: BoundedMCP.call_tool (the one seam every tool call already passes
+#      through, bounding + stats) now registers an IN-FLIGHT entry per call and a
+#      background task polls it — the moment any call has been running past
+#      _WATCHDOG_STALL_THRESHOLD_S, it logs ONCE (never repeats for the same call) with
+#      every thread's own stack, unprompted, no operator action required. A genuinely
+#      single-threaded asyncio event loop means "every thread's stack" is really "the one
+#      loop thread's stack plus whatever daemon threads exist" — deliberately not narrowed
+#      to just the loop thread, since a wedge could in principle be a C-extension holding
+#      the GIL from a different thread the loop thread never shows.
+_WATCHDOG_POLL_INTERVAL_S = 2.0
+_WATCHDOG_STALL_THRESHOLD_S = 10.0
+_in_flight_calls: dict[int, dict[str, Any]] = {}
+_in_flight_next_id = itertools.count()
+_watchdog_task: asyncio.Task[None] | None = None
+
+
+def _log_all_thread_stacks(log: Any, *, reason: str) -> None:
+    """Every live thread's own Python stack, formatted and logged in one shot — the
+    exact dump SIGUSR1 (faulthandler) also produces, reused here so the automatic and
+    manual doors report identically."""
+    frames = sys._current_frames()
+    parts = [f"{reason} — {len(frames)} live thread(s):"]
+    for thread_id, frame in frames.items():
+        parts.append(f"--- thread {thread_id} ---\n{''.join(traceback.format_stack(frame))}")
+    log.warning("\n".join(parts))
+
+
+async def _watchdog_loop() -> None:
+    """Runs for the life of the process (started lazily on first tool call, same pattern
+    `_ensure_tool_stats_flush_task` already uses) — polls `_in_flight_calls`, never
+    blocks on anything itself (a blocked event loop would also freeze THIS task, so its
+    own job is only to notice and log, not to unblock)."""
+    import logging
+
+    log = logging.getLogger("osiris.mcp.watchdog")
+    while True:
+        await asyncio.sleep(_WATCHDOG_POLL_INTERVAL_S)
+        now = time.monotonic()
+        for call_id, info in list(_in_flight_calls.items()):
+            if info["logged"]:
+                continue
+            elapsed = now - info["started_at"]
+            if elapsed < _WATCHDOG_STALL_THRESHOLD_S:
+                continue
+            info["logged"] = True
+            _log_all_thread_stacks(
+                log, reason=(
+                    f"SLOW TOOL CALL: {info['tool']!r} (caller={info['caller']!r}, "
+                    f"call_id={call_id}) has been in flight {elapsed:.1f}s, past the "
+                    f"{_WATCHDOG_STALL_THRESHOLD_S:.0f}s threshold"))
+
+
+def _ensure_watchdog_task() -> None:
+    global _watchdog_task
+    if _watchdog_task is None or _watchdog_task.done():
+        _watchdog_task = asyncio.create_task(_watchdog_loop())
 
 
 def _caller_for(ctx: Context | None) -> str:
@@ -775,6 +858,13 @@ async def tool_traffic(window_minutes: int = 60) -> dict[str, Any]:
             "eligible_for_removal": own_calls == 0 and action_calls == 0,
         })
 
+    now = time.monotonic()
+    in_flight = sorted((
+        {"call_id": call_id, "tool": info["tool"], "caller": info["caller"],
+         "elapsed_secs": round(now - info["started_at"], 1)}
+        for call_id, info in _in_flight_calls.items()
+    ), key=lambda r: -r["elapsed_secs"])
+
     return {
         "window_minutes": window_minutes,
         "persisted": persisted,
@@ -784,6 +874,14 @@ async def tool_traffic(window_minutes: int = 60) -> dict[str, Any]:
         "persisted_by_action": persisted_by_action,
         "current_unflushed_by_action": live_by_action,
         "retired_alias_traffic": retired_alias_traffic,
+        # THE STALL WATCHDOG's own in-flight view (thread 0be2f790, Thoth mail 10625):
+        # every call that has STARTED but not yet finished, right now — this very
+        # tool_traffic() call included (BoundedMCP.call_tool registers the entry before
+        # the tool body runs), so expect to always see at least one near-zero
+        # elapsed_secs row for 'tool_traffic' itself. A non-empty list with a LARGE
+        # elapsed_secs on some OTHER tool is exactly the shape the 2026-09-14 incident
+        # had no visibility into at all.
+        "in_flight": in_flight,
         "measures": "MCP tool calls on this one shared osiris-mcp process only",
         "blind_spots": list(_TOOL_STATS_BLIND_SPOTS),
     }
@@ -12133,6 +12231,15 @@ async def _boot_check() -> None:
 
 
 memprofile.maybe_start()  # inert unless OSIRIS_PROFILE_MEMORY is set — thread e6fd3772
+
+# THE MANUAL STALL DOOR (thread 0be2f790, THE OSIRIS-MCP MAIN-THREAD STALL, Thoth mail
+# 10625): `kill -USR1 <osiris-mcp pid>` dumps every thread's Python stack to stderr (the
+# systemd journal) on demand — zero runtime cost until signaled, complementing (never
+# replacing) the automatic watchdog above, which fires unprompted but only past
+# _WATCHDOG_STALL_THRESHOLD_S. Registered at import time, unconditionally: harmless for
+# the per-session stdio subprocess too, and importing this module is cheap insurance
+# against ever again having "no stack, no faulthandler signal" be the honest postmortem.
+faulthandler.register(signal.SIGUSR1, all_threads=True)
 
 
 def main() -> None:
