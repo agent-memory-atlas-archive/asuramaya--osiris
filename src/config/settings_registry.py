@@ -130,7 +130,7 @@ _MINER_BUDGETS: tuple[SettingSpec, ...] = (
 # THE FIVE BACKUP-LANE TIMERS (THE SETTINGS MENU piece 3, thread 7eb26f68, Thoth's GO mail
 # 10084) — moved here from `src/orchestrator/backup_settings.py` (which re-exports this
 # name so its own existing importers, compositions.py's `backup_status` and
-# scripts/render_backup_timers.py, keep working unchanged) so the registry — the
+# scripts/render_units.py, keep working unchanged) so the registry — the
 # declarations layer — never has to import FROM the orchestrator layer to build its own
 # SettingSpecs, only the reverse.
 BACKUP_TIMER_UNITS: tuple[str, ...] = (
@@ -165,7 +165,7 @@ def _validate_offbox_repositories(value: Any) -> str | None:
 # table (Wave 21, thread f04cce36 piece 3) — same authority shape that table's write
 # door always had (`operator_or_ruling`, `write_name='backup_settings'`), generalized
 # rather than reinvented. All three `effect='next_deploy'`: none of them take hold until
-# `render_backup_timers.py` regenerates the shipped units on the next `osiris deploy`.
+# `scripts/render_units.py` regenerates the shipped units on the next `osiris deploy`.
 # `path`/`schedule` both accept `None` as a value (settings_service.py's
 # `_validate_value`) meaning "no override" — how an operator clears one back to the
 # shipped default, the same "clearing an input and saving drops it" UX the old panel had.
@@ -289,8 +289,118 @@ _DIAGNOSTICS: tuple[SettingSpec, ...] = (
                env_field="osiris_worker_boot_memtrace_enabled"),
 )
 
+# WAVE 22 (ruling 7be61879, thread 40d6eef3, census gap-list-1 #1) — the daemon unit
+# literals a stranger hits first: MemoryMax for the four persistent dev-box daemons,
+# osiris-pulse's own --watch interval, the console's --host/--port, and the four pool
+# sizes that already existed as real Settings fields (src/orchestrator/pool_health.py's
+# own `_KNOWN_DAEMON_POOL_SETTINGS` names the exact unit each restarts under —
+# `osiris_api_pool_size` restarts osiris-console, the daemon that actually serves
+# `src.api.app` on the dev box, never a unit literally named "osiris-api").
+#
+# MemoryMax/watch-interval/host/port default to TODAY'S SHIPPED LITERAL rather than a
+# None-means-unset sentinel: the generic int/str validators don't support null-clearing
+# the way piece 3 added for path/schedule, and extending that further is out of scope
+# here — an unwritten key therefore already renders byte-identical to the shipped file,
+# "unset" falling out of matching defaults instead of a special case. The one exception:
+# osiris-pulse carries no MemoryMax line at all today, so that spec alone defaults to ""
+# (`scripts/render_units.py` treats empty as "no cap", omitting the line).
+def _validate_memory_max(value: Any) -> str | None:
+    import re as _re
+
+    if value == "":
+        return None
+    if not isinstance(value, str) or not _re.fullmatch(r"infinity|\d+[KMGT]?", value):
+        return "must be a systemd memory value like '3G'/'512M'/'infinity', or '' for no cap"
+    return None
+
+
+def _validate_port(value: Any) -> str | None:
+    if not isinstance(value, int) or isinstance(value, bool) or not (1 <= value <= 65535):
+        return "must be a valid TCP port (1-65535)"
+    return None
+
+
+def _validate_positive_int(value: Any) -> str | None:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        return "must be a positive integer"
+    return None
+
+
+_DAEMON_UNIT_LITERALS: tuple[SettingSpec, ...] = (
+    SettingSpec("daemon.osiris_mcp.memory_max", "str", "3G", effect="next_deploy",
+               validate=_validate_memory_max, authority="operator_or_ruling",
+               requires_because=True, consequence="high",
+               write_name="daemon_unit_literals"),
+    SettingSpec("daemon.osiris_worker.memory_max", "str", "3G", effect="next_deploy",
+               validate=_validate_memory_max, authority="operator_or_ruling",
+               requires_because=True, consequence="high",
+               write_name="daemon_unit_literals"),
+    SettingSpec("daemon.osiris_pulse.memory_max", "str", "", effect="next_deploy",
+               validate=_validate_memory_max, authority="operator_or_ruling",
+               requires_because=True, consequence="high",
+               write_name="daemon_unit_literals"),
+    SettingSpec("daemon.osiris_console.memory_max", "str", "512M", effect="next_deploy",
+               validate=_validate_memory_max, authority="operator_or_ruling",
+               requires_because=True, consequence="high",
+               write_name="daemon_unit_literals"),
+    SettingSpec("daemon.osiris_pulse.watch_interval_secs", "int", 600,
+               effect="next_deploy", validate=_validate_positive_int,
+               authority="operator_or_ruling", requires_because=True,
+               consequence="high", write_name="daemon_unit_literals"),
+    SettingSpec("daemon.osiris_console.host", "str", "127.0.0.1", effect="next_deploy",
+               authority="operator_or_ruling", requires_because=True,
+               consequence="high", write_name="daemon_unit_literals"),
+    SettingSpec("daemon.osiris_console.port", "int", 8011, effect="next_deploy",
+               validate=_validate_port, authority="operator_or_ruling",
+               requires_because=True, consequence="high",
+               write_name="daemon_unit_literals"),
+    # osiris-pg-autotune.timer, the second of the two "hand-installed timer" census
+    # targets — osiris-preflight.timer was ALREADY brought under deploy management by
+    # piece 3 (one of BACKUP_TIMER_UNITS, its schedule already backup.timer_schedule.
+    # osiris-preflight.timer); only this one is genuinely new. Kept OUT of
+    # BACKUP_TIMER_UNITS (it isn't a backup-lane timer) and grouped under "daemon"
+    # instead, an equally honest section for a Postgres-maintenance timer.
+    SettingSpec("daemon.osiris_pg_autotune.schedule", "schedule", None,
+               effect="next_deploy", authority="operator_or_ruling",
+               requires_because=True, consequence="high",
+               write_name="daemon_unit_literals"),
+)
+
+# THE FOUR POOL SIZES — real Settings fields already, keyed by their OWN settings.py
+# attribute name (never a fabricated per-daemon alias) so a reader grepping settings.py
+# finds the exact field a write governs. `env_field` documents which attribute
+# render_units.py's own Environment= substitution writes into the unit file; it is inert
+# for the LIVE overlay (`settings_with_overlay` only ever applies to `effect='immediate'`
+# keys, and pool sizes are read once at daemon boot, hence `restart:<unit>`).
+_POOL_SIZES: tuple[SettingSpec, ...] = (
+    SettingSpec("daemon.osiris_mcp.pool_size", "int", 8, effect="restart:osiris-mcp",
+               validate=_validate_positive_int, authority="operator_or_ruling",
+               requires_because=True, consequence="high",
+               write_name="daemon_unit_literals", env_field="osiris_mcp_pool_size"),
+    SettingSpec("daemon.osiris_worker.pool_size", "int", 4, effect="restart:osiris-worker",
+               validate=_validate_positive_int, authority="operator_or_ruling",
+               requires_because=True, consequence="high",
+               write_name="daemon_unit_literals", env_field="osiris_worker_pool_size"),
+    # osiris_api_pool_size: pool_health.py's own map names its restart target
+    # "osiris-console" (the dev-box daemon actually serving src.api.app), not "osiris-api".
+    SettingSpec("daemon.osiris_api.pool_size", "int", 10, effect="restart:osiris-console",
+               validate=_validate_positive_int, authority="operator_or_ruling",
+               requires_because=True, consequence="high",
+               write_name="daemon_unit_literals", env_field="osiris_api_pool_size"),
+    # osiris-manager isn't one of the four MemoryMax daemons (a separate, reviewer-gated
+    # unit outside deploy/user/'s own install pipeline) — registering its pool size does
+    # not bring the unit itself under deploy management, a separate act this wave doesn't
+    # take.
+    SettingSpec("daemon.osiris_manager.pool_size", "int", 10,
+               effect="restart:osiris-manager", validate=_validate_positive_int,
+               authority="operator_or_ruling", requires_because=True,
+               consequence="high", write_name="daemon_unit_literals",
+               env_field="osiris_manager_pool_size"),
+)
+
 SETTINGS: tuple[SettingSpec, ...] = (
     _DAEMON_KILL_SWITCHES + _MINER_BUDGETS + _BACKUP_SETTINGS + _WAKE_LADDER + _DIAGNOSTICS
+    + _DAEMON_UNIT_LITERALS + _POOL_SIZES
 )
 
 

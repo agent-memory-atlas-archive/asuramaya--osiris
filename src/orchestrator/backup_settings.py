@@ -7,7 +7,8 @@ instead of a parallel bespoke implementation.
 STORAGE MOVED, THE DOOR DIDN'T: `get_backup_settings`/`write_backup_settings` keep their
 exact outward shapes (dict in, dict out) — the MCP `backup_settings` tool, the
 `/backup-settings` REST routes, `compositions.py`'s `backup_status` Function, and
-`scripts/render_backup_timers.py` all call these unchanged. Internally each field now
+`scripts/render_units.py` (WAVE 22 generalized this from `render_backup_timers.py`, its
+own former name) all call these unchanged. Internally each field now
 reads/writes through `settings_service.get_setting`/`write_setting` against the generic
 `settings` table (`backup.vault_path`, one `backup.timer_schedule.<unit>` key PER timer —
 not one shared blob, so a single schedule tweak never touches the other four — and
