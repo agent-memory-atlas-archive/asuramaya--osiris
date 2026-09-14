@@ -2,43 +2,59 @@
 SERVER, piece A (rulings f832c3a4 + 0a3d6719, operator 2026-09-14, thread b6cb1d7c0b36):
 server-side placement over the WHOLE graph, run incrementally by the heartbeat -- positions
 stored as current_assertions (graph_x/graph_y), never computed live in the browser or the
-renderer. This module feeds the /graph endpoints (supernodes/clusters/viewport) and, from
-piece B on, the whole-graph typed-array stream.
+renderer. This module feeds the /graph endpoints (supernodes/clusters/viewport) and the
+whole-graph typed-array stream (graph_stream.py).
 
-THE PLACEMENT RULE (operator's own shape, not a force-layout guess): every project gets its
-own center, spread deterministically over the plane by a sunflower/Fermat spiral keyed on a
-stable hash of the project's OWN canonical -- never that project's rank among its peers, so
-adding or removing an unrelated project never moves this one. Every object TYPE gets a ring
-around its project's center, at a radius fixed by the type's own declared position in
-schema.py's object-type catalog (a stable, code-defined order every project reuses
-identically). Every object sits on its type's ring at an angle from a stable hash of its OWN
-id -- never a grid, never dependent on how many siblings share that ring or the order they
-were discovered in. All three of those are PURE functions of (project canonical, type name,
-object id) alone: recomputing any of them, for any object, at any time, reproduces the exact
-same point -- which is what makes "place every object, incrementally, idempotently" survive
-being spread over many ticks rather than one global pass.
+DECLUMP FIX (Thoth mail 10582, PRIORITY -- the operator's own screenshot of the deployed
+space showed stacked nodes, collapsed rings, thick edge bundles instead of a spread cloud):
+the FIRST version of this placement rule put every object of one type in one project on a
+SINGLE fixed-radius circle at a random hash angle -- fine for a handful of objects, but this
+house's own real population has (project, type) groups running into the THOUSANDS (Agent in
+the unfiled bucket: 18,978; Commit in the osiris project itself: 6,273) and a fixed
+circumference simply cannot hold that many points apart. Project centers had the same
+disease one level up: a hash into a wide flat spiral-index range gives no guaranteed
+MINIMUM separation between two projects, so the extent ends up both sparse in places and
+badly clumped in others (measured at ~260,000 units wide for ~49k objects before this fix).
 
-A SHORT, BOUNDED relax pass then pulls each tick's newly-placed batch toward its already-
-placed same-PROJECT neighbors (never cross-project -- ruling's own "edge attraction within a
-project"), starting FROM the ring/hash base position rather than a random seed, few
-iterations, anchors (already-placed neighbors) held fixed. This is the same vectorized numpy
-Fruchterman-Reingold `relax()` wave B item 1 already used for its own local relax -- reused
-here as a nudge on top of a deterministic base, not the sole placement rule it used to be.
+ONE MECHANISM, applied at both levels, replaces the old fixed-circle-plus-hash-angle rule:
+a SUNFLOWER/FERMAT SPIRAL keyed on a STABLE RANK (never a hash) -- radius grows with
+sqrt(rank), so N points pack into a radius proportional to sqrt(N) with a guaranteed
+minimum pairwise spacing, and the rank itself is permanent once assigned (creation-order
+via `ROW_NUMBER() OVER (... ORDER BY created_at, id)`, computed by the DATABASE, not
+derivable from an object's own id alone) -- a later-created sibling only ever takes a
+HIGHER, previously-unused rank, so an existing object's or project's position never moves
+once placed, the same incrementality guarantee the id-hash version had, just resolved
+against an immutable ORDER instead of an immutable VALUE.
+  - PROJECT CENTERS: every active SoftwareProject's rank by creation order; the `unfiled`
+    sentinel is pinned to rank 0 so it can never collide with a real project's index; real
+    projects start at 1. Spacing sized (measured live before picking the constant) to
+    comfortably contain even the worst real project's own extent (osiris itself, ~11.7k
+    objects) without two projects' discs ever touching.
+  - OBJECTS WITHIN A (project, type) GROUP: same sunflower, keyed on the object's own rank
+    within that exact group, offset outward from the type's existing base radius (still
+    schema.py's declared type order, unchanged) -- so small groups still read as a tight
+    ring near that base radius, and only a group large enough to need it spirals outward
+    past it (Thoth's own "beyond one ring's capacity" framing, expressed here as a single
+    formula rather than a two-tier ring-then-disc special case).
 
-INCREMENTAL, NEVER REVISITED: a tick only ever considers objects still missing the
-`graph_layout_v` marker (bumped whenever this module's placement RULE itself changes, not
-its per-tick progress) -- so a re-run over already-placed objects moves nothing, and a
-version bump alone is what causes the ONE migration pass over objects placed under wave B's
-prior (pure force-relax) scheme; nothing else about this file's contract to arq_worker's cron
-(`layout_batch(actions, limit=...) -> int`, 0 meaning fully placed) changed.
+A bounded intra-project relax pass still nudges each tick's batch toward already-placed
+same-project neighbors (unchanged rule: cross-project edges never attract) -- but now ends
+with a HARD MINIMUM-SEPARATION PASS: the Fruchterman-Reingold repulsion term APPROACHES a
+floor over enough iterations but never GUARANTEES one within the few iterations this
+heartbeat actually runs, so strong attraction could still leave two connected nodes
+uncomfortably close (or, at the limit, exactly coincident) -- this pass is a direct,
+deterministic correction, not another force-simulation step, so the guarantee holds
+regardless of how attraction behaved before it ran.
 
-WRITE PATH: positions are still recorded as ordinary property assertions (graph_x, graph_y,
-graph_layout_v), append-only and superseding exactly like every other assertion in this
-system. The one difference from the general-purpose assert_property path: this module
-covers a whole tick's batch with one multi-row statement per property instead of one call
-per object, because GRAPH_LAYOUT_SOURCE is this triple's only ever writer (documented on
-thread b6cb1d7c0b36's scope note before this was written) -- a full pass at ~41k objects
-through the general per-object path would be tens of thousands of sequential round trips.
+INCREMENTAL, NEVER REVISITED: unchanged mechanism -- a tick only ever considers objects
+still missing the CURRENT `graph_layout_v` marker (bumped to 3 here, forcing the same kind
+of one-time migration the 1->2 bump already did), so a re-run over already-placed objects
+moves nothing.
+
+WRITE PATH: unchanged -- graph_x/graph_y/graph_layout_v land as ordinary property
+assertions via one multi-row UPDATE+INSERT per property per tick, safe only because
+GRAPH_LAYOUT_SOURCE is this triple's sole writer (see the prior version's own note, still
+true here).
 """
 from __future__ import annotations
 
@@ -61,48 +77,66 @@ _MAX_STEP = 10.0
 
 # NAVIGABLE SPACE, piece A additions ---------------------------------------------------
 _LAYOUT_VERSION_PROP = "graph_layout_v"
-_LAYOUT_VERSION = 2  # bump this to force one migration pass over every already-placed object
+_LAYOUT_VERSION = 3  # bump this to force one migration pass over every already-placed object
 _RELAX_ITERATIONS = 6  # "a FEW iterations" -- a nudge on top of the deterministic base,
-                       # never enough to erase the ring/spiral structure
-_PROJECT_SLOT_RANGE = 50_000  # spiral index domain for a project's center (see project_center)
-_PROJECT_SPACING = 400.0
+                       # never enough to erase the sunflower structure
 _RING_BASE = 40.0
 _RING_GAP = 50.0
 _UNFILED_KEY = "unfiled"  # the same sentinel /graph/supernodes already uses for no-in_repo
 _GOLDEN_ANGLE = math.pi * (3.0 - math.sqrt(5.0))
+
+# spacing constants, sized against this house's OWN measured population (live, via
+# /graph/supernodes and /graph/clusters, never guessed) before the DECLUMP FIX landed:
+# worst single (project,type) group is Agent/unfiled at 18,978 (sunflower radius at that
+# rank, spacing 15.0, is ~2,067); worst real project is osiris itself at 11,768 objects
+# (Commit alone 6,273, radius ~1,188 at the same spacing) across 40 real projects total.
+_NODE_SPACING = 15.0  # minimum pairwise spacing within one (project, type) sunflower disc
+_MIN_SEPARATION = _NODE_SPACING  # hard floor the post-relax declump pass enforces
+_PROJECT_SPACING = 5000.0  # minimum spacing between two projects' sunflower rank-points --
+                           # >2x the worst measured single-project content radius (~2,067),
+                           # so two adjacent worst-case projects' own discs can never touch
 _TYPE_RING_INDEX: dict[str, int] = {t.name: i for i, t in enumerate(_OBJECT_TYPES)}
 
 
 def _hash01(key: str) -> float:
     """A deterministic pseudo-random float in [0,1) from a stable hash of `key` -- never
     Python's own hash() (salted per-process, so it would jitter every restart); sha256
-    keeps every derived position reproducible across ticks, processes, and reruns, which
-    the whole placement scheme depends on."""
+    keeps every derived value reproducible across ticks, processes, and reruns."""
     digest = hashlib.sha256(key.encode()).digest()
     return int.from_bytes(digest[:8], "big") / 2**64
 
 
-def project_center(canonical: str) -> tuple[float, float]:
-    """A project's center on the plane -- a sunflower/Fermat spiral point at an index
-    drawn from a stable hash of the project's OWN canonical, never its rank among peers,
-    so creating or retiring an unrelated project never moves this one. Bounded spiral
-    range (`_PROJECT_SLOT_RANGE`) keeps magnitudes sane; a same-slot collision between two
-    unrelated projects is a cosmetic overlap, never a positioning bug (and vanishingly
-    unlikely at this house's actual project count over a 50k-slot domain)."""
-    slot = int(_hash01(f"project:{canonical}") * _PROJECT_SLOT_RANGE)
-    r = _PROJECT_SPACING * math.sqrt(slot + 0.5)
-    theta = slot * _GOLDEN_ANGLE
+def _sunflower_point(rank: int, spacing: float) -> tuple[float, float]:
+    """The ONE placement primitive this module builds everything else from: a
+    golden-angle sunflower/Fermat spiral point at a given non-negative integer RANK,
+    at a given spacing scale. Pure function of (rank, spacing) alone -- the caller is
+    responsible for making sure `rank` itself is a STABLE, permanent value (creation-
+    order, never a hash) so recomputing this for the same rank always lands on the
+    same point, and a later-arriving sibling only ever gets a higher rank, never
+    disturbing an earlier one's placement."""
+    r = spacing * math.sqrt(rank + 0.5)
+    theta = rank * _GOLDEN_ANGLE
     return r * math.cos(theta), r * math.sin(theta)
 
 
+def project_center(rank: int) -> tuple[float, float]:
+    """A project's center on the plane -- a sunflower point at its own permanent
+    creation-order rank (see `_project_ranks`), never a hash of its canonical. Two
+    projects can never collide: the sunflower's own geometry guarantees consecutive
+    ranks are at least `_PROJECT_SPACING`-ish apart, comfortably clear of even the
+    largest measured project's own content radius."""
+    return _sunflower_point(rank, _PROJECT_SPACING)
+
+
 def _type_ring_index(type_name: str) -> int:
-    """Ring index for an object's TYPE around its project's center -- schema.py's own
-    declared object-type order (already a stable, code-defined enumeration every other
-    consumer of OBJECT_TYPES reuses), so every project draws the same type at the same
-    ring, never a per-project rediscovery order. An extension type outside the static
-    catalog still needs a stable index: falls back to a hash-derived ring beyond the
-    known count -- deterministic, and a shared ring between two unknown types is a label
-    overlap, never a positioning bug."""
+    """Base ring index for an object's TYPE around its project's center -- schema.py's
+    own declared object-type order (already a stable, code-defined enumeration every
+    other consumer of OBJECT_TYPES reuses), so every project draws the same type at
+    the same base radius. An extension type outside the static catalog still needs a
+    stable index: falls back to a hash-derived ring beyond the known count --
+    deterministic, and a shared base ring between two unknown types is a label
+    overlap, never a positioning bug (the sunflower disc built on top of it still
+    keeps individual OBJECTS apart)."""
     idx = _TYPE_RING_INDEX.get(type_name)
     if idx is not None:
         return idx
@@ -110,17 +144,20 @@ def _type_ring_index(type_name: str) -> int:
 
 
 def base_position(
-    project_canonical: str | None, type_name: str, object_id: uuid.UUID,
+    center: tuple[float, float], type_name: str, rank_in_group: int,
 ) -> tuple[float, float]:
-    """The deterministic placement rule itself: project as center, type as a ring around
-    it, the object on that ring at an angle from a stable hash of its OWN id -- never a
-    grid, never dependent on sibling count or discovery order. A pure function of
-    (project, type, id) alone: recomputing it for the same object always lands on the
-    same point, which is what lets the layout heartbeat visit any object at any time
-    without ever needing to touch one it has already placed."""
-    cx, cy = project_center(project_canonical or _UNFILED_KEY)
-    radius = _RING_BASE + _type_ring_index(type_name) * _RING_GAP
-    angle = _hash01(f"angle:{object_id}") * 2 * math.pi
+    """The deterministic placement rule itself: a sunflower disc for the object's own
+    (project, type) group, keyed on its permanent rank within that group, offset
+    outward from the type's own base radius (so a small group still reads as a tight
+    ring near that radius, and only a group large enough to need it spirals past it).
+    A pure function of (center, type, rank) alone -- recomputing it for the same
+    rank always lands on the same point."""
+    cx, cy = center
+    base_r = _RING_BASE + _type_ring_index(type_name) * _RING_GAP
+    lx, ly = _sunflower_point(rank_in_group, _NODE_SPACING)
+    local_r = math.hypot(lx, ly)
+    angle = math.atan2(ly, lx)
+    radius = base_r + local_r
     return cx + radius * math.cos(angle), cy + radius * math.sin(angle)
 
 
@@ -180,6 +217,52 @@ async def _project_and_type(
     return {r["id"]: (r["project_canonical"], r["type"]) for r in rows}
 
 
+async def _project_ranks(actions: Actions) -> dict[str, int]:
+    """Every active project's own PERMANENT rank by creation order --
+    `ROW_NUMBER() OVER (ORDER BY created_at, id)`, so an existing project's rank never
+    changes: a new project can only ever take a higher, previously-unused index.
+    `_UNFILED_KEY` is pinned to rank 0 so it can never collide with a real project's
+    own index regardless of how many projects exist."""
+    rows = await actions.pool.fetch(
+        "SELECT canonical, row_number() OVER (ORDER BY created_at, id) AS rnk "
+        "FROM objects WHERE type='SoftwareProject' AND status='active'")
+    ranks: dict[str, int] = {_UNFILED_KEY: 0}
+    ranks.update({r["canonical"]: int(r["rnk"]) for r in rows})
+    return ranks
+
+
+async def _group_ranks(actions: Actions, ids: list[uuid.UUID]) -> dict[uuid.UUID, int]:
+    """Each id's own PERMANENT rank within its (project, type) group --
+    `ROW_NUMBER() OVER (PARTITION BY project, type ORDER BY created_at, id)`, computed
+    over the WHOLE active population in one indexed window-function scan (this
+    house's own current ~49k-object scale: a sub-second query) so a rank, once
+    assigned to an id by this formula, can never change -- a later-created sibling
+    only ever takes a higher, not-yet-used rank in the SAME group. The inner
+    DISTINCT ON mirrors `_project_and_type`'s own multi-in_repo-link tie-break
+    (lowest link id wins) so a rare multi-membership object is never double-counted
+    into its own group, which would otherwise corrupt every rank after it."""
+    if not ids:
+        return {}
+    rows = await actions.pool.fetch(
+        "WITH members AS ("
+        "  SELECT DISTINCT ON (o.id) o.id, o.type, o.created_at, "
+        "    COALESCE(p.canonical, $2) AS project_key "
+        "  FROM objects o "
+        "  LEFT JOIN links l ON l.from_id=o.id AND l.type='in_repo' "
+        "    AND (l.valid_until IS NULL OR l.valid_until > now()) "
+        "  LEFT JOIN objects p ON p.id=l.to_id AND p.type='SoftwareProject' "
+        "  WHERE o.status NOT IN ('archived','merged','retired') "
+        "  ORDER BY o.id, l.id"
+        "), ranked AS ("
+        "  SELECT id, row_number() OVER ("
+        "    PARTITION BY project_key, type ORDER BY created_at, id"
+        "  ) - 1 AS rank_in_group "
+        "  FROM members"
+        ") SELECT id, rank_in_group FROM ranked WHERE id = ANY($1::uuid[])",
+        ids, _UNFILED_KEY)
+    return {r["id"]: int(r["rank_in_group"]) for r in rows}
+
+
 async def _neighbors_of(
     actions: Actions, ids: list[uuid.UUID],
 ) -> dict[uuid.UUID, set[uuid.UUID]]:
@@ -200,6 +283,59 @@ async def _neighbors_of(
     return out
 
 
+def _declump(
+    pos: np.ndarray, anchor_pos: np.ndarray, ids: list[uuid.UUID], *,
+    min_sep: float = _MIN_SEPARATION, iterations: int = 30,
+) -> np.ndarray:
+    """The HARD MINIMUM-SEPARATION pass (Thoth mail 10582, PRIORITY): a direct,
+    deterministic correction, never another force-simulation step -- `relax()`'s own
+    repulsion approaches but does not GUARANTEE a floor within a bounded iteration
+    count, so strong attraction could still leave two connected nodes (or a node and
+    a fixed anchor) closer than `min_sep`, at the limit exactly coincident. Pushes
+    every pair closer than `min_sep` apart by exactly the deficit (split evenly
+    between two movable points; the FULL deficit onto the movable side of a
+    movable/anchor pair, since the anchor never moves) -- iterates a bounded few
+    times since separating one pair can nudge another pair together, and stops the
+    moment a full pass finds nothing left to fix."""
+    for _ in range(iterations):
+        moved = False
+
+        delta = pos[:, None, :] - pos[None, :, :]
+        dist = np.linalg.norm(delta, axis=2)
+        np.fill_diagonal(dist, np.inf)
+        too_close = dist < min_sep
+        if too_close.any():
+            moved = True
+            safe = np.where(dist < 1e-9, 1.0, dist)
+            direction = delta / safe[:, :, None]
+            for i, j in zip(*np.where(dist < 1e-9), strict=True):
+                if i < j:
+                    a = _hash01(f"declump:{ids[i]}:{ids[j]}") * 2 * math.pi
+                    direction[i, j] = (math.cos(a), math.sin(a))
+                    direction[j, i] = (-math.cos(a), -math.sin(a))
+            deficit = np.where(too_close, min_sep - np.minimum(dist, min_sep), 0.0)
+            pos = pos + (deficit[:, :, None] / 2 * direction).sum(axis=1)
+
+        if len(anchor_pos):
+            d2 = pos[:, None, :] - anchor_pos[None, :, :]
+            dist2 = np.linalg.norm(d2, axis=2)
+            too_close2 = dist2 < min_sep
+            if too_close2.any():
+                moved = True
+                safe2 = np.where(dist2 < 1e-9, 1.0, dist2)
+                direction2 = d2 / safe2[:, :, None]
+                for i, k in zip(*np.where(dist2 < 1e-9), strict=True):
+                    a = _hash01(f"declump-anchor:{ids[i]}:{k}") * 2 * math.pi
+                    direction2[i, k] = (math.cos(a), math.sin(a))
+                deficit2 = np.where(
+                    too_close2, min_sep - np.minimum(dist2, min_sep), 0.0)
+                pos = pos + (deficit2[:, :, None] * direction2).sum(axis=1)
+
+        if not moved:
+            break
+    return pos
+
+
 def relax(
     unplaced: list[uuid.UUID], neighbors: dict[uuid.UUID, set[uuid.UUID]],
     anchors: dict[uuid.UUID, tuple[float, float]], *, iterations: int = _ITERATIONS,
@@ -211,11 +347,16 @@ def relax(
     reproduces the same layout rather than jittering on every retry.
 
     `init`, when given, seeds `pos` from these exact coordinates instead of a random
-    uniform scatter (NAVIGABLE SPACE piece A: the deterministic ring/hash base position,
-    so the relax pass nudges toward neighbors from a real starting point rather than
-    replacing it with noise; every id in `unplaced` must appear in `init` when it is
-    given). `seed`/random init stays the default for every caller that doesn't pass one
-    (piece A's own pure-function unit tests keep working unchanged).
+    uniform scatter (NAVIGABLE SPACE piece A: the deterministic sunflower base
+    position, so the relax pass nudges toward neighbors from a real starting point
+    rather than replacing it with noise; every id in `unplaced` must appear in `init`
+    when it is given). `seed`/random init stays the default for every caller that
+    doesn't pass one (this module's own pure-function unit tests keep working
+    unchanged).
+
+    Ends with `_declump`'s hard minimum-separation pass (Thoth mail 10582) -- see its
+    own docstring; this is what actually guarantees two connected nodes never end up
+    stacked, since the FR iterations above only ever approach that floor.
 
     MATRIX operations over the whole batch at once, never a Python double-loop over pairs
     -- measured live: the naive per-pair Python/numpy-scalar version didn't finish 300
@@ -281,6 +422,8 @@ def relax(
         step = np.minimum(dn, _MAX_STEP)
         pos = pos + disp / dn[:, None] * step[:, None]
 
+    pos = _declump(pos, ua_p, unplaced)
+
     return {nid: (float(pos[idx[nid], 0]), float(pos[idx[nid], 1])) for nid in unplaced}
 
 
@@ -335,10 +478,12 @@ async def _bulk_assert_positions(
 
 async def layout_batch(actions: Actions, *, limit: int = _BATCH_SIZE) -> int:
     """One heartbeat tick: place up to `limit` objects still missing the current layout
-    version -- a deterministic project/type/id base position, nudged by a few iterations
-    of intra-project edge attraction anchored on already-placed same-project neighbors.
-    Returns how many objects were newly positioned (0 when the graph is fully placed
-    under the current version -- the tick's own natural quiescence, no flag needed)."""
+    version -- a deterministic sunflower base position (project center by rank, object
+    by its own rank within the (project, type) group), nudged by a few iterations of
+    intra-project edge attraction anchored on already-placed same-project neighbors,
+    then hard-declumped. Returns how many objects were newly positioned (0 when the
+    graph is fully placed under the current version -- the tick's own natural
+    quiescence, no flag needed)."""
     unplaced = await unplaced_batch(actions, limit)
     if not unplaced:
         return 0
@@ -347,7 +492,13 @@ async def layout_batch(actions: Actions, *, limit: int = _BATCH_SIZE) -> int:
     neighbor_ids = sorted(
         ({nb for nbs in neighbors.values() for nb in nbs} - unplaced_set), key=str)
     proj_type = await _project_and_type(actions, unplaced + neighbor_ids)
-    base = {oid: base_position(*proj_type.get(oid, (None, "Unknown")), oid) for oid in unplaced}
+    project_ranks = await _project_ranks(actions)
+    group_ranks = await _group_ranks(actions, unplaced)
+    base = {}
+    for oid in unplaced:
+        proj_canonical, type_name = proj_type.get(oid, (None, "Unknown"))
+        center = project_center(project_ranks.get(proj_canonical or _UNFILED_KEY, 0))
+        base[oid] = base_position(center, type_name, group_ranks.get(oid, 0))
     anchors = await positions_for(actions, neighbor_ids)
     intra = _intra_project_neighbors(unplaced, neighbors, proj_type)
     placed = relax(unplaced, intra, anchors, iterations=_RELAX_ITERATIONS, init=base)

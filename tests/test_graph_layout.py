@@ -1,6 +1,8 @@
 """THE GRAPH VISUALIZER (wave B item 1) + NAVIGABLE SPACE, THE SERVER piece A (rulings
-f832c3a4 + 0a3d6719, thread b6cb1d7c0b36): the layout heartbeat places every object under
-a deterministic project/type/id rule, nudged by a bounded intra-project relax."""
+f832c3a4 + 0a3d6719, thread b6cb1d7c0b36), plus the DECLUMP FIX (Thoth mail 10582,
+PRIORITY): the layout heartbeat places every object under a rank-based sunflower rule
+(never a hash-into-a-fixed-circle), nudged by a bounded intra-project relax that ends
+with a hard minimum-separation pass."""
 from __future__ import annotations
 
 import math
@@ -10,6 +12,8 @@ from datetime import UTC, datetime
 from src.actions.core import Actions
 from src.orchestrator.graph_layout import (
     _LAYOUT_VERSION_PROP,
+    _MIN_SEPARATION,
+    _declump,
     _intra_project_neighbors,
     base_position,
     layout_batch,
@@ -19,7 +23,7 @@ from src.orchestrator.graph_layout import (
     unplaced_batch,
 )
 
-# --- pure placement rule: deterministic, idempotent, never a grid --------------------
+# --- pure placement rule: deterministic, idempotent, never overlapping ---------------
 
 
 def test_relax_positions_every_unplaced_node() -> None:
@@ -60,36 +64,51 @@ def test_relax_with_init_starts_from_the_given_base_not_a_random_seed() -> None:
     assert out[lone] == (123.0, 456.0)
 
 
-def test_project_center_is_a_pure_function_of_canonical_alone() -> None:
-    a1 = project_center("repo:osiris")
-    a2 = project_center("repo:osiris")
-    assert a1 == a2
-    assert project_center("repo:osiris") != project_center("repo:other")
+def test_project_center_is_a_pure_function_of_rank_alone() -> None:
+    assert project_center(3) == project_center(3)
+    assert project_center(3) != project_center(4)
+
+
+def test_project_center_ranks_never_collide_across_a_realistic_range() -> None:
+    """The declump fix's whole point at the project level: no two ranks in a
+    realistic range (dozens of real projects) land on the same point, or anywhere
+    near it relative to the spacing constant."""
+    points = [project_center(r) for r in range(60)]
+    for i in range(len(points)):
+        for j in range(i + 1, len(points)):
+            assert math.dist(points[i], points[j]) > 100
 
 
 def test_base_position_is_deterministic_and_pure() -> None:
-    oid = uuid.uuid4()
-    p1 = base_position("repo:osiris", "Thread", oid)
-    p2 = base_position("repo:osiris", "Thread", oid)
+    center = project_center(3)
+    p1 = base_position(center, "Thread", 7)
+    p2 = base_position(center, "Thread", 7)
     assert p1 == p2
 
 
-def test_base_position_never_lands_two_types_on_the_same_ring() -> None:
-    oid = uuid.uuid4()
-    thread_pos = base_position("repo:osiris", "Thread", oid)
-    decision_pos = base_position("repo:osiris", "Decision", oid)
-    cx, cy = project_center("repo:osiris")
-    r_thread = math.dist((cx, cy), thread_pos)
-    r_decision = math.dist((cx, cy), decision_pos)
+def test_base_position_never_lands_two_types_on_the_same_base_radius() -> None:
+    center = project_center(0)
+    thread_pos = base_position(center, "Thread", 0)
+    decision_pos = base_position(center, "Decision", 0)
+    r_thread = math.dist(center, thread_pos)
+    r_decision = math.dist(center, decision_pos)
     assert round(r_thread, 6) != round(r_decision, 6)
 
 
-def test_base_position_unfiled_gets_its_own_stable_center() -> None:
-    oid = uuid.uuid4()
-    p1 = base_position(None, "Thread", oid)
-    p2 = base_position(None, "Thread", oid)
-    assert p1 == p2
-    assert base_position(None, "Thread", oid) != base_position("repo:osiris", "Thread", oid)
+def test_base_position_ranks_within_one_group_never_collide_at_realistic_scale() -> None:
+    """The declump fix's whole point at the object level: a (project, type) group in
+    the low thousands (this house's own real worst case is in the tens of thousands)
+    still gets every rank a distinct, well-separated point."""
+    center = project_center(0)
+    points = [base_position(center, "Thread", r) for r in range(500)]
+    seen: set[tuple[float, float]] = set()
+    for p in points:
+        rounded = (round(p[0], 3), round(p[1], 3))
+        assert rounded not in seen, "two ranks landed on the exact same point"
+        seen.add(rounded)
+    # a sampled spot-check of near neighbors (rank r and r+1) never collapse together
+    for r in range(0, 490, 37):
+        assert math.dist(points[r], points[r + 1]) > 0.5
 
 
 def test_intra_project_neighbors_drops_cross_project_edges() -> None:
@@ -98,6 +117,48 @@ def test_intra_project_neighbors_drops_cross_project_edges() -> None:
     proj_type = {a: ("repo:x", "Thread"), b: ("repo:x", "Thread"), c: ("repo:y", "Thread")}
     out = _intra_project_neighbors([a], neighbors, proj_type)
     assert out[a] == {b}
+
+
+# --- _declump: the hard minimum-separation pass (Thoth mail 10582) -------------------
+
+
+def test_declump_separates_two_coincident_points() -> None:
+    import numpy as np
+
+    ids = [uuid.uuid4(), uuid.uuid4()]
+    pos = np.array([[10.0, 10.0], [10.0, 10.0]])
+    out = _declump(pos, np.zeros((0, 2)), ids)
+    assert math.dist(out[0], out[1]) >= _MIN_SEPARATION - 1e-6
+
+
+def test_declump_leaves_already_separated_points_alone() -> None:
+    import numpy as np
+
+    ids = [uuid.uuid4(), uuid.uuid4()]
+    pos = np.array([[0.0, 0.0], [1000.0, 1000.0]])
+    out = _declump(pos, np.zeros((0, 2)), ids)
+    assert out[0].tolist() == [0.0, 0.0]
+    assert out[1].tolist() == [1000.0, 1000.0]
+
+
+def test_declump_pushes_a_node_away_from_a_fixed_anchor() -> None:
+    import numpy as np
+
+    ids = [uuid.uuid4()]
+    pos = np.array([[5.0, 5.0]])
+    anchors = np.array([[5.0, 5.0]])
+    out = _declump(pos, anchors, ids)
+    assert math.dist(out[0], anchors[0]) >= _MIN_SEPARATION - 1e-6
+
+
+def test_relax_never_leaves_two_strongly_attracted_nodes_stacked() -> None:
+    """The exact regression Thoth's mail described: strong mutual attraction (many
+    shared edges, tight ideal length) used to be able to collapse two nodes onto
+    (almost) the same point; the declump pass now guarantees it can't."""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    out = relax([a, b], {a: {b}, b: {a}}, {}, iterations=50,
+                init={a: (0.0, 0.0), b: (0.01, 0.0)})
+    assert math.dist(out[a], out[b]) >= _MIN_SEPARATION - 1e-6
 
 
 # --- DB-backed: unplaced_batch / layout_batch / positions_for -------------------------
@@ -153,20 +214,6 @@ async def test_layout_batch_returns_zero_when_the_graph_is_fully_positioned(
     assert n2 == 0
 
 
-async def test_layout_batch_places_a_newcomer_at_its_own_deterministic_base(
-    actions: Actions,
-) -> None:
-    """A newcomer's placement never depends on how many siblings already share its ring
-    -- it lands within a bounded distance of its own pure-function base position, not an
-    arbitrary point some other object's arrival happened to push it toward."""
-    oid = await actions.create_or_find_object("Thread", "thread:gl-newcomer", "test")
-    await layout_batch(actions, limit=1000)
-    got = (await positions_for(actions, [oid]))[oid]
-    expected = base_position(None, "Thread", oid)
-    # a few relax iterations may nudge it, but never past a modest multiple of one edge
-    assert math.dist(got, expected) < 200
-
-
 async def test_layout_batch_keeps_two_projects_separated(actions: Actions) -> None:
     now = datetime.now(UTC)
     proj_a = await actions.create_or_find_object("SoftwareProject", "repo:gl-proj-a", "test")
@@ -179,6 +226,35 @@ async def test_layout_batch_keeps_two_projects_separated(actions: Actions) -> No
     await layout_batch(actions, limit=1000)
     pos = await positions_for(actions, [a, b])
     assert math.dist(pos[a], pos[b]) > 10
+
+
+async def test_layout_batch_separates_many_objects_of_the_same_type_in_one_project(
+    actions: Actions,
+) -> None:
+    """THE REGRESSION ITSELF, proven at DB scale: a (project, type) group well past
+    what a single fixed-radius ring could hold apart now places every member with
+    real minimum separation, never a stack."""
+    now = datetime.now(UTC)
+    proj = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gl-crowded-project", "test")
+    ids = []
+    for i in range(40):
+        oid = await actions.create_or_find_object("Thread", f"thread:gl-crowd-{i}", "test")
+        await actions.create_link(oid, proj, "in_repo", "test", now, 1.0)
+        ids.append(oid)
+
+    placed = 0
+    while True:
+        n = await layout_batch(actions, limit=1000)
+        placed += n
+        if n == 0:
+            break
+
+    pos = await positions_for(actions, ids)
+    points = [pos[oid] for oid in ids]
+    for i in range(len(points)):
+        for j in range(i + 1, len(points)):
+            assert math.dist(points[i], points[j]) >= _MIN_SEPARATION - 1e-6
 
 
 async def test_layout_batch_migrates_an_object_placed_under_a_prior_version(
