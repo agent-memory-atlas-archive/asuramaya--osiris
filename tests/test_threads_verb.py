@@ -52,6 +52,42 @@ async def test_threads_returns_only_the_callers_own_open_threads_in_project(
     assert len(out["threads"][0]["id"]) == 8
 
 
+async def test_threads_names_project_owned_obligations_not_shown(actions: Actions) -> None:
+    """thread 3a9d9a5d89fa, Ra XL's measured report: an obligation owned by the bare
+    project name, or unowned with an `in_repo` link, is invisible to the caller's own
+    owner-spelling match above — named on its own trailing line/field instead of
+    silently absent, so "nothing under my name" is never read as "nothing open here."""
+    from src import mcp_server as srv
+    from src.orchestrator.agents import AgentIdentity
+
+    await open_thread(actions, "mine, in thprojc", kind="obligation",
+                      owner="agent:th-caller2", repo="thprojc", source="agent:th-caller2")
+    await open_thread(actions, "project-owned, in thprojc", kind="obligation",
+                      owner="thprojc", repo="thprojc", source="agent:th-caller2")
+    await open_thread(actions, "unowned, in thprojc", kind="obligation",
+                      owner=None, repo="thprojc", source="agent:th-caller2")
+    await _mount(actions.pool, agent_id="agent:th-caller2", project="thprojc",
+                session="thcaller2")
+
+    ctx = _Ctx()
+    saved = srv._pool
+    srv._pool = actions.pool
+    srv._agents[srv._conn_key(ctx)] = AgentIdentity(
+        agent_id="agent:th-caller2", session="thcaller2", project="thprojc", model=None,
+        cwd=None)
+    try:
+        out = await srv.threads(ctx=ctx)
+        text_out = await srv.threads(ctx=ctx, render="text")
+    finally:
+        srv._pool = saved
+        srv._agents.pop(srv._conn_key(ctx), None)
+
+    assert out["total"] == 1
+    assert out["threads"][0]["summary"] == "mine, in thprojc"
+    assert out["project_owned_not_shown"] == 2
+    assert "2 project-owned/unowned obligation(s)" in text_out["text"]
+
+
 async def test_threads_matches_a_handle_owner_not_just_the_literal_agent_id(
     actions: Actions,
 ) -> None:

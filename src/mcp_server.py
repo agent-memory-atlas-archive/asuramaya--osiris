@@ -5493,7 +5493,11 @@ async def threads(project: str | None = None, render: str | None = None,
 
     `contested` (fix (b), Metron's mechanism report, mail 8890): present and `True` when
     a newer note has disputed this summary and nobody has corrected it yet — marked with
-    a leading `!` in both the JSON row and the text render."""
+    a leading `!` in both the JSON row and the text render.
+
+    `project_owned_not_shown` (thread 3a9d9a5d89fa): obligations here whose owner is
+    this project's own bare name or empty, never yours by any spelling — present only
+    when >0; the text render's own trailing line names the same count."""
     pool = await _pool_get()
     ident = await _ident_for(ctx)
     proj = project or (ident.project if ident else None)
@@ -5503,10 +5507,11 @@ async def threads(project: str | None = None, render: str | None = None,
     proj_id = await _resolve_repo(pool, proj)
     if proj_id is None:
         return {"error": f"no project {proj!r}", "threads": []}
-    from src.orchestrator.stophook_logic import owner_refs
+    from src.orchestrator.stophook_logic import owner_refs, project_owned_obligation_count
     from src.orchestrator.textrender import render_threads_text
 
     owners = await owner_refs(pool, ident.agent_id)
+    project_owned = await project_owned_obligation_count(pool, proj_id, owners)
     rows = await pool.fetch(
         "SELECT o.id, "
         "  COALESCE("
@@ -5536,8 +5541,9 @@ async def threads(project: str | None = None, render: str | None = None,
              **({"contested": True} if r["contested"] else {})}
            for r in rows]
     if render == "text":
-        return {"text": render_threads_text(mine)}
-    return {"project": proj, "threads": mine, "total": len(mine)}
+        return {"text": render_threads_text(mine, project_owned)}
+    return {"project": proj, "threads": mine, "total": len(mine),
+           **({"project_owned_not_shown": project_owned} if project_owned else {})}
 
 
 @mcp.tool()

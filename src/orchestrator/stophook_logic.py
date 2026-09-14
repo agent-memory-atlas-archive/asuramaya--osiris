@@ -75,11 +75,27 @@ async def owner_refs(conn: asyncpg.Pool | asyncpg.Connection, agent_id: str) -> 
 async def owned_obligations(
     conn: asyncpg.Pool | asyncpg.Connection, agent_id: str,
 ) -> dict[str, int]:
-    """{owned, stale}: OPEN kind='obligation' Threads this agent (seat, lineage, handle)
-    owns, and how many of them are past their stale_after window. THE BAR'S `owe`
-    (operator 2026-09-06: the old owed_here counted the OPERATOR's debts in the project,
-    a number that never belonged to the seat reading it) — scoped to the reader's own
-    premises, red only when something is stale, hidden at zero."""
+    """{owned, stale, project}: OPEN kind='obligation' Threads this agent (seat, lineage,
+    handle) owns, how many are past their stale_after window, and — THE THIRD OWNER
+    CATEGORY (thread 3a9d9a5d89fa, Ra XL's measured report, mail 10351/10358: "three
+    owner categories existed, the fix reasoned about two") — how many more sit in a
+    project this agent's own seat GOVERNS (`charter_of`) whose owner is the bare PROJECT
+    NAME itself, or empty, rather than any individual spelling `owner_refs` matches.
+    THE BAR'S `owe N (+M project)` (operator 2026-09-06's own `owe` ruling narrowed to
+    the reader's own premises; this restores the population that narrowing silently
+    dropped, without re-widening `owned` itself — `project` stays a SEPARATE, honestly
+    labeled count, never folded back into `owned`).
+
+    READ-TIME ONLY, never resolves or normalizes (see `owner_normalization.
+    resolve_owner_seat` for the write-time act that eventually retitles these rows) —
+    a peer-governed project's own obligations (owner_normalization.py's own
+    `_coordinating_seat_for_project`, operator ruling thread 90ea942a92b5: no manager on
+    record resolves to the literal 'operator') still count here for EVERY governing
+    seat's own `project` figure regardless of whether that resolution has actually been
+    applied — rotten-apple's own 11 were deliberately excluded from the one migration
+    run that would have retitled them (Thoth DM 8650, "that project's own data defect,
+    not ours to touch"), so they remain genuinely, literally owner='rotten-apple' today,
+    and this counts them by that literal string, not a hypothetical resolved one."""
     owners = await owner_refs(conn, agent_id)
     row = await conn.fetchrow(
         "SELECT count(*) AS owned, "
@@ -89,9 +105,72 @@ async def owned_obligations(
         f"  AND {_OBLIGATION_STATUS_SQL}='open' AND {_OBLIGATION_KIND_SQL}='obligation' "
         f"  AND lower(COALESCE({_OBLIGATION_OWNER_SQL},'')) = ANY($1::text[])",
         owners)
+    project = await _project_owned_count(conn, agent_id, owners)
     if row is None:
-        return {"owned": 0, "stale": 0}
-    return {"owned": int(row["owned"] or 0), "stale": int(row["stale"] or 0)}
+        return {"owned": 0, "stale": 0, "project": project}
+    return {"owned": int(row["owned"] or 0), "stale": int(row["stale"] or 0),
+           "project": project}
+
+
+async def _project_owned_count(
+    conn: asyncpg.Pool | asyncpg.Connection, agent_id: str, owners: list[str],
+) -> int:
+    """The `project` half of `owned_obligations` — open obligation Threads filed
+    (`in_repo`) under one of THIS agent's own seat's `charter_of` projects, whose owner
+    is empty or exactly that project's own bare name. 0 for an agent holding no seat, or
+    a seat with an empty charter — never a fleet-wide scan."""
+    from src.orchestrator.charter import charter_of
+    from src.orchestrator.seats import held_seat
+
+    seat = await held_seat(conn, agent_id)
+    seat_id = seat.get("seat_id") if seat else None
+    if not seat_id:
+        return 0
+    projects = await charter_of(conn, str(seat_id))
+    if not projects:
+        return 0
+    lowered = [p.lower() for p in projects]
+    n = await conn.fetchval(
+        "SELECT count(*) FROM objects o "
+        "JOIN links l ON l.from_id=o.id AND l.type='in_repo' "
+        "  AND (l.valid_until IS NULL OR l.valid_until > now()) "
+        "JOIN objects p ON p.id=l.to_id AND p.type='SoftwareProject' "
+        "WHERE o.type='Thread' AND o.status='active' AND o.merged_into IS NULL "
+        f"  AND {_OBLIGATION_STATUS_SQL}='open' AND {_OBLIGATION_KIND_SQL}='obligation' "
+        "  AND lower(replace(p.canonical,'repo:','')) = ANY($1::text[]) "
+        f"  AND lower(COALESCE({_OBLIGATION_OWNER_SQL},'')) != ALL($2::text[]) "
+        "  AND (lower(COALESCE("
+        f"    {_OBLIGATION_OWNER_SQL},'')) = '' "
+        "    OR lower(COALESCE("
+        f"    {_OBLIGATION_OWNER_SQL},'')) = lower(replace(p.canonical,'repo:','')))",
+        lowered, owners)
+    return int(n or 0)
+
+
+async def project_owned_obligation_count(
+    conn: asyncpg.Pool | asyncpg.Connection, project_object_id: Any, owners: list[str],
+) -> int:
+    """Open obligation Threads filed (`in_repo`) under ONE project (by its object id,
+    already resolved by the caller — `threads()`'s own `proj_id`) whose owner is empty
+    or exactly that project's own bare name — the single-project sibling of
+    `_project_owned_count`'s cross-charter scan, for a caller (`threads()`) that already
+    knows exactly which project it's asking about and needs no charter lookup at all.
+    `owners` excludes anything `owner_refs` already matches, so this and the main
+    threads() query never double-count a row."""
+    n = await conn.fetchval(
+        "SELECT count(*) FROM objects o "
+        "JOIN links l ON l.from_id=o.id AND l.type='in_repo' AND l.to_id=$1 "
+        "  AND (l.valid_until IS NULL OR l.valid_until > now()) "
+        "JOIN objects p ON p.id=l.to_id AND p.type='SoftwareProject' "
+        "WHERE o.type='Thread' AND o.status='active' AND o.merged_into IS NULL "
+        f"  AND {_OBLIGATION_STATUS_SQL}='open' AND {_OBLIGATION_KIND_SQL}='obligation' "
+        f"  AND lower(COALESCE({_OBLIGATION_OWNER_SQL},'')) != ALL($2::text[]) "
+        "  AND (lower(COALESCE("
+        f"    {_OBLIGATION_OWNER_SQL},'')) = '' "
+        "    OR lower(COALESCE("
+        f"    {_OBLIGATION_OWNER_SQL},'')) = lower(replace(p.canonical,'repo:','')))",
+        project_object_id, owners)
+    return int(n or 0)
 
 
 async def compute_stale_obligations(

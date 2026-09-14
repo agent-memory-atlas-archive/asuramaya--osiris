@@ -56,7 +56,7 @@ async def test_heartbeat_route_bumps_last_seen_and_returns_the_shared_shape(
     assert "error" not in payload
     for key in ("briefs", "mail", "dm", "flight", "souls", "wakes", "owed", "owed_here",
                 "sick", "spend", "resolved_project", "resolved_intent",
-                "resolved_seat_handle"):
+                "resolved_seat_handle", "owed_mine", "stale_mine", "owed_mine_project"):
         assert key in payload
 
     row = await actions.pool.fetchrow(
