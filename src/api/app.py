@@ -160,12 +160,28 @@ def create_app(pool: asyncpg.Pool | None = None) -> FastAPI:
         try:
             yield
         finally:
+            app.state.shutting_down.set()
             await app.state.arq.aclose()
             await app.state.redis.aclose()
             if own:
                 await app.state.pool.close()
 
     app = FastAPI(title="Osiris Object Set Service", lifespan=lifespan)
+    # THE CONSOLE GRACEFUL SHUTDOWN (thread 0be2f790's own deploy-reliability follow-up,
+    # Thoth DM 10653): an SSE generator's `while not await request.is_disconnected()`
+    # loop never notices the SERVER shutting down — only a client-initiated disconnect,
+    # which an operator's browser holding a stream open across a restart never sends.
+    # Every SSE route below also checks this event, set the instant uvicorn's shutdown
+    # sequence reaches the lifespan above (right after `yield` returns, before the
+    # pool/redis/arq teardown that follows) — a stalled stream now exits on its own
+    # within one `keep-alive` tick instead of holding the process open until systemd's
+    # TimeoutStopSec SIGKILLs it. Set HERE, not inside the lifespan closure: a test
+    # fixture building `create_app()` without ever driving its lifespan (tests/
+    # test_graph_stream.py's/test_api.py's own `client` fixture, neither of which calls
+    # `app.router.lifespan_context`) must still find a real Event on `app.state` the
+    # instant `create_app()` returns, never an AttributeError the first time an SSE
+    # route's loop condition is evaluated.
+    app.state.shutting_down = asyncio.Event()
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -821,7 +837,8 @@ def create_app(pool: asyncpg.Pool | None = None) -> FastAPI:
 
         async def gen() -> AsyncIterator[str]:
             nonlocal cursor
-            while not await request.is_disconnected():
+            while (not request.app.state.shutting_down.is_set()
+                  and not await request.is_disconnected()):
                 deltas, cursor = await deltas_since(request.app.state.pool, cursor)
                 if deltas:
                     yield f"id: {cursor}\ndata: {_json.dumps(deltas)}\n\n"
@@ -1217,7 +1234,8 @@ def create_app(pool: asyncpg.Pool | None = None) -> FastAPI:
         watches this so the graph/badges update live as the cascade expands."""
         async def gen() -> AsyncIterator[str]:
             last = ""
-            while not await request.is_disconnected():
+            while (not request.app.state.shutting_down.is_set()
+                  and not await request.is_disconnected()):
                 stats = await compute_stats(
                     request.app.state.pool, request.app.state.redis, case_id
                 )
@@ -1570,7 +1588,8 @@ def create_app(pool: asyncpg.Pool | None = None) -> FastAPI:
         as the case stream). The browser applies remote moves; its own it suppresses by rev."""
         async def gen() -> AsyncIterator[str]:
             last = ""
-            while not await request.is_disconnected():
+            while (not request.app.state.shutting_down.is_set()
+                  and not await request.is_disconnected()):
                 state = await get_console(request.app.state.pool)
                 payload = _json.dumps(state)
                 if payload != last:
@@ -1637,7 +1656,8 @@ def create_app(pool: asyncpg.Pool | None = None) -> FastAPI:
                 return
 
             watermark = await asyncio.to_thread(_file_size, path)
-            while not await request.is_disconnected():
+            while (not request.app.state.shutting_down.is_set()
+                  and not await request.is_disconnected()):
                 lines, watermark = await asyncio.to_thread(
                     _read_chunk, path, watermark, 512 * 1024)
                 text, _cwd = distill(lines) if lines else ("", None)

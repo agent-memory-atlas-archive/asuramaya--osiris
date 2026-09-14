@@ -85,6 +85,18 @@ def _sub_console_port(text: str, value: Any) -> str:
     return re.sub(r"--port \d+", f"--port {int(value)}", text)
 
 
+def _sub_console_graceful_timeout(text: str, value: Any) -> str:
+    """THE CONSOLE GRACEFUL SHUTDOWN (thread 0be2f790's own deploy-reliability
+    follow-up, Thoth DM 10653) — same shape as `_sub_console_host`/`_sub_console_port`
+    above: a plain regex replace against the flag's own literal on `ExecStart=`,
+    never an insert-if-missing branch, because the shipped unit already carries
+    `--timeout-graceful-shutdown 10` (this substitution's own registered default)."""
+    if value is None:
+        return text
+    return re.sub(r"--timeout-graceful-shutdown \d+",
+                  f"--timeout-graceful-shutdown {int(value)}", text)
+
+
 def _sub_env_var(name: str) -> Callable[[str, Any], str]:
     """`Environment=<name>=<value>` substitution, generic (thread e332177f: the first
     caller is `ingest.transcripts_root` -> `OSIRIS_TRANSCRIPTS`, but the shape is the
@@ -165,6 +177,7 @@ _DAEMON_SERVICE_SUBS: dict[str, list[tuple[str, Callable[[str, Any], str]]]] = {
         ("daemon.osiris_console.memory_max", _sub_memory_max),
         ("daemon.osiris_console.host", _sub_console_host),
         ("daemon.osiris_console.port", _sub_console_port),
+        ("daemon.osiris_console.graceful_shutdown_secs", _sub_console_graceful_timeout),
     ],
 }
 

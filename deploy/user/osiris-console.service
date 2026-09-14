@@ -35,7 +35,13 @@ Environment=REDIS_URL=redis://127.0.0.1:6396/0
 ExecStartPre=/bin/bash -c 'until (echo > /dev/tcp/127.0.0.1/5601) 2>/dev/null; do sleep 1; done'
 # --factory: uvicorn calls create_app() (which builds its OWN pool + lifespan), the self-standing
 # form of the app; the module-level `app` is the same surface for the /opt system unit.
-ExecStart=%h/code/osiris/.venv/bin/uvicorn --factory src.api.app:create_app --host 127.0.0.1 --port 8011
+# --timeout-graceful-shutdown (thread 0be2f790's own deploy-reliability follow-up, Thoth DM
+# 10653): bounds how long a restart waits on an open SSE stream (a browser holding
+# /graph/stream/deltas or /console/stream across the restart never disconnects on its own) —
+# paired with the SSE generators themselves now exiting on the app's own shutdown event
+# (src/api/app.py's `app.state.shutting_down`), a stalled stream no longer costs systemd's full
+# TimeoutStopSec (90s default, unset on this unit) before a SIGKILL.
+ExecStart=%h/code/osiris/.venv/bin/uvicorn --factory src.api.app:create_app --host 127.0.0.1 --port 8011 --timeout-graceful-shutdown 10
 Restart=always
 RestartSec=2
 # A read surface holds no truth; a modest cap contains a runaway render without starving the box.

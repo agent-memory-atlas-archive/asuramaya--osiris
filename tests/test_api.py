@@ -835,6 +835,58 @@ async def test_lifespan_binds_even_when_triggers_is_exclusively_locked(
         await actions.pool.release(conn)
 
 
+async def test_create_app_always_carries_a_shutting_down_event(actions: Actions) -> None:
+    """THE CONSOLE GRACEFUL SHUTDOWN (thread 0be2f790's own deploy-reliability
+    follow-up, Thoth DM 10653): `app.state.shutting_down` must exist the instant
+    `create_app()` returns, never only after the lifespan runs — this file's own
+    `client` fixture (and test_graph_stream.py's) builds `create_app(actions.pool)`
+    and never drives `app.router.lifespan_context`, so an SSE route's own loop
+    condition evaluating `request.app.state.shutting_down.is_set()` would raise
+    AttributeError on first use if this event were only ever set inside the lifespan
+    closure."""
+    import asyncio
+
+    app = create_app(actions.pool)
+    assert isinstance(app.state.shutting_down, asyncio.Event)
+    assert not app.state.shutting_down.is_set()
+
+
+async def test_lifespan_sets_shutting_down_on_the_way_out(
+    pg_dsn: str, redis_url: str,
+) -> None:
+    """The real end-to-end proof, same `app.router.lifespan_context` protocol
+    `test_lifespan_seeds_the_type_catalog_on_boot` above already drives: NOT set while
+    the app is up, set the moment the lifespan's own shutdown sequence runs — an SSE
+    generator's loop condition checked on the next `keep-alive` tick after a restart
+    is signaled sees it flip, rather than only noticing a client disconnect that an
+    operator's browser holding a stream open across the restart never sends."""
+    import os
+
+    os.environ["DATABASE_URL"] = pg_dsn
+    os.environ["REDIS_URL"] = redis_url
+    app = create_app()  # own pool: exercises the exact lifespan a real boot runs
+    async with app.router.lifespan_context(app):
+        assert not app.state.shutting_down.is_set()
+    assert app.state.shutting_down.is_set()
+
+
+def test_every_sse_route_checks_shutting_down_before_is_disconnected() -> None:
+    """Reads the REAL source (not a synthetic reproduction) — the same discipline
+    test_shipped_osiris_mcp_unit_declares_a_transcripts_root holds for a unit file:
+    a future edit to one of the four SSE loops that drops the check without meaning
+    to fails here, loudly, rather than silently reintroducing the incident's own
+    shape for whichever route it happened to."""
+    import inspect
+
+    from src.api import app as app_module
+
+    src = inspect.getsource(app_module)
+    occurrences = src.count("not request.app.state.shutting_down.is_set()")
+    assert occurrences == 4, (
+        f"expected all 4 SSE routes to check shutting_down before is_disconnected, "
+        f"found {occurrences}")
+
+
 async def test_object_card_title_uses_resolve_label_not_name_only(actions: Actions) -> None:
     """Task #97 workstream 3: _object_card (the watch/subscription card-preview
     endpoint) used to check ONLY the `name` property for its title — a Practice
