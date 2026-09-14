@@ -82,11 +82,11 @@ async def test_live_mints_the_edge_sourced_to_the_original_writer_and_is_idempot
     upstream = await actions.create_or_find_object("Decision", "decision:eee555fff666", "x")
     lines = [
         _tool_result(json.dumps({"canonical": "decision:eee555fff666"})),
-        _tool_result(json.dumps({"canonical": "decision:ggg777hhh888"})),
+        _tool_result(json.dumps({"canonical": "decision:aaa777bbb888"})),
     ]
     await _mint_agent_with_sid(actions, "agent:writer-b", "sidbbb22deadbeef", tmp_path, lines)
     decision = await actions.create_or_find_object(
-        "Decision", "decision:ggg777hhh888", "agent:writer-b")
+        "Decision", "decision:aaa777bbb888", "agent:writer-b")
     await actions.assert_property(
         decision, "summary", "another decision with a real upstream read",
         "agent:writer-b", now, 0.9)
@@ -142,12 +142,12 @@ async def test_summary_classifies_matched_no_ledger_and_no_transcript(
     await actions.create_or_find_object("Decision", "decision:a00000a00000", "x")
     lines = [
         _tool_result(json.dumps({"canonical": "decision:a00000a00000"})),
-        _tool_result(json.dumps({"canonical": "decision:matched0001a2"})),
+        _tool_result(json.dumps({"canonical": "decision:aaa000100a2"})),
     ]
     await _mint_agent_with_sid(actions, "agent:writer-matched", "sidmatch1deadbeef",
                                tmp_path, lines)
     matched_d = await actions.create_or_find_object(
-        "Decision", "decision:matched0001a2", "agent:writer-matched")
+        "Decision", "decision:aaa000100a2", "agent:writer-matched")
     await actions.assert_property(matched_d, "summary", "a matched write",
                                   "agent:writer-matched", now, 0.9)
 
@@ -217,14 +217,14 @@ async def test_a_successor_generation_matches_via_its_ancestors_anchor_sid(
     upstream = await actions.create_or_find_object("Decision", "decision:b00000b00000", "x")
     lines = [
         _tool_result(json.dumps({"canonical": "decision:b00000b00000"})),
-        _tool_result(json.dumps({"canonical": "decision:successor000a1"})),
+        _tool_result(json.dumps({"canonical": "decision:bbb1110000a1"})),
     ]
     # the ledger entry lives on the ANCESTOR generation, never the successor's own.
     await _mint_agent_with_sid(actions, "agent:widentest", "sidwide1deadbeef",
                                tmp_path, lines)
     await actions.create_or_find_object("Agent", "agent:widentest-ii", "test")
     decision = await actions.create_or_find_object(
-        "Decision", "decision:successor000a1", "agent:widentest-ii")
+        "Decision", "decision:bbb1110000a1", "agent:widentest-ii")
     await actions.assert_property(
         decision, "summary", "written by the successor generation",
         "agent:widentest-ii", now, 0.9)
@@ -234,7 +234,136 @@ async def test_a_successor_generation_matches_via_its_ancestors_anchor_sid(
 
     assert report["edges_to_mint"] == 1
     entry = report["plan"][0]
-    assert entry["from"] == "decision:successor000a1"
+    assert entry["from"] == "decision:bbb1110000a1"
     assert entry["writer"] == "agent:widentest-ii"  # sourced to the REAL writer
     assert entry["to"] == str(upstream)
     assert report["summary"]["candidates"]["matched"] == 1
+
+
+# --- thread 0be2f790, Thoth mail 10626: THE STALL's own fix -----------------------------
+
+def _sidecar_for(transcript: Path) -> Path:
+    return transcript.with_name(transcript.name + ".providx.json")
+
+
+async def test_a_transcript_over_the_cap_is_skipped_unopened(
+    actions: Actions, tmp_path: Path,
+) -> None:
+    """A 100MB transcript never gets opened at all when it exceeds max_scan_bytes — the
+    fix for the 469MB/222MB real transcripts that stalled osiris-mcp for 19 minutes."""
+    now = datetime.now(UTC)
+    proj_dir = tmp_path / "-home-someone-code-testrepo"
+    proj_dir.mkdir(parents=True, exist_ok=True)
+    sid = "sidbig001deadbeef"
+    big = proj_dir / f"{sid}.jsonl"
+    with big.open("wb") as f:
+        f.truncate(100 * 1024 * 1024)  # sparse — instant, never actually written
+    obj = await actions.create_or_find_object("Agent", "agent:writer-huge", "test")
+    await actions.assert_property(
+        obj, f"anchor_sid:{sid[:8]}", sid, "test", now, 0.9,
+        evidence_class="direct_observation")
+    decision = await actions.create_or_find_object(
+        "Decision", "decision:cccccc111111", "agent:writer-huge")
+    await actions.assert_property(
+        decision, "summary", "a write whose only transcript is huge",
+        "agent:writer-huge", now, 0.9)
+
+    report = await backfill_possible_upstream(
+        actions, dry_run=True, transcript_root=tmp_path, max_scan_bytes=64 * 1024 * 1024)
+
+    assert report["edges_to_mint"] == 0
+    assert report["summary"]["candidates"]["no_transcript"] == 1
+    assert "over ingest.transcript_scan_max_bytes" in report["skipped"][0]["reason"]
+    assert not _sidecar_for(big).exists()  # never opened, so never cached either
+
+
+async def test_a_10mb_transcript_streams_and_finds_the_receipt(
+    actions: Actions, tmp_path: Path,
+) -> None:
+    """Under the cap, a real multi-megabyte file still streams correctly (never
+    read_text()) and finds a receipt near the end of it."""
+    now = datetime.now(UTC)
+    upstream = await actions.create_or_find_object("Decision", "decision:1a2b3c4d5e6f", "x")
+    filler = _tool_result(json.dumps({"note": "x" * 180})) + "\n"
+    lines = [filler] * 55_000  # ~10MB of filler before the real content
+    lines.append(_tool_result(json.dumps({"canonical": "decision:1a2b3c4d5e6f"})))
+    lines.append(_tool_result(json.dumps({"canonical": "decision:6f5e4d3c2b1a"})))
+    proj_dir = tmp_path / "-home-someone-code-testrepo"
+    proj_dir.mkdir(parents=True, exist_ok=True)
+    sid = "sid10mb01deadbeef"
+    transcript = proj_dir / f"{sid}.jsonl"
+    transcript.write_text("\n".join(lines) + "\n")
+    assert transcript.stat().st_size > 9 * 1024 * 1024  # genuinely multi-MB, not a token file
+
+    obj = await actions.create_or_find_object("Agent", "agent:writer-10mb", "test")
+    await actions.assert_property(
+        obj, f"anchor_sid:{sid[:8]}", sid, "test", now, 0.9,
+        evidence_class="direct_observation")
+    decision = await actions.create_or_find_object(
+        "Decision", "decision:6f5e4d3c2b1a", "agent:writer-10mb")
+    await actions.assert_property(
+        decision, "summary", "a write near the end of a big real transcript",
+        "agent:writer-10mb", now, 0.9)
+
+    report = await backfill_possible_upstream(
+        actions, dry_run=True, transcript_root=tmp_path, max_scan_bytes=64 * 1024 * 1024)
+
+    assert report["edges_to_mint"] == 1
+    assert report["plan"][0]["to"] == str(upstream)
+    assert _sidecar_for(transcript).exists()  # the streaming pass cached its own index
+
+
+async def test_the_sidecar_cache_is_used_on_a_second_visit(
+    actions: Actions, tmp_path: Path,
+) -> None:
+    """A second call against an UNCHANGED transcript reuses the sidecar's own index
+    instead of re-scanning — proven by corrupting the transcript's own content (while
+    preserving its stat signature) between calls and confirming the cached answer
+    survives the corruption."""
+    now = datetime.now(UTC)
+    upstream = await actions.create_or_find_object("Decision", "decision:aa11bb22cc33", "x")
+    lines = [
+        _tool_result(json.dumps({"canonical": "decision:aa11bb22cc33"})),
+        _tool_result(json.dumps({"canonical": "decision:dd44ee55ff66"})),
+    ]
+    sid = "sidcache1deadbeef"
+    transcript = await _mint_agent_with_sid(
+        actions, "agent:writer-cache", sid, tmp_path, lines)
+    decision = await actions.create_or_find_object(
+        "Decision", "decision:dd44ee55ff66", "agent:writer-cache")
+    await actions.assert_property(
+        decision, "summary", "cached across a second visit",
+        "agent:writer-cache", now, 0.9)
+
+    first = await backfill_possible_upstream(actions, dry_run=True, transcript_root=tmp_path)
+    assert first["edges_to_mint"] == 1
+
+    import os
+
+    st = transcript.stat()
+    garbage = ("no receipt in here at all " * (st.st_size // 27 + 1))[:st.st_size]
+    transcript.write_bytes(garbage.encode())  # SAME byte length — size+mtime both preserved
+    os.utime(transcript, (st.st_atime, st.st_mtime))  # preserve the cache's own key
+
+    second = await backfill_possible_upstream(actions, dry_run=True, transcript_root=tmp_path)
+    assert second["edges_to_mint"] == 1  # still found — via the sidecar, not a re-scan
+    assert second["plan"][0]["to"] == str(upstream)
+
+
+async def test_a_tight_budget_returns_a_partial_receipt(
+    actions: Actions, tmp_path: Path,
+) -> None:
+    """Thread 0be2f790: a caller must never be left waiting on a call that could hang —
+    an exhausted wall-clock budget stops between candidates and says so, honestly."""
+    now = datetime.now(UTC)
+    for i in range(3):
+        d = await actions.create_or_find_object(
+            "Decision", f"decision:budget00000{i}", f"agent:writer-budget-{i}")
+        await actions.assert_property(
+            d, "summary", f"candidate {i}", f"agent:writer-budget-{i}", now, 0.9)
+
+    report = await backfill_possible_upstream(
+        actions, dry_run=True, transcript_root=tmp_path, budget_seconds=0.0)
+
+    assert report["partial"] is True
+    assert report["candidates_examined"] < report["candidates_total"]

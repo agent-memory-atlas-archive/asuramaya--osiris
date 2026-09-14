@@ -6480,6 +6480,41 @@ async def layout_migrate(limit: int | None = None, ctx: Context | None = None) -
     return {"batches": receipts, "total_placed": total_placed}
 
 
+_PROVENANCE_BACKFILL_RECEIPT_THREAD = "e332177f"  # thread 0be2f790's own live specimen
+
+
+async def _enqueue_provenance_backfill(
+    dry_run: bool, because: str | None, limit: int | None, newest_first: bool,
+    ctx: Context | None,
+) -> dict[str, Any]:
+    """THE STALL's own fix, item 1 (thread 0be2f790, Thoth mail 10626): no transcript
+    byte is ever read on osiris-mcp's own event loop thread again — this enqueues
+    `provenance_backfill_job` on osiris-worker (its own process) and returns the job id
+    immediately; the receipt lands as a thread annotation on
+    `_PROVENANCE_BACKFILL_RECEIPT_THREAD` when the worker finishes. Same
+    `arq.create_pool`/`enqueue_job` shape `sweep_route` already uses — never a second
+    enqueue mechanism."""
+    from arq import create_pool as arq_create_pool
+    from arq.connections import RedisSettings
+
+    from src.orchestrator.provenance_backfill import _DEFAULT_LIMIT
+
+    ident = await _ident_for(ctx)
+    if ident is None:
+        return {"error": "mount first — a backfill is a mind's act, and the graph must "
+                         "know whose", "why": _anchorless(ctx)}
+    arq_pool = await arq_create_pool(RedisSettings.from_dsn(get_settings().redis_url))
+    job = await arq_pool.enqueue_job(
+        "provenance_backfill_job", dry_run=dry_run, because=because,
+        limit=limit if limit is not None else _DEFAULT_LIMIT, newest_first=newest_first,
+        actor=ident.agent_id, receipt_ref=_PROVENANCE_BACKFILL_RECEIPT_THREAD)
+    job_id = job.job_id if job is not None else None
+    return {"enqueued": True, "job_id": job_id,
+            "note": f"runs on osiris-worker — the receipt lands as a thread annotation "
+                    f"on {_PROVENANCE_BACKFILL_RECEIPT_THREAD} when it finishes, never "
+                    "inline on this call"}
+
+
 async def _dispatch_backfill(
     target: str, dry_run: bool, because: str | None, only_bases: list[str] | None,
     ctx: Context | None, *, limit: int | None = None, newest_first: bool = False,
@@ -6532,13 +6567,20 @@ async def backfill(
     `governs` link from `person:operator` to every active SoftwareProject it doesn't
     already govern, so the single operator today stays chartered over everything) |
     "provenance_possible_upstream" (thread e332177f: back-stamps `possible_upstream` onto
-    historical Decision/Thread writes via each write's transcript receipt — `limit`
-    (default 200) and `newest_first` (default False, oldest-first) are consulted by THIS
-    target only, every other target ignores them)."""
+    historical Decision/Thread writes via each write's transcript receipt — `limit`/
+    `newest_first` are consulted by THIS target only. RUNS ASYNCHRONOUSLY (thread
+    0be2f790: a 470MB transcript once starved this door for 19 minutes) — returns a job
+    id at once, receipt lands as a thread annotation on e332177f when done)."""
     from src.orchestrator.backfill import BACKFILL_TARGETS
 
     if target not in BACKFILL_TARGETS:
         return {"error": f"unknown target {target!r}", "valid_targets": sorted(BACKFILL_TARGETS)}
+    if target == "provenance_possible_upstream":
+        # THE STALL's own fix (thread 0be2f790): never inline on this door again — see
+        # `_enqueue_provenance_backfill`'s own docstring. The CLI door still calls
+        # `run_backfill` in-process (`cmd_backfill` in src/cli.py) — it IS its own
+        # process, so this door's own starvation risk does not apply there.
+        return await _enqueue_provenance_backfill(dry_run, because, limit, newest_first, ctx)
     return await _dispatch_backfill(target, dry_run, because, only_bases, ctx,
                                     limit=limit, newest_first=newest_first)
 

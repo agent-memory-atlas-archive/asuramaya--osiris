@@ -474,6 +474,17 @@ _INGEST_SETTINGS: tuple[SettingSpec, ...] = (
     SettingSpec("ingest.transcripts_root", "path", "", effect="restart:osiris-mcp",
                authority="operator_or_ruling", requires_because=True, consequence="low",
                write_name="daemon_unit_literals", env_field="osiris_transcripts"),
+    # THE STALL'S OWN FIX, item 3 (thread 0be2f790, Thoth mail 10626, 2026-09-14
+    # evening): a real transcript on this box ran 469MB, and reading one whole into
+    # memory on osiris-mcp's own event loop thread starved the shared, whole-fleet
+    # connection for 19 minutes before the operator restarted it by hand.
+    # `effect='next_tick'`: read fresh each backfill call/job via `current_stored_value`
+    # (the same `next_tick`-key escape hatch `wake.trigger.enabled` already established),
+    # never baked into a live env var the way a `restart:<unit>` knob is — no `env_field`,
+    # since nothing reads this off a live `Settings` object.
+    SettingSpec("ingest.transcript_scan_max_bytes", "int", 64 * 1024 * 1024,
+               effect="next_tick", authority="operator_or_ruling", requires_because=False,
+               consequence="low", write_name="daemon_unit_literals"),
 )
 
 # THE LAYOUT HEARTBEAT'S OWN KNOBS (Thoth mail 10609, product law -- every action has a
