@@ -9,28 +9,9 @@ const esc = s => (s == null ? "" : String(s)).replace(/[<>&]/g, c => ({ "<": "&l
 let FOCUS = null, SET = [], ROOM = '', ROOMS = [], PROJECTS = [], ACTIVE_SURFACE = 'browse';
 let SELECTED_ENTITY_TYPES = new Set(), ENTITY_SEARCH_QUERY = '', ENTITY_VIEW_MODE = 'table';
 let TABLE_SORT_COL = 'date', TABLE_SORT_DIR = 'desc', EXPANDED_ROWS = new Set();
-let BOARD_GROUP_BY = 'auto', SYNCING = false, CONSOLE_REV = 0, SHOW_AGENTS = false, SCOPE_FILTER = '';
+let SYNCING = false, CONSOLE_REV = 0, SHOW_AGENTS = false, SCOPE_FILTER = '';
 let TRUE_COUNTS = null; // uncapped per-type census from /objects/counts (#196) — null until loaded
 let OBJECTS_LIMIT = 1500, OBJECTS_HAS_MORE = false, OBJECTS_LOADING_MORE = false;
-
-// NAVIGABLE SPACE, INTEGRATION (decision "NAVIGABLE SPACE, INTEGRATION SHAPE", mail 10550):
-// the three.js renderer (space.js, mounted via #cy in index.html's own module script, see
-// window.__spaceReady) now owns browse's default graph view — the whole-graph LOD toggle
-// that used to live over the SAME cytoscape board (Thoth dispatch 9563's Atlas fold) is
-// superseded, not migrated: space shows every positioned object at once, always, so there
-// is no "whole graph" mode to toggle into separately any more. `ensureBoard()`'s cytoscape
-// instance survives, retargeted at the hidden #cy-legacy — Board (the kanban projection)
-// and this legacy mount are BOTH slated for real removal in piece 3, not here.
-var board = null;
-function ensureBoard() {
-  if (!board && typeof Osiris !== "undefined" && Osiris.makeBoard) {
-    board = Osiris.makeBoard($("cy-legacy"),
-      function(id, deep, type) { return deep ? primaryAction(id, type) : inspectOnly(id); },
-      function(id, type, ev) { return ev && showActionMenu(ev.clientX, ev.clientY, id, type); },
-      function() {});
-  }
-  return board;
-}
 
 function setStatus(s) { $("status").textContent = s; }
 function showBoard() { $("stage").classList.remove("panel"); }
@@ -49,7 +30,7 @@ async function switchSurface(surface) {
     if (!SET.length) await loadObjectSet(); renderEntityExplorer();
   } else {
     $('entity-taxonomy-bar').style.display = 'none';
-    (ensureBoard()).clear(); showPanel();
+    showPanel();
     if (window.OsirisSpace) window.OsirisSpace.pause();
     if (surface === 'mailbox') renderMailbox();
     if (surface === 'pane') renderPane();
@@ -325,8 +306,8 @@ async function renderEntityExplorer() { $('entity-taxonomy-bar').style.display =
 // NAVIGABLE SPACE, INTEGRATION (mail 10550): "graph and table COEXIST in the middle — your
 // default: the graph canvas fills the section with the table as a collapsible drawer beneath
 // it, the Table/Graph switch becomes 'show table'". Table/Board/Graph's old three-way
-// view-tab switcher (renderSwitcher, ENTITY_VIEW_MODE) is superseded by this one boolean —
-// #viewsw stays in the markup, empty/unused (piece 3 removes it alongside Board/cytoscape).
+// view-tab switcher (renderSwitcher, ENTITY_VIEW_MODE) is superseded by this one boolean;
+// #viewsw and Board itself are gone for real now (piece 3, ruling c5953bb1).
 let TABLE_DRAWER_OPEN = false;
 function toggleTableDrawer() {
   TABLE_DRAWER_OPEN = !TABLE_DRAWER_OPEN;
@@ -426,38 +407,6 @@ function renderTableRow(o) {
     (isExp ? '<tr class="ee-tray-row"><td colspan="5"><div class="ee-inline-tray"><div class="ee-tray-head"><span class="ee-tray-title">STATEMENT / RATIONALE</span><div class="ee-tray-badges">' + (grade ? '<span class="card-tag grade-' + esc(grade) + '">' + esc(grade.replace(/_/g, ' ')) + '</span>' : '') + (source ? '<span class="card-tag">source: ' + esc(source) + '</span>' : '') + '<button class="iconbtn" style="padding:1px 6px;font-size:10px" onclick="event.stopPropagation();focus(\'' + o.id + '\')">Open in Graph &#9658;</button></div></div><div class="ee-tray-body">' + esc(summary || o.name || '') + '</div>' + (Object.keys(p).length ? '<div class="ee-tray-props">' + Object.entries(p).filter(function(e){return ['summary','rationale','statement','title','description'].indexOf(e[0]) === -1;}).slice(0, 8).map(function(e){return '<div class="ee-prop-item"><span class="ee-prop-k">' + esc(e[0]) + ':</span> <span class="ee-prop-v">' + esc(String(e[1])) + '</span></div>';}).join('') + '</div>' : '') + '</div></td></tr>' : '');
 }
 
-// ── Board Projection ─────────────────────────────────────────────────────────
-function renderBoardProjection(container, items) {
-  const shown = items.slice(0, 250);
-  if (!shown.length) { container.innerHTML = '<div class="o-empty" style="padding:40px 20px">No matching entities.</div>'; return; }
-  const distinctTypes = [...new Set(shown.map(o => o.type || 'Unknown'))];
-  let effMode = BOARD_GROUP_BY === 'auto' ? (distinctTypes.length <= 1 ? 'status' : 'type') : BOARD_GROUP_BY;
-  let lanes = [];
-  if (effMode === 'status') {
-    lanes = [{ id: 'active', name: 'Active / Open', items: [] }, { id: 'progress', name: 'In Progress', items: [] }, { id: 'resolved', name: 'Resolved', items: [] }];
-    shown.forEach(o => { const p = o.props || {}, st = (o.status || p.status || 'active').toLowerCase(), ow = (p.owner || p.assignee || '').toLowerCase(); if (['historical','retired','resolved','closed','done'].includes(st)) lanes[2].items.push(o); else if (st === 'in_progress' || st === 'leased' || (ow && ow !== 'unassigned' && ow !== 'operator')) lanes[1].items.push(o); else lanes[0].items.push(o); });
-  } else {
-    const priorityOrder = ['Decision','Thread','Reference','Commit','File','Practice','SoftwareProject','Seat'];
-    const sortedTypes = distinctTypes.sort((a,b)=>{const ai=priorityOrder.indexOf(a),bi=priorityOrder.indexOf(b);if(ai!==-1&&bi!==-1)return ai-bi;if(ai!==-1)return-1;if(bi!==-1)return 1;return a.localeCompare(b)});
-    lanes = sortedTypes.map(t => ({ id: t, name: t==='Thread'?'Threads':(t==='Decision'?'Decisions':(t==='Reference'?'Canon':(t==='Commit'?'Commits':(t==='File'?'Files':(t==='SoftwareProject'?'Projects':t))))), items: [] }));
-    const lm = new Map(lanes.map(l => [l.id, l])); shown.forEach(o => { const t = lm.get(o.type); if (t) t.items.push(o); });
-  }
-  const activeLanes = lanes.filter(l => l.items.length > 0), lanesToRender = activeLanes.length ? activeLanes : lanes;
-  container.innerHTML = '<div style="padding:16px;height:100%"><div class="spatial-board">' + lanesToRender.map(l => renderBoardLane(l)).join('') + '</div>' + (items.length > 250 ? '<div class="o-faint" style="padding:16px 0;text-align:center">Showing first 250 of ' + items.length + '</div>' : '') + '</div>';
-}
-function renderBoardLane(l) {
-  var lc = '#6e7681'; try { lc = Osiris.ty(l.id).c || '#6e7681'; } catch(e) {}
-  return '<div class="board-lane"><div class="board-lane-head"><div class="lane-title-wrap"><span class="dot" style="background:' + lc + '"></span><span class="lane-name">' + esc(l.name) + '</span></div><span class="lane-badge">' + l.items.length + '</span></div><div class="board-lane-items">' + l.items.map(renderBoardCard).join('') + (l.items.length ? '' : '<div class="lane-empty">No items</div>') + '</div></div>';
-}
-function renderBoardCard(o) {
-  const p = o.props || {}, summary = p.summary || p.rationale || p.statement || p.description || p.title || '';
-  const dateStr = o.created_at ? o.created_at.slice(0, 10) : '';
-  const grade = (p.evidence_class || p.grade || 'self_declared').toLowerCase(), source = p.source_id || p.source_label || p.source || '';
-  const isDuty = o.type === 'Thread' && (p.kind === 'obligation' || o.status === 'obligation'), statusLabel = isDuty ? 'duty' : (o.status || 'active');
-  var cc = '#6e7681'; try { cc = Osiris.ty(o.type).c || '#6e7681'; } catch(e) {}
-  return '<div class="board-card' + (FOCUS === o.id ? ' sel' : '') + '" onclick="inspectOnly(\'' + o.id + '\')" ondblclick="primaryAction(\'' + o.id + '\', \'' + esc(o.type) + '\')"><div class="card-tags-top"><span class="card-tag card-tag-type" style="border-color:' + cc + '40;color:' + cc + ';background:' + cc + '18"><span class="dot" style="background:' + cc + '"></span> ' + esc(o.type) + '</span>' + edgeCountBadge(o.id) + renderKey(o) + '</div><div class="card-main-content"><div class="card-title">' + esc(o.display_label || o.name || summary || o.id) + '</div>' + (summary && summary !== o.name ? '<div class="card-desc">' + esc(summary) + '</div>' : '') + '</div><div class="card-tags-bottom"><span class="card-tag card-tag-status status-' + esc(statusLabel) + '">' + esc(statusLabel) + '</span>' + (dateStr ? '<span class="card-tag card-tag-date">' + esc(dateStr) + '</span>' : '') + (grade ? '<span class="card-tag card-tag-grade grade-' + esc(grade) + '">' + esc(grade.replace(/_/g, ' ')) + '</span>' : '') + (source ? '<span class="card-tag card-tag-source">by ' + esc(source) + '</span>' : '') + '</div></div>';
-}
-
 // ── Mailbox ──────────────────────────────────────────────────────────────────
 // Ported off /pulse (which never carried a `messages` array — src/api/app.py's pulse_route
 // only ever returned {line, live, owed, briefs, wakes, spend}; the old code silently rendered
@@ -489,7 +438,7 @@ async function runMailboxComposition(name, args) {
     }
     var panel = document.createElement('div');
     panel.style.padding = '16px';
-    await Osiris.renderResult(res, { board: null, panel: panel }, Osiris.defaultView(res), null, null, null);
+    await Osiris.renderResult(res, { panel: panel }, Osiris.defaultView(res), null, null, null);
     container.innerHTML = '';
     if (isFunctionDrill) {
       var back = document.createElement('div');
@@ -603,8 +552,8 @@ function settingsEffectProse(effect) {
 }
 var SETTINGS_LIST = null;
 async function renderSettingsPanel() {
-  const container = $('result'); showBoard(); (ensureBoard()).clear(); showPanel();
-  $('entity-taxonomy-bar').style.display = 'none'; $('viewsw').style.display = 'none';
+  const container = $('result'); showPanel();
+  $('entity-taxonomy-bar').style.display = 'none';
   container.innerHTML = '<div class="o-empty" style="padding:40px">Loading settings…</div>';
   try {
     SETTINGS_LIST = (await fetch('/settings').then(r => r.json())).settings || [];
@@ -762,8 +711,8 @@ var REPAIRS_TARGETS = [
   { key: 'operator_charter', hint: 'Mint governs from person:operator to every active SoftwareProject it doesn’t already cover — fleet-wide authority scope. Apply is CLI-only: osiris backfill operator_charter --apply --because "..."', cliOnly: true },
 ];
 function renderRepairsPanel() {
-  const container = $('result'); showBoard(); (ensureBoard()).clear(); showPanel();
-  $('entity-taxonomy-bar').style.display = 'none'; $('viewsw').style.display = 'none';
+  const container = $('result'); showPanel();
+  $('entity-taxonomy-bar').style.display = 'none';
   var rows = REPAIRS_TARGETS.map(function(t) {
     var applyBtn = t.cliOnly
       ? '<span class="o-faint" title="' + esc(t.hint) + '">CLI-only</span>'
@@ -848,7 +797,7 @@ async function renderProjects() {
     var panel = document.createElement('div');
     panel.style.padding = '0 16px 16px';
     var filtered = Object.assign({}, PROJECTS_INDEX_DATA, { items: shown, count: shown.length });
-    await Osiris.renderResult(filtered, { board: null, panel: panel }, Osiris.defaultView(filtered), null, null, null);
+    await Osiris.renderResult(filtered, { panel: panel }, Osiris.defaultView(filtered), null, null, null);
     container.innerHTML = '';
     container.appendChild(head);
     container.appendChild(panel);
@@ -889,7 +838,7 @@ function jumpToBreadcrumb(i) {
   BREADCRUMBS = BREADCRUMBS.slice(0, i + 1);
   focus(target.id, true);
 }
-// Escape steps back one crumb (console.js's own keydown handler calls this when the board
+// Escape steps back one crumb (console.js's own keydown handler calls this when browse
 // is the active surface and there's somewhere to step back TO).
 function stepBackBreadcrumb() {
   if (BREADCRUMBS.length < 2) return false;
@@ -999,16 +948,6 @@ function primaryAction(id, type) { const a = actionsFor(type)[0]; if (a) a.run(i
 async function viewContent(id) { inspect(id); }
 async function tagIt(id) { const t = prompt('Tag:'); if (!t) return; await fetch('/objects/' + id + '/tags', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tag: t }) }); }
 
-let ACTIONMENU = null;
-function closeActionMenu() { if (ACTIONMENU) { ACTIONMENU.remove(); ACTIONMENU = null; } }
-function showActionMenu(x, y, id, type) {
-  closeActionMenu(); const acts = actionsFor(type); if (!acts.length) return;
-  const pop = document.createElement('div'); pop.className = 'pop'; pop.id = 'actionmenu'; pop.style.left = x + 'px'; pop.style.top = y + 'px'; pop.style.position = 'fixed';
-  pop.innerHTML = acts.map(a => '<div class="keyrow" style="cursor:pointer;padding:4px 0" onmousedown="closeActionMenu()" onclick="(' + a.run.toString() + ')(\'' + id + '\')">' + esc(a.label) + '</div>').join('');
-  document.body.appendChild(pop); ACTIONMENU = pop;
-  setTimeout(() => document.addEventListener('click', function h() { closeActionMenu(); document.removeEventListener('click', h); }), 0);
-}
-
 // ── Intake ───────────────────────────────────────────────────────────────────
 async function addSeed() { const raw = $('seed')?.value.trim(); if (!raw) return; try { const cases = await fetch('/cases').then(r => r.json()); const cid = cases.length ? cases[0].id : null; if (!cid) return; const r = await fetch('/cases/' + cid + '/intake', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ raw }) }).then(r => r.json()); if (r) { $('seedmsg').textContent = 'Added: ' + r.type; $('seed').value = ''; } } catch(e) {} }
 
@@ -1030,7 +969,9 @@ async function updatePulse() {
 const PANE = { l: { var: '--lw', min: 180, max: 640, def: 274 }, r: { var: '--rw', min: 220, max: 760, def: 350 } };
 function loadPanes() { for (const k of ['l','r']) { const v = localStorage.getItem('osiris.pane.' + k); if (v) $('main').style.setProperty(PANE[k].var, v + 'px'); } }
 function wireGrips() { const main = $('main'); document.querySelectorAll('[data-grip]').forEach(g => { g.onmousedown = e => { e.preventDefault(); const k = g.dataset.grip, cfg = PANE[k], rail = $(k === 'l' ? 'left' : 'right'); const start = e.clientX, w0 = rail.getBoundingClientRect().width; g.classList.add('on'); main.classList.add('dragging'); const move = ev => { const dw = (ev.clientX - start) * (k === 'l' ? 1 : -1); main.style.setProperty(cfg.var, Math.min(cfg.max, Math.max(cfg.min, w0 + dw)) + 'px'); }; const up = () => { g.classList.remove('on'); main.classList.remove('dragging'); localStorage.setItem('osiris.pane.' + k, parseFloat(main.style.getPropertyValue(cfg.var)) + ''); document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up); _afterResize(); }; document.addEventListener('mousemove', move); document.addEventListener('mouseup', up); }; }); }
-function _afterResize() { if (board && (ensureBoard()).resizeFit) setTimeout(() => (ensureBoard()).resizeFit(), 180); }
+// was the cytoscape board's own resizeFit — retired with the board itself (piece 3); the
+// space canvas already resizes itself via its own window "resize" listener.
+function _afterResize() {}
 function toggleLeft() { $('main').classList.toggle('lefthidden'); _afterResize(); }
 function toggleRight() { $('main').classList.toggle('righthidden'); _afterResize(); }
 
@@ -1068,7 +1009,7 @@ async function runTool(name) { await runComposition(name, {}, FOCUS); }
 
 async function runComposition(name, args, subject) {
   const container = $('result'); showPanel();
-  $('entity-taxonomy-bar').style.display = 'none'; $('viewsw').style.display = 'none';
+  $('entity-taxonomy-bar').style.display = 'none';
   try {
     setStatus('Running ' + name + '...');
     const isFunctionDrill = args && Object.keys(args).length > 0;
@@ -1078,7 +1019,7 @@ async function runComposition(name, args, subject) {
     if (res.error) { setStatus(res.error); container.innerHTML = '<div class="o-empty" style="padding:40px">' + esc(res.error) + '</div>'; return; }
     LAST_COMPOSITION_RUN = isFunctionDrill ? null : { name: res.composition || name, spec: res.spec };
     const panel = document.createElement('div'); panel.style.padding = '16px';
-    await Osiris.renderResult(res, { board: null, panel: panel }, Osiris.defaultView(res), null, null, null);
+    await Osiris.renderResult(res, { panel: panel }, Osiris.defaultView(res), null, null, null);
     container.innerHTML = '<div style="padding:8px 16px;display:flex;gap:8px">' +
       '<button class="iconbtn" onclick="switchSurface(\'browse\')">\u2190 Back to Browse</button>' +
       (LAST_COMPOSITION_RUN ? '<button class="iconbtn" onclick="forkComposition()">\u2942 Fork (save as)\u2026</button>' : '') +
@@ -1211,7 +1152,6 @@ function closePeek() { const o = $('peek'); o.className = 'peek-overlay'; o.inne
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
 Osiris.loadSchema().then(async function() {
-  ensureBoard();
   await Promise.all([loadProjects(), loadRooms(), loadObjectSet()]);
   var cur = await fetch('/console').then(function(r){return r.ok ? r.json() : null;}).catch(function(){return null;});
   await switchRoom((cur && cur.room_id) || '');
