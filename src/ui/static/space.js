@@ -73,6 +73,46 @@ function classOfEdgeType(type) {
   return STRUCTURAL_EDGE_TYPES.has(type) ? "structural" : "semantic";
 }
 
+// THE READING LAYER, part B (ruling c5953bb1): the curated provenance/evidence edge-type
+// allowlist a real FOCUS walks — the actual "long paths leading back and upstream" the
+// operator asked to see, as opposed to part A's structural containment edges, which never
+// widen a path. Pure, DOM-free module-level functions (not closures inside initSpace) so
+// the acceptance test Thoth's own dispatch named — "a synthetic 5-hop chain where focus at
+// the tail lights exactly the chain and nothing else" — can exercise the real algorithm
+// directly via Node, not a string-presence proof.
+export const PATH_EDGE_TYPES = new Set([
+  "possible_upstream", "cites", "derived_from", "spawned_by",
+  "succeeded_from", "supersedes", "resolves",
+]);
+export function buildPathAdjacency(edges) {
+  const outAdj = new Map(), inAdj = new Map(); // node id -> [neighbor ids]
+  for (const e of edges) {
+    if (!PATH_EDGE_TYPES.has(e.type)) continue;
+    if (!outAdj.has(e.source)) outAdj.set(e.source, []);
+    outAdj.get(e.source).push(e.target);
+    if (!inAdj.has(e.target)) inAdj.set(e.target, []);
+    inAdj.get(e.target).push(e.source);
+  }
+  return { outAdj, inAdj };
+}
+// bidirectional BFS, depth-limited (a widen control raises depth interactively rather than
+// a hardcoded ceiling) — Osiris convention: from_id = the dependent/newer fact, to_id =
+// what it points at, so "upstream" follows outAdj (X.source -> target) and "downstream...
+// over the same reversed" follows inAdj.
+export function walkPath(outAdj, inAdj, startId, depth) {
+  const seen = new Set([startId]);
+  let frontier = [startId];
+  for (let d = 0; d < depth && frontier.length; d++) {
+    const next = [];
+    for (const cur of frontier) {
+      for (const t of outAdj.get(cur) || []) { if (!seen.has(t)) { seen.add(t); next.push(t); } }
+      for (const t of inAdj.get(cur) || []) { if (!seen.has(t)) { seen.add(t); next.push(t); } }
+    }
+    frontier = next;
+  }
+  return seen;
+}
+
 // ---- GET /graph/stream wire decode (a JS twin of graph_stream.decode_snapshot) ---------
 // 4-byte LE uint32 header length, that many bytes of UTF-8 JSON header, then the raw arrays
 // back to back at the byte offsets the header's own `arrays` map names.
@@ -145,13 +185,15 @@ function resolveContainer(container) {
     upBtn: (container && container.upBtn) || byId("up-btn"),
     legendBtn: (container && container.legendBtn) || byId("legend-btn"),
     legendPanel: (container && container.legendPanel) || byId("legend-panel"),
+    backBtn: (container && container.backBtn) || byId("back-btn"),
+    widenBtn: (container && container.widenBtn) || byId("widen-btn"),
     onFocus: (container && container.onFocus) || null, // (id) => void, shares selection with the table
   };
 }
 
 export async function initSpace(container) {
   const { wrap, labelsEl, statusEl, levelBadge, searchInput, searchDd, rightRail, fitBtn, upBtn,
-    legendBtn, legendPanel, onFocus } =
+    legendBtn, legendPanel, backBtn, widenBtn, onFocus } =
     resolveContainer(container);
   function setStatus(text) { statusEl.textContent = text; }
 
@@ -256,8 +298,14 @@ export async function initSpace(container) {
   let mesh = null, pickMesh = null, edgeLines = null;
   let meshUniforms = null, pickUniforms = null;
   let idToNode = [];
-  let focusId = null;
-  let litIds = new Set();
+  // THE READING LAYER, part B: FOCUS = PATH LENS (ruling c5953bb1, Thoth DM 10596). SELECT
+  // (a plain click) and FOCUS (double-click, Enter, or the inspector's Focus button) are now
+  // two different acts — selectedId just shows the inspector; pathFocusId/pathReachable are
+  // the real path-lens state (only non-empty while an actual focus is active).
+  let selectedId = null;
+  let pathFocusId = null;
+  let pathReachable = new Set();
+  let focusStack = []; // ids, most recent last — back() pops, Escape/Clear focus wipes the overlay
 
   function disposeCurrent() {
     for (const m of [mesh, pickMesh, edgeLines]) {
@@ -512,18 +560,23 @@ export async function initSpace(container) {
     markDirty();
   }
 
-  // click = HIGHLIGHT, never a data change: dim everything except the focused node + its
-  // lit neighborhood (empty litIds = nothing dimmed, the normal unfocused view).
+  // SELECT (a plain click) never dims the graph — only FOCUS does, and only focus dims
+  // "to near invisible" (ruling c5953bb1's own wording, stronger than the old 0.12 factor):
+  // a real path lens has to actually read as a lens, not a faint tint.
+  const FOCUS_DIM_FACTOR = 0.03;
   function applyDim() {
     if (!mesh) return;
     const color = new THREE.Color();
-    const dimmed = litIds.size > 0 || focusId;
+    const focused = !!pathFocusId;
     for (let i = 0; i < idToNode.length; i++) {
       const nd = idToNode[i];
       color.set(typeColors.get(nd.type) || "#6e7681");
-      if (dimmed && nd.id !== focusId && !litIds.has(nd.id)) {
-        color.multiplyScalar(0.12); // dim hard — colour as signal, not decoration
-      } else if (nd.id === focusId) {
+      if (focused) {
+        if (nd.id === pathFocusId) color.set("#58a6ff");
+        else if (!pathReachable.has(nd.id)) color.multiplyScalar(FOCUS_DIM_FACTOR);
+        // else: reachable-but-not-focused nodes keep their normal type colour — still
+        // legible as part of the path, the focused node alone gets the accent colour.
+      } else if (nd.id === selectedId) {
         color.set("#58a6ff");
       }
       mesh.instanceColor.setXYZ(i, color.r, color.g, color.b);
@@ -587,7 +640,7 @@ export async function initSpace(container) {
       pendingRebuild = false;
       nodes = Array.from(nodesById.values());
       buildScene(nodes, edges);
-      if (focusId) applyDim();
+      if (pathFocusId || selectedId) applyDim();
       setStatus(`${nodes.length} objects, ${edges.length} edges (live)`);
     }, 250);
   }
@@ -609,55 +662,59 @@ export async function initSpace(container) {
     console.error("graph/stream/deltas unavailable", err);
   }
 
-  // "highlight nodes all the way upstream" — walked CLIENT-SIDE off the already-loaded
-  // edge list (the whole-graph load makes this free: no new endpoint). Osiris convention
-  // is from_id = the dependent/newer fact, to_id = what it points at (grounds/cites/
-  // spawned_by/etc all read this way) — so upstream from X follows OUTGOING edges
-  // (X.source -> target), repeated until nothing new turns up. Capped so one hyper-
-  // connected node can't pull in a meaningful fraction of the whole graph.
-  const outAdj = new Map(); // node id -> [target ids]
-  for (const e of edges) {
-    if (!outAdj.has(e.source)) outAdj.set(e.source, []);
-    outAdj.get(e.source).push(e.target);
-  }
-  const UPSTREAM_CAP = 400;
-  function walkUpstream(startId) {
-    const seen = new Set([startId]);
-    const frontier = [startId];
-    while (frontier.length && seen.size < UPSTREAM_CAP) {
-      const cur = frontier.shift();
-      for (const t of outAdj.get(cur) || []) {
-        if (seen.has(t)) continue;
-        seen.add(t);
-        frontier.push(t);
-        if (seen.size >= UPSTREAM_CAP) break;
-      }
-    }
-    return seen;
-  }
+  // THE READING LAYER, part B: the PATH — walked CLIENT-SIDE off the already-loaded edge
+  // list, over a curated allowlist of provenance/evidence link types only (ruling c5953bb1's
+  // own list) — structural containment (in_repo, works_in, ...) never widens a path, that's
+  // exactly what part A excludes from "what a reader is tracing". Osiris convention: from_id
+  // = the dependent/newer fact, to_id = what it points at — "upstream" from X follows
+  // OUTGOING edges (X.source -> target); "downstream... over the same reversed" follows
+  // INCOMING edges. Both directions, one BFS, depth-limited (not count-capped like the old
+  // walkUpstream) with a widen control (focusDepth) instead of a hardcoded ceiling.
+  // buildPathAdjacency/walkPath are pure, DOM-free, module-level functions (below the
+  // module docstring) precisely so THE ACCEPTANCE TEST Thoth's own dispatch named — "a
+  // synthetic 5-hop chain where focus at the tail lights exactly the chain and nothing
+  // else" — can exercise the real algorithm directly via Node, not a string-presence proof.
+  const FOCUS_DEPTH_DEFAULT = 4;
+  let focusDepth = FOCUS_DEPTH_DEFAULT;
+  const { outAdj: outAdjPath, inAdj: inAdjPath } = buildPathAdjacency(edges);
 
-  // a second, brighter LineSegments drawn OVER the dim base edges — only edges strictly
-  // between two currently-lit nodes, so the focus's own provenance chain visually pops
-  // instead of reading as the same grey wash as everything else.
-  let highlightEdges = null;
-  function updateHighlightEdges() {
-    if (highlightEdges) { scene.remove(highlightEdges); highlightEdges.geometry.dispose(); highlightEdges.material.dispose(); highlightEdges = null; }
+  // a second LineSegments drawn OVER the dim base edges: the reachable PATH edges (bright,
+  // WITH DIRECTION — a vertex-colour gradient, brighter at the source/dependent end, dimmer
+  // at the target/depended-on end, per Osiris's own from_id->to_id convention) plus, per
+  // ruling c5953bb1, "the focused object's structural edges draw on focus only" — the
+  // focused node's own containment (which project, which agent) becomes visible exactly
+  // because it's focused, even though part A hides structural edges at rest.
+  let pathHighlightEdges = null;
+  const PATH_EDGE_BRIGHT = new THREE.Color(0x58a6ff);
+  const PATH_EDGE_DIM = new THREE.Color(0x58a6ff).multiplyScalar(0.35);
+  function updatePathEdges() {
+    if (pathHighlightEdges) {
+      scene.remove(pathHighlightEdges);
+      pathHighlightEdges.geometry.dispose();
+      pathHighlightEdges.material.dispose();
+      pathHighlightEdges = null;
+    }
     markDirty();
-    if (!litIds.size) return;
-    const idx = new Map(idToNode.map((nd, i) => [nd.id, nd]));
-    const pos = [];
+    if (!pathFocusId) return;
+    const idx = new Map(idToNode.map((nd) => [nd.id, nd]));
+    const pos = [], col = [];
     for (const e of edges) {
-      if (!litIds.has(e.source) || !litIds.has(e.target)) continue;
+      const onPath = PATH_EDGE_TYPES.has(e.type) && pathReachable.has(e.source) && pathReachable.has(e.target);
+      const structuralOfFocus = e.edgeClass === "structural" && (e.source === pathFocusId || e.target === pathFocusId);
+      if (!onPath && !structuralOfFocus) continue;
       const a = idx.get(e.source), b = idx.get(e.target);
       if (!a || !b) continue;
       pos.push(a.x || 0, a.y || 0, -0.05, b.x || 0, b.y || 0, -0.05);
+      col.push(PATH_EDGE_BRIGHT.r, PATH_EDGE_BRIGHT.g, PATH_EDGE_BRIGHT.b,
+        PATH_EDGE_DIM.r, PATH_EDGE_DIM.g, PATH_EDGE_DIM.b);
     }
     if (!pos.length) return;
     const geo = new THREE.BufferGeometry();
     geo.setAttribute("position", new THREE.Float32BufferAttribute(new Float32Array(pos), 3));
-    highlightEdges = new THREE.LineSegments(
-      geo, new THREE.LineBasicMaterial({ color: 0x58a6ff, transparent: true, opacity: 0.8 }));
-    scene.add(highlightEdges);
+    geo.setAttribute("color", new THREE.Float32BufferAttribute(new Float32Array(col), 3));
+    pathHighlightEdges = new THREE.LineSegments(
+      geo, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.85 }));
+    scene.add(pathHighlightEdges);
   }
 
   // ---- pan + zoom — LOOKING ONLY, never changes what's loaded ------------------------
@@ -760,17 +817,27 @@ export async function initSpace(container) {
     return id === 0 ? null : idToNode[id - 1];
   }
 
+  // click = SELECT (inspector only, no dim, no camera move); dblclick/Enter/the inspector's
+  // own Focus button = the real path lens (focusObject, below). A plain click also clears
+  // any active focus overlay first — a fresh inspection supersedes the last path, only the
+  // explicit Back/Escape acts are about navigating the focus history itself.
   renderer.domElement.addEventListener("click", (ev) => {
     if (dragDistance > CLICK_SLOP_PX) return; // the trailing click after a real pan/drag
     const hit = pickAt(ev.clientX, ev.clientY);
-    if (hit) focusObject(hit.id);
+    if (hit) selectObject(hit.id);
     else clearFocus();
+  });
+  renderer.domElement.addEventListener("dblclick", (ev) => {
+    const hit = pickAt(ev.clientX, ev.clientY);
+    if (hit) focusObject(hit.id);
   });
 
   function clearFocus() {
-    focusId = null; litIds = new Set();
+    selectedId = null;
+    pathFocusId = null;
+    pathReachable = new Set();
     applyDim();
-    updateHighlightEdges();
+    updatePathEdges();
     rightRail.className = "rail";
     rightRail.innerHTML =
       '<div class="insp-empty" id="insp"><div style="font-weight:700;font-size:13px;' +
@@ -780,26 +847,62 @@ export async function initSpace(container) {
     if (onFocus) onFocus(null); // shares the clear with an embedding table (console.js)
   }
 
+  // SELECT: inspector only, no dim, no camera move, no path walk — the lightweight act.
+  async function selectObject(id) {
+    selectedId = id;
+    pathFocusId = null;
+    pathReachable = new Set();
+    if (onFocus) onFocus(id);
+    applyDim();
+    updatePathEdges();
+    await inspect(id);
+  }
+
   fitBtn.addEventListener("click", () => {
     fitToNodes(idToNode);
     scheduleLabelPick();
   });
   upBtn.addEventListener("click", clearFocus);
+  if (backBtn) backBtn.addEventListener("click", goBack);
+  if (widenBtn) widenBtn.addEventListener("click", () => {
+    focusDepth = Math.min(focusDepth + 1, 20);
+    if (pathFocusId) focusObject(pathFocusId, { skipStackPush: true, depth: focusDepth });
+  });
 
-  // ---- focus = HIGHLIGHT, never a reload (inspector stays HTML) ---------------------
-  async function focusObject(id) {
-    focusId = id;
-    litIds = walkUpstream(id);
+  function pushFocusStack(id) {
+    if (focusStack[focusStack.length - 1] === id) return;
+    focusStack.push(id);
+    if (focusStack.length > 50) focusStack.shift();
+  }
+  function goBack() {
+    if (focusStack.length < 2) { clearFocus(); return; }
+    focusStack.pop(); // the current focus
+    const prev = focusStack[focusStack.length - 1];
+    focusObject(prev, { skipStackPush: true });
+  }
+
+  // ---- FOCUS = PATH LENS (ruling c5953bb1): walks upstream+downstream over the curated
+  // provenance edge types, dims everything unreachable to near invisible, draws the
+  // reachable path bright with direction, fits the camera to the reachable set, labels the
+  // path, reveals the focused object's own structural edges. Never a data reload — the
+  // whole graph is already loaded, this only ever changes what's highlighted.
+  async function focusObject(id, opts) {
+    const options = opts || {};
+    selectedId = id;
+    pathFocusId = id;
+    focusDepth = options.depth || FOCUS_DEPTH_DEFAULT;
+    pathReachable = walkPath(outAdjPath, inAdjPath, id, focusDepth);
+    if (!options.skipStackPush) pushFocusStack(id);
     if (onFocus) onFocus(id); // shares the selection with an embedding table (console.js)
 
-    // zoom-to-fit: frame the camera around exactly the lit set's own bounding box (padded),
-    // not a fixed small viewSize centered on the click — "zooming them to where they make
-    // sense," per the operator. A single-node upstream (nothing else lit) still gets a
-    // sane close-in view rather than a zero-size frustum.
+    // zoom-to-fit: frame the camera around exactly the reachable set's own bounding box
+    // (padded), not a fixed small viewSize centered on the click — "zooming them to where
+    // they make sense," per the operator. A single-node path (nothing else reachable) still
+    // gets a sane close-in view rather than a zero-size frustum.
     const idx = new Map(idToNode.map((nd) => [nd.id, nd]));
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-    for (const litId of litIds) {
-      const nd = idx.get(litId);
+    for (const rid of pathReachable) {
+      const nd = idx.get(rid);
       if (!nd || nd.x == null || nd.y == null) continue;
       minX = Math.min(minX, nd.x); maxX = Math.max(maxX, nd.x);
       minY = Math.min(minY, nd.y); maxY = Math.max(maxY, nd.y);
@@ -811,15 +914,16 @@ export async function initSpace(container) {
       // padding + a sane floor/ceiling — the ceiling rides maxViewSize (the real fitted
       // graph's own extent, set in fitToNodes) rather than a hardcoded 1300: the same class
       // of stale-constant bug Thoth caught in the wheel clamp (mail 10581) would otherwise
-      // clip a legitimately wide-spread upstream chain back down to a fixed small view.
+      // clip a legitimately wide-spread path back down to a fixed small view.
       viewSize = Math.max(30, Math.min(maxViewSize, span * 1.6 + 40));
       updateFrustum();
       rescaleForZoom();
     }
 
     applyDim();
-    updateHighlightEdges();
-    setStatus(`focused: ${litIds.size} upstream (capped at ${UPSTREAM_CAP})`);
+    updatePathEdges();
+    if (widenBtn) widenBtn.textContent = `Widen (${focusDepth})`;
+    setStatus(`focused: ${pathReachable.size} reachable within ${focusDepth} hops`);
     scheduleLabelPick();
     markDirty();
     await inspect(id);
@@ -829,9 +933,30 @@ export async function initSpace(container) {
     const obj = await fetch(`/objects/${id}`).then((r) => r.json());
     rightRail.className = "rail";
     rightRail.innerHTML = Osiris.objectDetail(obj, "");
+    // the inspector's own Focus button — one of the three ways to trigger a real focus
+    // (ruling c5953bb1: double-click, Enter, or this button).
+    const focusBtn = document.createElement("button");
+    focusBtn.className = "iconbtn";
+    focusBtn.textContent = pathFocusId === id ? "Focused" : "Focus";
+    focusBtn.style.cssText = "margin-bottom:10px";
+    focusBtn.addEventListener("click", () => focusObject(id));
+    rightRail.prepend(focusBtn);
+    // every object reference in the inspector (upstream_ids, readers, links) walks the
+    // focus — ruling c5953bb1's own "harmony" requirement, part C, but the wiring lives
+    // here since it's the same click-through this inspector has always used.
     const relsEl = rightRail.querySelector("[data-rels]");
     if (relsEl) await Osiris.loadRels(relsEl, id, (pickId) => focusObject(pickId), () => {});
   }
+
+  // Enter focuses the currently selected node (ruling c5953bb1's own second trigger) —
+  // guarded the same way console.js's own keydown handler guards Ctrl+K/Escape, never
+  // firing while a real text field has focus.
+  window.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter") return;
+    const tag = document.activeElement && document.activeElement.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+    if (selectedId) focusObject(selectedId);
+  });
 
   // ---- search (stays HTML) -----------------------------------------------------------
   let searchTimer = null, searchToken = 0;
@@ -886,7 +1011,7 @@ export async function initSpace(container) {
   function pickLabels() {
     const cx = camera.position.x, cy = camera.position.y;
     const n = Math.max(10, Math.round(N_LABELS - (viewSize / 2000) * 30));
-    const pool = litIds.size ? idToNode.filter((nd) => nd.id === focusId || litIds.has(nd.id)) : idToNode;
+    const pool = pathFocusId ? idToNode.filter((nd) => pathReachable.has(nd.id)) : idToNode;
     labeledNodes = pool
       .map((nd) => ({ nd, d: (nd.x - cx) ** 2 + (nd.y - cy) ** 2 }))
       .sort((a, b) => a.d - b.d)
@@ -934,7 +1059,7 @@ export async function initSpace(container) {
       _v.set(nd.x || 0, nd.y || 0, 0).project(camera);
       const x = (_v.x * 0.5 + 0.5) * wrap.clientWidth;
       const y = (-_v.y * 0.5 + 0.5) * wrap.clientHeight;
-      const lit = nd.id === focusId || litIds.has(nd.id);
+      const lit = nd.id === pathFocusId || pathReachable.has(nd.id) || nd.id === selectedId;
       // lit/focused labels always win their spot (never declutter the thing you asked to
       // see); ordinary labels yield to anything already placed.
       if (!lit && overlapsPlaced(x, y)) { div.hidden = true; continue; }
@@ -955,8 +1080,11 @@ export async function initSpace(container) {
   markDirty();
 
   const api = {
-    focusObject, clearFocus, inspect, pause, resume,
+    focusObject, selectObject, clearFocus, inspect, pause, resume, goBack,
     get idToNode() { return idToNode; },
+    get pathReachable() { return pathReachable; },
+    get pathFocusId() { return pathFocusId; },
+    get selectedId() { return selectedId; },
     camera, pickAt, mesh: () => mesh, worldPerPx, nodeRadiusPx, renderer,
     // debug/test hooks only (same convention as window.__space always being exposed) —
     // zoomAt bypasses the rAF-coalesced wheel path for direct exercise; forceRender skips

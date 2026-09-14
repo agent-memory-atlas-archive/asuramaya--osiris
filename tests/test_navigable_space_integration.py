@@ -75,8 +75,12 @@ def test_space_onfocus_hook_repaints_the_table_selection() -> None:
 
 
 def test_a_table_row_click_highlights_the_canvas_too() -> None:
+    # THE READING LAYER, part B (ruling c5953bb1) split click into SELECT vs FOCUS -- a
+    # table row click is a plain select now (see test_reading_layer_focus_path.py's own
+    # test_table_row_clicks_select_not_focus for the fuller story), still sharing selection
+    # with the canvas, just no longer forcing the whole path-lens dim/zoom.
     body = _CONSOLE_JS.split("function inspectOnly(id)", 1)[1].split("\n}\n", 1)[0]
-    assert "window.OsirisSpace.focusObject(id)" in body
+    assert "window.OsirisSpace.selectObject(id)" in body
 
 
 def test_search_around_and_omni_picks_delegate_to_the_mounted_space_instance() -> None:
