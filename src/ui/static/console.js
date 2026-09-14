@@ -45,10 +45,12 @@ async function switchSurface(surface) {
   if (surface === 'browse') {
     $('entity-taxonomy-bar').style.display = 'flex';
     showBoard(); // the space canvas (#cy) + browse's own table drawer, never the shared #result panel
+    if (window.OsirisSpace) window.OsirisSpace.resume(); // render-on-demand (mail 10581): don't render an invisible canvas
     if (!SET.length) await loadObjectSet(); renderEntityExplorer();
   } else {
     $('entity-taxonomy-bar').style.display = 'none';
     (ensureBoard()).clear(); showPanel();
+    if (window.OsirisSpace) window.OsirisSpace.pause();
     if (surface === 'mailbox') renderMailbox();
     if (surface === 'pane') renderPane();
     if (surface === 'projects') renderProjects();

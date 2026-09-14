@@ -124,12 +124,17 @@ export async function initSpace(container) {
   const typeColors = await loadTypeColors();
 
   // ---- renderer / scene / camera -----------------------------------------------------
-  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  // pixel ratio capped at 1.5 and antialias only below/at native DPR (Thoth's own live
+  // measurement on an Iris Xe box, mail 10581): AA is a real GPU cost that scales with
+  // resolution, and stacking it on top of an already-high device pixel ratio was part of
+  // what made a real laptop GPU choke on this scene.
+  const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+  const renderer = new THREE.WebGLRenderer({ antialias: dpr <= 1 });
   // three.js's ColorManagement converts every hex colour (THREE.Color.set('#8ab4f8')) from
   // sRGB into LINEAR space internally — without this, the renderer displays those linear
   // values as-is, reading systematically darker than the real colour.
   renderer.outputColorSpace = THREE.SRGBColorSpace;
-  renderer.setPixelRatio(window.devicePixelRatio || 1);
+  renderer.setPixelRatio(dpr);
   renderer.setSize(wrap.clientWidth, wrap.clientHeight);
   wrap.appendChild(renderer.domElement);
 
@@ -141,8 +146,13 @@ export async function initSpace(container) {
   // placement, piece A) and is NOT a fixed constant — a project-center hash can land
   // anywhere; fitToNodes() (below) frames the camera from the real loaded bbox instead of
   // a guessed number the moment the first snapshot lands, and Fit re-measures live rather
-  // than resetting to a stale guess.
+  // than resetting to a stale guess. minViewSize/maxViewSize (Thoth's own live-verified fix,
+  // mail 10581) are likewise derived from the real fitted bbox, not the old hardcoded
+  // [8, 2000] clamp — that clamp predated the deterministic layout and let one wheel tick
+  // snap a 259,779-unit-wide view down to 2,862 (a 90x jump into a single dense cluster,
+  // read by the operator as "zoom does not work").
   let viewSize = 1300;
+  let minViewSize = 20, maxViewSize = 2000;
   const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
   camera.position.set(0, 0, 5);
   camera.lookAt(0, 0, 0);
@@ -158,9 +168,58 @@ export async function initSpace(container) {
   window.addEventListener("resize", () => {
     renderer.setSize(wrap.clientWidth, wrap.clientHeight);
     updateFrustum();
+    markDirty();
   });
 
+  // ---- render ON DEMAND (Thoth's own live measurement, mail 10581): the render loop used
+  // to run every frame forever (rAF plus a 50ms setTimeout fallback), even when browse
+  // isn't the active surface or the tab is hidden — pure waste, and on top of the
+  // per-wheel-event instance-buffer rewrite this fix removes below, it compounded into the
+  // "super fried" report. Now a frame only renders when something actually changed
+  // (camera move, data, focus, label pick); the loop stops scheduling itself entirely once
+  // idle rather than polling at 20fps forever.
+  let dirty = true, running = true, rafPending = false;
+  function markDirty() {
+    dirty = true;
+    if (!running || rafPending) return;
+    rafPending = true;
+    requestAnimationFrame(renderIfDirty);
+  }
+  function renderIfDirty() {
+    rafPending = false;
+    if (!running || !dirty) return;
+    renderer.render(scene, camera);
+    positionLabels();
+    dirty = false;
+  }
+  function pause() { running = false; }
+  function resume() { running = true; markDirty(); }
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) pause(); else resume();
+  });
+
+  // WebGL context loss (Thoth's own live report: the first load in her tab was refused
+  // outright, "Web page caused context loss and was blocked", and a later tab vanished —
+  // a GPU reset Chrome then blocks the page from reusing). preventDefault on loss keeps the
+  // browser from tearing the canvas down permanently; rebuild GPU resources on restore
+  // instead of leaving a dead black canvas or crashing the tab.
+  renderer.domElement.addEventListener("webglcontextlost", (ev) => {
+    ev.preventDefault();
+    pause();
+    setStatus("WebGL context lost — recovering…");
+  }, false);
+  renderer.domElement.addEventListener("webglcontextrestored", () => {
+    setStatus("WebGL context restored — rebuilding…");
+    if (idToNode.length) {
+      buildScene(idToNode, edges);
+      fitToNodes(idToNode);
+      setStatus(`${idToNode.length} objects, ${edges.length} edges (recovered)`);
+    }
+    resume();
+  }, false);
+
   let mesh = null, pickMesh = null, edgeLines = null;
+  let meshUniforms = null, pickUniforms = null;
   let idToNode = [];
   let focusId = null;
   let litIds = new Set();
@@ -198,6 +257,33 @@ export async function initSpace(container) {
   function nodeRadiusPx(nd) { return CATEGORY_BASE_PX[categoryOf(nd)] * degreeFactor(nd); }
   function worldPerPx() { return viewSize / wrap.clientHeight; }
 
+  // SCREEN-CONSTANT SIZE ON THE GPU (Thoth's own live measurement, mail 10581): a node's
+  // pixel radius must stay constant across zoom, but rewriting 49,019 instance matrices
+  // (getMatrixAt/decompose/setMatrixAt on BOTH meshes, two ~3MB buffer re-uploads) on every
+  // single wheel event measured at 18.6ms JS for one tick — a real scroll gesture is 20-60
+  // events, so seconds of main-thread stall plus a GPU upload storm per scroll. Fixed by
+  // moving the per-frame-varying part (worldPerPx) into a material uniform and the
+  // per-node-but-frame-CONSTANT part (radiusPx) into a static instanced attribute: the
+  // vertex shader multiplies them together at draw time, so a zoom step touches exactly one
+  // float per material (two total) no matter how many nodes are on screen, and the instance
+  // matrices only ever hold translation (+ the existing degree z-bias), set once at build
+  // time and never rewritten again until the data itself changes.
+  function makeInstancedCircleMaterial() {
+    const uniforms = { uWorldPerPx: { value: worldPerPx() } };
+    const mat = new THREE.MeshBasicMaterial({ vertexColors: true });
+    mat.onBeforeCompile = (shader) => {
+      shader.uniforms.uWorldPerPx = uniforms.uWorldPerPx;
+      shader.vertexShader =
+        "attribute float aRadiusPx;\nuniform float uWorldPerPx;\n" + shader.vertexShader;
+      shader.vertexShader = shader.vertexShader.replace(
+        "#include <begin_vertex>",
+        "#include <begin_vertex>\n\ttransformed *= (aRadiusPx * uWorldPerPx);"
+      );
+    };
+    mat.customProgramCacheKey = () => "circleInstancedUniformScale";
+    return { material: mat, uniforms };
+  }
+
   function buildScene(nodes, edges) {
     disposeCurrent();
     idToNode = nodes;
@@ -210,27 +296,35 @@ export async function initSpace(container) {
     // without this, rendering flat black regardless of instanceColor.
     geo.setAttribute("color", new THREE.Float32BufferAttribute(
       new Float32Array(geo.attributes.position.count * 3).fill(1), 3));
-    const mat = new THREE.MeshBasicMaterial({ vertexColors: true });
+    const radiusAttr = new THREE.InstancedBufferAttribute(new Float32Array(Math.max(n, 1)), 1);
+    geo.setAttribute("aRadiusPx", radiusAttr); // shared by mesh + pickMesh, same geometry instance
+
+    const built = makeInstancedCircleMaterial();
+    const mat = built.material;
+    meshUniforms = built.uniforms;
     mesh = new THREE.InstancedMesh(geo, mat, Math.max(n, 1));
     mesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(Math.max(n, 1) * 3), 3);
 
-    const pickMat = new THREE.MeshBasicMaterial({ vertexColors: true });
+    const builtPick = makeInstancedCircleMaterial();
+    const pickMat = builtPick.material;
+    pickUniforms = builtPick.uniforms;
     pickMesh = new THREE.InstancedMesh(geo, pickMat, Math.max(n, 1));
     pickMesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(Math.max(n, 1) * 3), 3);
 
     const dummy = new THREE.Object3D();
     const color = new THREE.Color();
     const idColor = new THREE.Color();
-    const wpp = worldPerPx();
     for (let i = 0; i < n; i++) {
       const nd = nodes[i];
       nd.radiusPx = nodeRadiusPx(nd);
+      radiusAttr.setX(i, nd.radiusPx);
       // "sizing more intuitive where high-degree nodes stand out without obfuscating
       // smaller nodes" — a bigger circle can still sit BEHIND a smaller one drawn later
       // in the same z-plane; give every node a tiny z bias proportional to its own radius
       // so the important (bigger) ones are always nearer the camera and never occluded.
+      // Scale stays 1 here deliberately — the shader (aRadiusPx * uWorldPerPx) owns sizing.
       dummy.position.set(nd.x || 0, nd.y || 0, nd.radiusPx * 0.002);
-      dummy.scale.setScalar(nd.radiusPx * wpp);
+      dummy.scale.setScalar(1);
       dummy.updateMatrix();
       mesh.setMatrixAt(i, dummy.matrix);
       pickMesh.setMatrixAt(i, dummy.matrix);
@@ -240,6 +334,7 @@ export async function initSpace(container) {
       idColor.setRGB((id & 0xff) / 255, ((id >> 8) & 0xff) / 255, ((id >> 16) & 0xff) / 255);
       pickMesh.instanceColor.setXYZ(i, idColor.r, idColor.g, idColor.b);
     }
+    radiusAttr.needsUpdate = true;
     mesh.instanceMatrix.needsUpdate = true;
     pickMesh.instanceMatrix.needsUpdate = true;
     scene.add(mesh);
@@ -271,6 +366,7 @@ export async function initSpace(container) {
     scene.add(edgeLines);
     applyDim();
     updateEdgeStyle();
+    markDirty();
   }
 
   // edges thin and fade with zoom-out — legible up close, never a solid mesh of lines once
@@ -300,6 +396,7 @@ export async function initSpace(container) {
       mesh.instanceColor.setXYZ(i, color.r, color.g, color.b);
     }
     mesh.instanceColor.needsUpdate = true;
+    markDirty();
   }
 
   async function loadTypeColors() {
@@ -326,8 +423,14 @@ export async function initSpace(container) {
     camera.position.y = (minY + maxY) / 2;
     const span = Math.max(maxX - minX, maxY - minY, 0);
     viewSize = Math.max(30, span * 1.1 + 40);
+    // the wheel clamp's own bounds (Thoth's fix, mail 10581) — derived from THIS fit's real
+    // span, not a guess: a floor small enough to inspect one dense cluster, a ceiling about
+    // 2x the whole fitted graph so "zoom out" can't run away past anything meaningful.
+    minViewSize = 20;
+    maxViewSize = Math.max(span * 2, 200);
     updateFrustum();
     rescaleForZoom();
+    markDirty();
   }
 
   setStatus("loading the whole graph…");
@@ -406,6 +509,7 @@ export async function initSpace(container) {
   let highlightEdges = null;
   function updateHighlightEdges() {
     if (highlightEdges) { scene.remove(highlightEdges); highlightEdges.geometry.dispose(); highlightEdges.material.dispose(); highlightEdges = null; }
+    markDirty();
     if (!litIds.size) return;
     const idx = new Map(idToNode.map((nd, i) => [nd.id, nd]));
     const pos = [];
@@ -444,38 +548,58 @@ export async function initSpace(container) {
     const wpy = (camera.top - camera.bottom) / wrap.clientHeight;
     camera.position.x -= dx * wpx;
     camera.position.y += dy * wpy;
-    // no scheduleLabelUpdate() here — label POSITIONS track every render frame now (see
-    // the render loop below); only WHICH labels show is still debounced (scheduleLabelPick)
+    // no scheduleLabelUpdate() here — label POSITIONS are repainted on every render this
+    // markDirty() triggers (render-on-demand, see the loop below); only WHICH labels show
+    // is still debounced (scheduleLabelPick).
+    markDirty();
     scheduleLabelPick();
   });
 
+  // O(1) regardless of node count now — sizing lives in the shader (aRadiusPx * uniform,
+  // see makeInstancedCircleMaterial), so a zoom step only ever writes two floats (the draw
+  // mesh's and pick mesh's own uWorldPerPx) instead of rewriting 49,019 instance matrices.
   function rescaleForZoom() {
-    if (!mesh || !idToNode.length) return;
     const wpp = worldPerPx();
-    const dummy = new THREE.Object3D();
-    const m = new THREE.Matrix4();
-    for (let i = 0; i < idToNode.length; i++) {
-      const nd = idToNode[i];
-      mesh.getMatrixAt(i, m);
-      m.decompose(dummy.position, dummy.quaternion, dummy.scale);
-      dummy.scale.setScalar(nd.radiusPx * wpp);
-      dummy.updateMatrix();
-      mesh.setMatrixAt(i, dummy.matrix);
-      pickMesh.setMatrixAt(i, dummy.matrix);
-    }
-    mesh.instanceMatrix.needsUpdate = true;
-    pickMesh.instanceMatrix.needsUpdate = true;
+    if (meshUniforms) meshUniforms.uWorldPerPx.value = wpp;
+    if (pickUniforms) pickUniforms.uWorldPerPx.value = wpp;
     updateEdgeStyle();
   }
 
+  // wheel = LOOKING ONLY, cursor-anchored (Thoth's own live fix, mail 10581 item 5: "zoom
+  // is not anchored at the cursor"), coalesced to one update per animation frame no matter
+  // how many wheel events land in that frame (a real trackpad/mouse burst is 20-60 events —
+  // each one used to trigger its own full rescale; now each just accumulates a delta, and
+  // ONE zoomAt() runs per frame).
+  let pendingWheelDelta = 0, wheelClientX = 0, wheelClientY = 0, wheelRafPending = false;
+  function zoomAt(clientX, clientY, deltaY) {
+    const rect = wrap.getBoundingClientRect();
+    const nx = rect.width ? (clientX - rect.left) / rect.width : 0.5;
+    const ny = rect.height ? (clientY - rect.top) / rect.height : 0.5;
+    const worldX = camera.position.x + THREE.MathUtils.lerp(camera.left, camera.right, nx);
+    const worldY = camera.position.y + THREE.MathUtils.lerp(camera.top, camera.bottom, ny);
+    viewSize = Math.max(minViewSize, Math.min(maxViewSize, viewSize * Math.exp(deltaY * 0.001)));
+    updateFrustum();
+    // re-anchor: keep the same world point under the cursor after the frustum resize.
+    camera.position.x = worldX - THREE.MathUtils.lerp(camera.left, camera.right, nx);
+    camera.position.y = worldY - THREE.MathUtils.lerp(camera.top, camera.bottom, ny);
+    rescaleForZoom();
+    scheduleLabelPick();
+    markDirty();
+  }
+  function applyPendingWheel() {
+    wheelRafPending = false;
+    if (pendingWheelDelta === 0) return;
+    const deltaY = pendingWheelDelta;
+    pendingWheelDelta = 0;
+    zoomAt(wheelClientX, wheelClientY, deltaY);
+  }
   renderer.domElement.addEventListener(
     "wheel",
     (ev) => {
       ev.preventDefault();
-      viewSize = Math.max(8, Math.min(2000, viewSize * Math.exp(ev.deltaY * 0.001)));
-      updateFrustum();
-      rescaleForZoom();
-      scheduleLabelPick();
+      pendingWheelDelta += ev.deltaY;
+      wheelClientX = ev.clientX; wheelClientY = ev.clientY;
+      if (!wheelRafPending) { wheelRafPending = true; requestAnimationFrame(applyPendingWheel); }
     },
     { passive: false }
   );
@@ -549,7 +673,11 @@ export async function initSpace(container) {
       camera.position.x = (minX + maxX) / 2;
       camera.position.y = (minY + maxY) / 2;
       const span = Math.max(maxX - minX, maxY - minY, 0);
-      viewSize = Math.max(30, Math.min(1300, span * 1.6 + 40)); // padding + a sane floor/ceiling
+      // padding + a sane floor/ceiling — the ceiling rides maxViewSize (the real fitted
+      // graph's own extent, set in fitToNodes) rather than a hardcoded 1300: the same class
+      // of stale-constant bug Thoth caught in the wheel clamp (mail 10581) would otherwise
+      // clip a legitimately wide-spread upstream chain back down to a fixed small view.
+      viewSize = Math.max(30, Math.min(maxViewSize, span * 1.6 + 40));
       updateFrustum();
       rescaleForZoom();
     }
@@ -558,6 +686,7 @@ export async function initSpace(container) {
     updateHighlightEdges();
     setStatus(`focused: ${litIds.size} upstream (capped at ${UPSTREAM_CAP})`);
     scheduleLabelPick();
+    markDirty();
     await inspect(id);
   }
 
@@ -642,9 +771,11 @@ export async function initSpace(container) {
       labelsEl.appendChild(div);
       labelDivs.set(nd, div);
     }
+    markDirty(); // newly (un)labeled divs need one more positionLabels() pass to place them
   }
-  // runs every render frame — cheap (one project() + style write per already-chosen label,
-  // no sort, no DOM create/destroy) so labels track the scene with zero perceptible lag.
+  // runs on every render (render-on-demand now, not an unconditional per-frame loop — see
+  // below) — cheap (one project() + style write per already-chosen label, no sort, no DOM
+  // create/destroy) so labels track the scene with zero perceptible lag whenever it fires.
   // DECLUTTER: "present text without it looking like garbage" — labeledNodes is already
   // nearest-to-camera-first (from pickLabels' own sort), so a plain greedy pass — show a
   // label unless its screen box would overlap one already placed this frame — keeps the
@@ -680,25 +811,22 @@ export async function initSpace(container) {
     }
   }
 
-  // ---- render loop ---------------------------------------------------------------------
-  function schedule(cb) {
-    let done = false;
-    const rafId = requestAnimationFrame(() => { if (!done) { done = true; cb(); } });
-    const toId = setTimeout(() => { if (!done) { done = true; cancelAnimationFrame(rafId); cb(); } }, 50);
-    return () => { cancelAnimationFrame(rafId); clearTimeout(toId); };
-  }
-  function loop() {
-    renderer.render(scene, camera);
-    positionLabels();
-    schedule(loop);
-  }
-  loop();
+  // the render loop itself is defined above (markDirty/renderIfDirty, right after the
+  // camera/resize setup) — render-on-demand per Thoth's own live measurement (mail 10581):
+  // the old unconditional rAF-plus-50ms-fallback loop rendered forever regardless of
+  // whether anything changed or the tab/surface was even visible, which is real waste this
+  // fix removes rather than papering over.
   pickLabels();
+  markDirty();
 
   const api = {
-    focusObject, clearFocus, inspect,
+    focusObject, clearFocus, inspect, pause, resume,
     get idToNode() { return idToNode; },
     camera, pickAt, mesh: () => mesh, worldPerPx, nodeRadiusPx, renderer,
+    // debug/test hooks only (same convention as window.__space always being exposed) —
+    // zoomAt bypasses the rAF-coalesced wheel path for direct exercise; forceRender skips
+    // the dirty check for a synchronous frame.
+    zoomAt, forceRender: () => { renderer.render(scene, camera); positionLabels(); },
   };
   window.__space = api; // kept for existing debugging/test scripts, same shape as before
   return api;
