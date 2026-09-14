@@ -1667,6 +1667,34 @@ def deploy_unit_names(repo_root: Path) -> list[str]:
     return [p.stem for p in user_unit_sources(repo_root)]
 
 
+def _placeholder_unit_reason(text: str, repo_root: Path) -> str | None:
+    """A reason string when a unit file's own content looks like a stand-in rather than
+    a real unit — the exact shape of a live incident (Thoth mail 10242): a test's own
+    30-byte fixture (`[Service]\\nExecStart=/bin/true\\n`), run through the REAL
+    installer with `Path.home` unpatched, silently overwrote this box's actual
+    osiris-mcp/osiris-pulse units and left them dead across a reboot. None when the
+    unit looks real.
+
+    Two checks, either one enough to refuse: no `[Unit]` `Description=` line (every
+    real unit in deploy/user/ has one, a bare `[Service]` stub never does); or an
+    `ExecStart=` that names neither `%h` (systemd's own home specifier — every real
+    unit here points ExecStart at `%h/code/osiris/...`) nor this repo's own checkout
+    path — `/bin/true` or any other bare system binary matches neither."""
+    if "Description=" not in text:
+        return "no [Unit] Description= line"
+    execstart = next(
+        (line.strip().removeprefix("ExecStart=") for line in text.splitlines()
+         if line.strip().startswith("ExecStart=")),
+        None,
+    )
+    if not execstart:
+        return "no ExecStart= line"
+    if "%h" not in execstart and str(repo_root) not in execstart:
+        return (f"ExecStart={execstart!r} names neither %h (systemd's own home "
+                f"specifier) nor this repo's own checkout path ({repo_root})")
+    return None
+
+
 async def _real_install_user_units(repo_root: Path) -> list[str]:
     """Copies deploy/user/*.service over ~/.config/systemd/user/ (creating the dir if this is
     a fresh box) and daemon-reloads ONLY if something actually changed — an idle box's every
@@ -1676,10 +1704,23 @@ async def _real_install_user_units(repo_root: Path) -> list[str]:
 
     A `repo_root` with no deploy/user/ (a test's own tmp_path, or a checkout that predates
     this) touches NOTHING outside itself — no directory created, no real ~/.config read —
-    rather than silently mkdir-ing into the real caller's home on every such call."""
+    rather than silently mkdir-ing into the real caller's home on every such call.
+
+    REFUSES THE WHOLE BATCH (Thoth mail 10242, a live incident — see
+    `_placeholder_unit_reason`'s own docstring) rather than installing any of it the
+    moment ONE source file looks like a placeholder: notes named `unit: REFUSED ...`
+    are the signal `cmd_deploy` gates the restart on, same law as its own silent-no-op
+    guard. Every real unit this repo ships passes both checks today."""
     sources = user_unit_sources(repo_root)
     if not sources:
         return ["unit files: no deploy/user/ found — nothing to install"]
+    placeholder_notes = [
+        f"unit: REFUSED {src.name} — {reason}"
+        for src in sources
+        if (reason := _placeholder_unit_reason(src.read_text(), repo_root)) is not None
+    ]
+    if placeholder_notes:
+        return placeholder_notes
     target_dir = Path.home() / ".config" / "systemd" / "user"
     target_dir.mkdir(parents=True, exist_ok=True)
     notes: list[str] = []
@@ -1706,6 +1747,28 @@ async def _real_install_user_units(repo_root: Path) -> list[str]:
     else:
         notes.append(f"systemctl --user daemon-reload: ok ({', '.join(changed)})")
     return notes
+
+
+def unit_install_drift(repo_root: Path) -> dict[str, str]:
+    """Per-unit drift between deploy/user/<name> (source of truth) and whatever is
+    actually installed at ~/.config/systemd/user/<name> right now — Khnum's own
+    boot-heal oneshot and `osiris boot-status` (ruling aaa8e841, REBOOT SURVIVAL
+    RULED) call this directly rather than re-deriving the comparison this installer
+    already knows how to make. One entry per unit named by `user_unit_sources`:
+    'missing' (not installed at all), 'drifted' (installed but byte-different from
+    source), or 'ok' (installed, byte-identical). Pure and read-only — never writes,
+    never daemon-reloads; `_real_install_user_units` is the only writer."""
+    target_dir = Path.home() / ".config" / "systemd" / "user"
+    out: dict[str, str] = {}
+    for src in user_unit_sources(repo_root):
+        dest = target_dir / src.name
+        if not dest.exists():
+            out[src.name] = "missing"
+        elif dest.read_text() != src.read_text():
+            out[src.name] = "drifted"
+        else:
+            out[src.name] = "ok"
+    return out
 
 
 def _find_repo_root(start: Path | None = None) -> Path | None:
@@ -2619,6 +2682,18 @@ async def cmd_deploy(
                   "specimen: a real deploy restarted onto a stale unit set while printing zero "
                   "unit: lines). Refusing rather than restarting blind. NOTHING was restarted.",
                   file=sys.stderr)
+            return 1
+        if any(note.startswith("unit: REFUSED") for note in unit_notes):
+            # A live incident (Thoth mail 10242): a test's own 30-byte stub unit, run
+            # through the real installer with Path.home unpatched, silently overwrote
+            # osiris-mcp/osiris-pulse's actual units and left them dead across a
+            # reboot. install_units (`_placeholder_unit_reason`) now refuses the whole
+            # batch rather than writing any of it the moment one source file looks
+            # like a placeholder — never restart onto whatever partial install just
+            # happened, or didn't.
+            print("osiris deploy: REFUSED — one or more unit files look like "
+                  "placeholders, not real units (see the `unit: REFUSED` line(s) "
+                  "above). NOTHING was installed or restarted.", file=sys.stderr)
             return 1
 
         tools_before = await list_tools()
