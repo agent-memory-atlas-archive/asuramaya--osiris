@@ -72,6 +72,7 @@ from src.cli import (
     cmd_fleet_reconcile,
     cmd_fold_project,
     cmd_fork_project,
+    cmd_graph_export,
     cmd_heal_seat_anchor,
     cmd_heal_seat_transcript,
     cmd_inbox,
@@ -185,6 +186,7 @@ NO_WRITE_INVOCATIONS: dict[str, Any] = {
     "show": lambda a: cmd_show("no-such-ref-anywhere"),
     "boot-status": lambda a: cmd_boot_status(pool=a.pool),
     "lint": lambda a: cmd_lint(pool=a.pool),
+    "graph-export": lambda a: cmd_graph_export(as_json=True, pool=a.pool),
     "audit": lambda a: cmd_audit("the-wall", pool=a.pool),
     "search": lambda a: cmd_search("no-such-query-anywhere-xyz", limit=1),
     "launch": lambda a: cmd_launch(

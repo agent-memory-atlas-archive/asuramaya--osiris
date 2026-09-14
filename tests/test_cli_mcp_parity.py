@@ -52,6 +52,12 @@ NO_MCP_EQUIVALENT = {
         "function (comp.run_spec over the 'lint' Function), same call graph_lint itself "
         "makes; named 'lint' on the CLI (WAVE 22 item 2, mail 10109) rather than "
         "'graph-lint' for a shorter headless-cron command, deliberately not name-matched.",
+    "graph-export": "operator/cron-shaped bulk act, not an agent verb — the CLI mirror "
+        "of GET /graph/stream (NAVIGABLE SPACE piece B, thread b6cb1d7c0b36), "
+        "direct-to-Postgres and headless like lint's own entry above, but exporting "
+        "tens of thousands of positioned objects as a binary blob has no sensible MCP "
+        "tool-call shape (no model needs the raw typed-array payload) — the REST route "
+        "and the three.js renderer are this capability's real consumers.",
     "audit": "NOT actually MCP-less — one CLI door (WAVE 22 item 2) fans out to FIVE "
         "differently-named compositions (closure-health/the-wall/type-census/family-"
         "consistency/family-drift) via comp.run_composition, the same function "
