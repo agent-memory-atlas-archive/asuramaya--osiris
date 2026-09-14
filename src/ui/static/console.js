@@ -333,7 +333,16 @@ function toggleTableDrawer() {
   const el = $('browse-drawer'); if (el) el.classList.toggle('open', TABLE_DRAWER_OPEN);
 }
 function renderEntityExplorerStage() {
-  const filtered = getFilteredEntities(); setStatus(filtered.length + ' of ' + SET.length + ' entities');
+  let filtered = getFilteredEntities();
+  // THE READING LAYER, part C ("harmony", ruling c5953bb1): "the table filters to the
+  // reachable set while a focus is on" — a real path focus (not a plain select) narrows
+  // the table to exactly what the canvas is showing lit.
+  var space = window.OsirisSpace;
+  if (space && space.pathFocusId) {
+    var reachable = space.pathReachable;
+    filtered = filtered.filter(function(o) { return reachable.has(o.id); });
+  }
+  setStatus(filtered.length + ' of ' + SET.length + ' entities');
   const countEl = $('browse-drawer-count'); if (countEl) countEl.textContent = filtered.length.toLocaleString();
   renderTableProjection($('browse-table'), filtered);
 }
@@ -964,11 +973,14 @@ function inspectOnly(id) {
     badge.textContent = "Inspect: " + id.slice(0, 8) + "";
   }
   // a table-drawer row click "shares the selection" with the space canvas (mail 10550) —
-  // selectObject also opens the inspector itself, so this replaces the plain inspect(id)
-  // call whenever the canvas is actually mounted and visible (browse). A table click is
-  // SELECT, not FOCUS (ruling c5953bb1): it doesn't dim the graph or walk a path — that's
-  // reserved for a double-click, Enter, or the inspector's own Focus button.
-  if (ACTIVE_SURFACE === 'browse' && window.OsirisSpace) window.OsirisSpace.selectObject(id);
+  // selectObject/focusObject also open the inspector, so this replaces the plain inspect(id)
+  // call whenever the canvas is actually mounted and visible (browse). Ordinarily a table
+  // click is SELECT (pans the graph to it, per part C's "harmony" — no dim, no path walk);
+  // but while a real focus is already active, part C's own "its rows select and focus"
+  // means a row click walks a fresh path from that row instead, same as a canvas double-click.
+  var space = ACTIVE_SURFACE === 'browse' ? window.OsirisSpace : null;
+  if (space && space.pathFocusId) space.focusObject(id);
+  else if (space) space.selectObject(id, { pan: true });
   else inspect(id);
 }
 async function openAsSet(oid, type, dir, label) {

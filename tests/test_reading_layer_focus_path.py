@@ -74,7 +74,9 @@ def test_a_shallower_depth_does_not_reach_the_whole_chain() -> None:
 # --- everything else: static-source-guard proofs, the existing convention -----------------
 
 def test_select_vs_focus_are_two_different_acts() -> None:
-    assert "async function selectObject(id)" in _SPACE_JS
+    # selectObject's own `opts` (part C, "harmony") only ever controls whether it pans the
+    # camera -- never dim, never a path walk, still the lightweight act vs. focusObject.
+    assert "async function selectObject(id, opts)" in _SPACE_JS
     assert "async function focusObject(id, opts)" in _SPACE_JS
     click_body = _SPACE_JS.split('addEventListener("click", (ev) => {', 1)[1][:300]
     assert "selectObject(hit.id)" in click_body
@@ -94,7 +96,7 @@ def test_enter_key_focuses_the_selected_node() -> None:
 
 
 def test_inspector_carries_a_focus_button() -> None:
-    body = _SPACE_JS.split("async function inspect(id)", 1)[1][:900]
+    body = _SPACE_JS.split("async function inspect(id)", 1)[1][:1300]
     assert 'focusBtn.addEventListener("click", () => focusObject(id));' in body
 
 
@@ -158,8 +160,16 @@ def test_back_and_widen_buttons_exist_in_both_pages() -> None:
         assert 'id="widen-btn"' in html
 
 
-def test_table_row_clicks_select_not_focus() -> None:
+def test_table_row_clicks_select_and_pan_ordinarily() -> None:
+    # THE READING LAYER, part C ("harmony"): an ordinary table row click selects (and pans
+    # the graph to it) -- see test_table_row_clicks_focus_while_a_focus_is_already_active
+    # for the OTHER half of part C's own "its rows select and focus."
     console_js = (_STATIC / "console.js").read_text()
-    body = console_js.split("function inspectOnly(id)", 1)[1][:900]
-    assert "window.OsirisSpace.selectObject(id)" in body
-    assert "window.OsirisSpace.focusObject(id)" not in body
+    body = console_js.split("function inspectOnly(id)", 1)[1][:1300]
+    assert "space.selectObject(id, { pan: true });" in body
+
+
+def test_table_row_clicks_focus_while_a_focus_is_already_active() -> None:
+    console_js = (_STATIC / "console.js").read_text()
+    body = console_js.split("function inspectOnly(id)", 1)[1][:1300]
+    assert "if (space && space.pathFocusId) space.focusObject(id);" in body
