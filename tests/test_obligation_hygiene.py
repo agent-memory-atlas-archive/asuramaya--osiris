@@ -203,6 +203,42 @@ async def test_a_project_name_owner_falls_back_to_the_operator_desk(actions: Act
     assert "error" not in row["sent"]
 
 
+async def test_a_project_owned_obligation_is_flagged_and_the_nudge_names_it(
+    actions: Actions,
+) -> None:
+    """thread 3a9d9a5d89fa, Ra XL's measured report: a project-named owner is exactly
+    the population threads() can never show its holder — the row is flagged
+    `project_owned` and the nudge body says so explicitly, plainly enough that whoever
+    reads it knows to check the bar's `+M project` figure or the project's own thread
+    list instead of expecting it under their own threads()."""
+    await actions.create_or_find_object("SoftwareProject", "repo:hygtestproj2", _SRC)
+    stale = NOW - timedelta(days=N1_IDLE_DAYS + 1)
+    t = await _mk_obligation(actions, "hyg-project-owner-2", owner="hygtestproj2",
+                             touched_at=stale)
+    dry = await hygiene_dry_run(actions.pool, now=NOW)
+    row = _find(dry["buckets"]["would_nudge"], t)
+    assert row is not None
+    assert row["project_owned"] is True
+
+    out = await hygiene_execute(actions, execute=True, now=NOW)
+    sent = next(r for r in out["nudged"] if r["thread_id"] == str(t))["sent"]
+    assert "error" not in sent
+    body = await actions.pool.fetchval(
+        "SELECT body FROM fleet_messages WHERE id=$1", sent["id"])
+    assert "project-owned" in body
+    assert "threads()" in body
+
+
+async def test_a_seat_owned_obligation_is_not_flagged_project_owned(actions: Actions) -> None:
+    stale = NOW - timedelta(days=N1_IDLE_DAYS + 1)
+    t = await _mk_obligation(actions, "hyg-seat-owner", owner="agent:hyg-seat-owner",
+                             touched_at=stale)
+    out = await hygiene_dry_run(actions.pool, now=NOW)
+    row = _find(out["buckets"]["would_nudge"], t)
+    assert row is not None
+    assert row["project_owned"] is False
+
+
 async def test_an_unowned_obligation_nudges_the_operator_desk(actions: Actions) -> None:
     stale = NOW - timedelta(days=N1_IDLE_DAYS + 1)
     t = await _mk_obligation(actions, "hyg-unowned", owner=None, touched_at=stale)
@@ -268,9 +304,36 @@ async def test_quote_summary_names_an_already_answered_row() -> None:
     assert "ALREADY ANSWERED" not in plain
     answered = _quote_summary({
         "summary": "a headline", "summary_age_days": 12, "contested": False,
-        "answered_by": [{"id": "abc12345", "summary": "found and fixed it already"}]})
+        "answered_by": [{"id": "abc12345", "summary": "found and fixed it already",
+                         "sim": 0.9}]})
     assert "ALREADY ANSWERED" in answered
     assert "abc12345" in answered and "found and fixed it already" in answered
+
+
+async def test_quote_summary_downgrades_a_weak_match_to_possibly_answered() -> None:
+    """thread 3a9d9a5d89fa, Ra XL's own two false matches: a citation below the
+    similarity threshold is never dropped, but never claims "ALREADY ANSWERED" either
+    — the reader still checks, just without a false sense the question is closed."""
+    from src.orchestrator.obligation_hygiene import _quote_summary
+
+    weak = _quote_summary({
+        "summary": "a headline", "summary_age_days": 12, "contested": False,
+        "answered_by": [{"id": "def67890", "summary": "an unrelated finding", "sim": 0.1}]})
+    assert "ALREADY ANSWERED" not in weak
+    assert "possibly answered" in weak
+    assert "def67890" in weak and "an unrelated finding" in weak
+
+
+async def test_quote_summary_carries_both_confidence_tiers_at_once() -> None:
+    from src.orchestrator.obligation_hygiene import _quote_summary
+
+    both = _quote_summary({
+        "summary": "a headline", "summary_age_days": 12, "contested": False,
+        "answered_by": [
+            {"id": "strong01", "summary": "a confident match", "sim": 0.9},
+            {"id": "weak0001", "summary": "a shaky match", "sim": 0.1}]})
+    assert "ALREADY ANSWERED by 1 decision(s): strong01" in both
+    assert "possibly answered by 1 decision(s), unconfirmed: weak0001" in both
 
 
 async def test_hygiene_dry_run_surfaces_an_answering_decision_on_the_nudge(
@@ -290,8 +353,14 @@ async def test_hygiene_dry_run_surfaces_an_answering_decision_on_the_nudge(
     out = await hygiene_dry_run(actions.pool, now=NOW)
     row = _find(out["buckets"]["would_nudge"], t)
     assert row is not None
-    assert row["answered_by"] == [
-        {"id": str(d)[:8], "summary": "re-measured hyg-answered-1: it's fine now"}]
+    assert len(row["answered_by"]) == 1
+    entry = row["answered_by"][0]
+    assert entry["id"] == str(d)[:8]
+    assert entry["summary"] == "re-measured hyg-answered-1: it's fine now"
+    # `_score_answer_similarity`'s own live pg_trgm score — a real float, not asserted
+    # to an exact value (that's the measurement this thread's own follow-up is about),
+    # only that the scoring pass actually ran and attached something.
+    assert isinstance(entry["sim"], float)
 
 
 async def test_hygiene_dry_run_never_answers_for_a_row_with_no_bears_on_edge(

@@ -1136,6 +1136,35 @@ def test_statusline_never_caches_the_callers_own_identity(
     assert cached["souls"] == 7          # the shared counts DO survive
 
 
+def test_statusline_renders_the_project_owned_suffix_beside_owe(
+    monkeypatch: Any, tmp_path: Path,
+) -> None:
+    """thread 3a9d9a5d89fa, Ra XL's measured report: the bar's own `owe N` gains a
+    `(+M project)` suffix for obligations project-owned in a project you govern."""
+    out = _statusline(monkeypatch, tmp_path,
+                       answer={"result": {**_COUNTS, "owed_mine_project": 11}})
+    assert "owe 2 (+11 project)" in out
+
+
+def test_statusline_shows_the_project_suffix_even_with_zero_personal_owe(
+    monkeypatch: Any, tmp_path: Path,
+) -> None:
+    """The whole point: a seat with zero PERSONAL debt can still be sitting on real
+    project pressure no individual `owe` count would ever surface — the cell must not
+    stay hidden just because owed_mine/stale_mine are both 0."""
+    out = _statusline(monkeypatch, tmp_path,
+                       answer={"result": {**_COUNTS, "owed_mine": 0, "stale_mine": 0,
+                                          "owed_mine_project": 5}})
+    assert "owe 0 (+5 project)" in out
+
+
+def test_statusline_omits_the_project_suffix_when_zero(
+    monkeypatch: Any, tmp_path: Path,
+) -> None:
+    out = _statusline(monkeypatch, tmp_path, answer={"result": _COUNTS})
+    assert "project)" not in out
+
+
 def test_statusline_puts_the_sick_warning_at_the_far_right_of_the_line(
     monkeypatch: Any, tmp_path: Path,
 ) -> None:

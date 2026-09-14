@@ -1570,7 +1570,11 @@ TOOL_CONTRACT_EXPECTED_COUNT = 86
 # Repairs panel) — no new @mcp.tool(), tool count unchanged, dispatched through the
 # same door as always, now delegating to src.orchestrator.backfill.run_backfill.
 # Measured exact (137,011).
-TOOL_CONTRACT_CEILING_CHARS = 137064
+# 137064 -> 137307 (2026-09-14, Imhotep, thread 3a9d9a5d89fa, project-owned obligations
+# visibility): `threads`'s own docstring gains one clause naming its new
+# `project_owned_not_shown` field — no new @mcp.tool(), tool count unchanged. Measured
+# exact (137,307).
+TOOL_CONTRACT_CEILING_CHARS = 137307
 
 def test_ceiling_has_exactly_one_executable_assignment() -> None:
     """THE RATCHET'S OWN GUARD (thread c655c757). This file used to carry every historical

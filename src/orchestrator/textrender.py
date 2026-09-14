@@ -228,19 +228,27 @@ def render_team_text(rows: list[dict[str, Any]]) -> str:
 THREADS_BAND_CAP = 30
 
 
-def render_threads_text(rows: list[dict[str, Any]]) -> str:
+def render_threads_text(rows: list[dict[str, Any]], project_owned_count: int = 0) -> str:
     """One line per thread, already ordered by the caller (threads()'s own oldest-first
     query) — caps and formats only, never reorders. Caps at `THREADS_BAND_CAP`, the
     remainder folded into one trailing count line.
 
     A leading `!` marks a CONTESTED thread (fix (b), Metron's mechanism report, mail
     8890): a note newer than the last summary correction disputes this headline — read
-    it as disputed, not as settled fact."""
+    it as disputed, not as settled fact.
+
+    `project_owned_count` (thread 3a9d9a5d89fa, Ra XL's measured report, mail 10351/
+    10358): obligations in this SAME project whose owner is the project's own bare
+    name or empty — invisible to the owner-spelling match above, named on their own
+    trailing line so "nothing under MY name" is never read as "nothing open here."""
     shown, remainder = rows[:THREADS_BAND_CAP], max(0, len(rows) - THREADS_BAND_CAP)
-    if not shown:
+    if not shown and not project_owned_count:
         return "threads: none open in your name here"
     lines = [f"{'! ' if r.get('contested') else ''}{r['id']} [{r['kind'] or '?'}] "
-            f"{r['summary']}" for r in shown]
+            f"{r['summary']}" for r in shown] if shown else ["threads: none open in your name here"]
     if remainder:
         lines.append(f"+{remainder} more thread(s)")
+    if project_owned_count:
+        lines.append(f"+{project_owned_count} project-owned/unowned obligation(s) here, "
+                     "owner is this project's own name or empty — not shown above")
     return "\n".join(lines)

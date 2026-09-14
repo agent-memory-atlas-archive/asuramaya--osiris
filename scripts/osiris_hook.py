@@ -317,8 +317,19 @@ def _cmd_statusline(hook: dict[str, Any]) -> int:
         # stale window, dim otherwise, absent at zero. briefs left the bar entirely — the
         # operator stacked 29 and never read one; a count nobody reads is noise.
         owed_mine, stale_mine = int(r.get("owed_mine", 0)), int(r.get("stale_mine", 0))
-        owe_s = (f"{_RED}owe {owed_mine}{_RESET}" if stale_mine
-                 else (f"{_DIM}owe {owed_mine}{_RESET}" if owed_mine else ""))
+        # THE THIRD OWNER CATEGORY (thread 3a9d9a5d89fa, Ra XL's measured report,
+        # 2026-09-14): obligations in a project you GOVERN whose owner is the bare
+        # project name or empty — invisible to owe's own individual-spelling match
+        # until now. Shown as a trailing "(+M project)", dim, never red (no per-owner
+        # stale window applies to a project-owned row the same way) — and critically,
+        # shown even when owed_mine is itself 0: the whole point is that a governing
+        # seat with zero PERSONAL debt can still be sitting on real project pressure
+        # nobody's individual `owe` count would ever surface.
+        owed_mine_project = int(r.get("owed_mine_project", 0))
+        suffix = f" (+{owed_mine_project} project)" if owed_mine_project else ""
+        owe_s = (f"{_RED}owe {owed_mine}{suffix}{_RESET}" if stale_mine
+                 else (f"{_DIM}owe {owed_mine}{suffix}{_RESET}"
+                       if owed_mine or owed_mine_project else ""))
         # ONE CELL, YOUR PREMISES ONLY (operator 2026-09-06: "just ✉ 3 is enough ... we're
         # trying to keep it compact"). The count is what is unread and addressed to YOU —
         # direct mail plus room broadcasts you have not read; in-flight traffic on other

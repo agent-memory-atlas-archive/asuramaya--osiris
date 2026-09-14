@@ -52,6 +52,11 @@ class HeartbeatResult(NamedTuple):
     # past their stale window (operator 2026-09-06: owed_here counted the operator's debts).
     owed_mine: int = 0
     stale_mine: int = 0
+    # THE THIRD OWNER CATEGORY (thread 3a9d9a5d89fa, Ra XL's measured report): open
+    # obligations in a project THIS seat governs whose owner is the bare project name
+    # itself or empty — invisible to owed_mine's own individual-spelling match. Renders
+    # as the bar's `+M project` suffix, never folded into owed_mine.
+    owed_mine_project: int = 0
 
 
 async def _team_live(conn: Any, seat_id: str, *, live_secs: int) -> tuple[int, int]:
@@ -174,13 +179,14 @@ async def compute_heartbeat(
     resolved_intent = intent_hint
     resolved_seat_handle: str | None = None
     team, team_of = 0, 0
-    owed_mine, stale_mine = 0, 0
+    owed_mine, stale_mine, owed_mine_project = 0, 0, 0
     if agent:
         from src.orchestrator.seats import held_seat, seat_facts
         from src.orchestrator.stophook_logic import owned_obligations
 
         mine = await owned_obligations(conn, agent)
         owed_mine, stale_mine = mine["owned"], mine["stale"]
+        owed_mine_project = mine["project"]
         seat = await held_seat(conn, agent)
         if seat:
             resolved_seat_handle = seat.get("handle")
@@ -215,4 +221,4 @@ async def compute_heartbeat(
          seg.spend.data.get("blind", 0)),
         resolved_project, resolved_intent, resolved_seat_handle, team, team_of,
         int(seg.mail.data.get("needs", seg.mail.data["mail"] + seg.mail.data["dm"])),
-        owed_mine, stale_mine)
+        owed_mine, stale_mine, owed_mine_project)

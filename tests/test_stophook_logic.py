@@ -237,6 +237,60 @@ async def test_resolve_worker_identity_none_outside_any_office(
     assert identity is None
 
 
+async def test_owned_obligations_counts_project_owned_rows_in_my_charter(
+    actions: Actions,
+) -> None:
+    """thread 3a9d9a5d89fa, Ra XL's measured report ("three owner categories existed,
+    the fix reasoned about two"): obligations owned by the bare project name, or
+    unowned with an in_repo link, in a project THIS agent's own seat GOVERNS — invisible
+    to `owned`'s own owner_refs match, counted SEPARATELY as `project`."""
+    from src.orchestrator.stophook_logic import owned_obligations
+
+    await _mounted_seat(actions, agent="agent:chartobl1", seat="seat:chartobl1",
+                        handle="Chartworker1", sid="chartob1-0000-4000-8000-000000000000",
+                        job_short="chartob1")
+    seat_oid = await actions.create_or_find_object("Seat", "seat:chartobl1", "test")
+    proj_oid = await actions.create_or_find_object(
+        "SoftwareProject", "repo:hygcharterproj", "test")
+    await actions.create_link(seat_oid, proj_oid, "governs", "test", datetime.now(UTC), 0.9)
+
+    async def _obligation(canonical: str, *, owner: str | None) -> Any:
+        t = await actions.create_or_find_object("Thread", canonical, "test")
+        now = datetime.now(UTC)
+        await actions.assert_property(t, "summary", canonical, "test", now, 0.9,
+                                      evidence_class="self_declared")
+        await actions.assert_property(t, "status", "open", "test", now, 0.9,
+                                      evidence_class="self_declared")
+        await actions.assert_property(t, "kind", "obligation", "test", now, 0.9,
+                                      evidence_class="self_declared")
+        if owner:
+            await actions.assert_property(t, "owner", owner, "test", now, 0.9,
+                                          evidence_class="self_declared")
+        await actions.create_link(t, proj_oid, "in_repo", "test", now, 0.9)
+        return t
+
+    await _obligation("chart-obl-project-owned", owner="hygcharterproj")
+    await _obligation("chart-obl-unowned", owner=None)
+    await _obligation("chart-obl-someone-else", owner="agent:not-chartobl1")
+
+    result = await owned_obligations(actions.pool, "agent:chartobl1")
+    assert result["owned"] == 0
+    assert result["project"] == 2
+
+
+async def test_owned_obligations_project_is_zero_with_no_charter(actions: Actions) -> None:
+    from src.orchestrator.capture import open_thread
+    from src.orchestrator.stophook_logic import owned_obligations
+
+    await _mounted_seat(actions, agent="agent:nochart1", seat="seat:nochart1",
+                        handle="Nochartworker1", sid="nochart1-0000-4000-8000-000000000000",
+                        job_short="nochart1")
+    await open_thread(actions, "unrelated project's own obligation", kind="obligation",
+                      owner="someotherproject", source="test")
+    result = await owned_obligations(actions.pool, "agent:nochart1")
+    assert result["project"] == 0
+
+
 async def test_leased_assignment_finds_the_open_obligation_owned_by_my_seat(
     actions: Actions,
 ) -> None:
