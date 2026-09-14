@@ -1803,6 +1803,39 @@ async def test_dispatch_is_immediate_and_carries_the_receipt(
         "SELECT mode FROM agent_wakes ORDER BY id DESC LIMIT 1") == "dm-resume"
 
 
+async def test_a_dm_queued_during_an_outage_dispatches_on_the_backstops_next_tick(
+    actions: Actions, tmp_path: Path,
+) -> None:
+    """thread bc6a5d455da2, REBOOT SURVIVAL's fleet half, piece 4 (Thoth mail 10253): a
+    DM filed while the trigger's own immediate leg never ran (the exact outage shape —
+    send() itself either never attempted dispatch, or its attempt raised and was caught,
+    per cli.py's/mcp_server.py's own "the send already committed; confess" handling) must
+    still leave the message genuinely QUEUED (read_at IS NULL, no delivered_at) rather
+    than silently dropped, and `_dms_with_unread`'s own population query is unconditional
+    on how the row got there — this pins that the worker's own backstop sweep, ticking
+    with the trigger now armed, picks it up and dispatches on its very first pass, no
+    special-casing needed. Send WITHOUT ever calling dispatch_dm (simulating an outage
+    where the immediate leg never ran at all, the harshest case) — the message sits
+    exactly as `_dms_with_unread` will find it."""
+    sense = await _stale_resumable_owner(actions, tmp_path)
+    msg_id = await _dm_to_owner(actions)  # send_message alone — no dispatch_dm call yet
+    row = await actions.pool.fetchrow(
+        "SELECT read_at FROM fleet_messages WHERE id=$1", msg_id)
+    assert row is not None and row["read_at"] is None  # genuinely still queued
+
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def _spawn(repo: str, prompt: str, **kw: Any) -> None:
+        calls.append((repo, kw))
+
+    report = await trigger_mail_tick(
+        actions, settings=_settings(enabled=True, sense=str(sense)), spawn=_spawn,
+        windows=_no_windows)
+    assert report["woke"] == 1
+    assert report["resumed"] == 1
+    assert calls and calls[0][1].get("resume_session") == FULL_SID
+
+
 async def test_an_fyi_dm_never_wakes(actions: Actions, tmp_path: Path) -> None:
     """The grammar's loop terminator: grade='fyi' + ack settles WITHOUT minting a turn — so
     an fyi never resumes anybody. It waits, readable, for the addressee's own next turn;

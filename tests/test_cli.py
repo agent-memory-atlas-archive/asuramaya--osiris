@@ -3889,6 +3889,73 @@ async def test_cmd_boot_status_names_a_gap_and_exits_nonzero(
     assert "reissue_office(adopt=True)" in buf.getvalue()
 
 
+async def test_cmd_boot_status_fleet_never_touches_the_rollout_gap_check(
+    actions: Actions, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """thread bc6a5d455da2: --fleet is a SEPARATE report — a blank census (no live
+    bodies at all) must still exit clean, and never print anything from the rollout-gap
+    check above."""
+    import io
+    from contextlib import redirect_stdout
+
+    from src.orchestrator import mounts
+
+    async def _empty_census(_pool: object) -> dict[str, Any]:
+        return {"blind": False, "matched": [], "rowless": []}
+
+    monkeypatch.setattr(mounts, "registry_census", _empty_census)
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        out = await cmd_boot_status(pool=actions.pool, fleet=True)
+    assert out == 0
+    assert "compiled managed section" not in buf.getvalue()
+
+
+async def test_cmd_boot_status_fleet_refreshes_and_names_rowless(
+    actions: Actions, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.orchestrator import mounts
+
+    await mounts.save_mount(actions.pool, job_dir="/x/jobs/clifleet1",
+                            agent_id="agent:clifleet1", project="osiris",
+                            cwd="/code/osiris", model=None, session_key="whisper:1")
+    await actions.pool.execute(
+        "UPDATE agent_mounts SET last_seen = now() - interval '3 hours' "
+        "WHERE agent_id='agent:clifleet1'")
+
+    async def _census(_pool: object) -> dict[str, Any]:
+        return {"blind": False, "matched": [
+            {"agent_id": "agent:clifleet1", "job_dir": "/x/jobs/clifleet1", "pid": 1},
+        ], "rowless": [
+            {"session_id": "clighost1-0000-0000-0000-000000000000", "pid": 2,
+             "proc_cwd": "/w/ghost"},
+        ]}
+
+    monkeypatch.setattr(mounts, "registry_census", _census)
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        out = await cmd_boot_status(pool=actions.pool, fleet=True)
+    assert out == 1  # a rowless body means exit nonzero
+    assert "agent:clifleet1" in buf.getvalue()
+    assert "clighost1" in buf.getvalue()
+
+
+async def test_cmd_boot_status_fleet_emits_json(
+    actions: Actions, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.orchestrator import mounts
+
+    async def _empty_census(_pool: object) -> dict[str, Any]:
+        return {"blind": False, "matched": [], "rowless": []}
+
+    monkeypatch.setattr(mounts, "registry_census", _empty_census)
+    out = await cmd_boot_status(pool=actions.pool, fleet=True, as_json=True)
+    assert out == 0
+
+
 # --- cmd_lint: the graph_lint mirror (WAVE 22 item 2, mail 10109, thread bf10608b) — a real
 # pool, never mocked, same as every other CLI test in this file. Finding-triggering recipes
 # reuse test_compositions.py's own cheap fixtures (the edgeless-closure-growth ceiling
@@ -4606,6 +4673,52 @@ async def test_cmd_send_broadcasts_and_reports(actions: Actions) -> None:
 
     msgs = await read_inbox(actions.pool, "clisendhouse", reader_agent="agent:someoneelse")
     assert [m["body"] for m in msgs] == ["deploy landing shortly"]
+
+
+async def test_cmd_send_honors_the_operators_stored_trigger_toggle_over_a_bare_env(
+    actions: Actions, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """thread bc6a5d455da2, the CLI trigger-dark false-negative (Thoth mail 10225/10253):
+    the operator's ACTUAL stored toggle (settings table, wake.trigger.enabled) is ON,
+    but a bare CLI process's own environment (no worker systemd drop-in) reads
+    OSIRIS_TRIGGER_ENABLED as off — dispatch_dm must be handed the STORED value, not the
+    bare env one, so a DM sent from a plain shell doesn't falsely report trigger-dark
+    while the operator's own real setting is on."""
+    from src.orchestrator import mounts
+    from src.orchestrator.settings_service import write_setting
+
+    await mounts.save_mount(actions.pool, job_dir="/j/clitrigsend", agent_id="agent:clitrigrecv",
+                            project="clitrighouse", cwd="/x", model=None, session_key=None)
+    write_out = await write_setting(
+        actions.pool, "wake.trigger.enabled", True, actor="operator", because="test")
+    assert "error" not in write_out
+
+    # simulate the bare-shell environment: get_settings() itself reads OFF
+    from src.config import settings as settings_mod
+
+    monkeypatch.setattr(
+        settings_mod, "get_settings",
+        lambda: settings_mod.Settings(osiris_trigger_enabled=False))
+
+    seen_settings: dict[str, Any] = {}
+
+    async def _fake_dispatch_dm(pool: object, *, addressee: str, msg_id: int,
+                                sender: str | None, settings: Any = None,
+                                **_kw: object) -> dict[str, str]:
+        seen_settings["osiris_trigger_enabled"] = settings.osiris_trigger_enabled
+        return {"mode": "nudged", "detail": "test"}
+
+    monkeypatch.setattr("src.orchestrator.trigger.dispatch_dm", _fake_dispatch_dm)
+
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        out = await cmd_send("reboot survival fix", to_agent="agent:clitrigrecv",
+                             actor="agent:clitrigsender", pool=actions.pool)
+    assert out == 0
+    assert seen_settings["osiris_trigger_enabled"] is True
 
 
 async def test_cmd_send_refuses_an_unknown_project(actions: Actions) -> None:

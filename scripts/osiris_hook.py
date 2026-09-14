@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
 import time
 import urllib.error
@@ -172,6 +173,33 @@ def _statusline_cache_write(project: str, payload: dict[str, Any]) -> None:
         pass  # the chrome never breaks on a cache write
 
 
+# REBOOT SURVIVAL, the fleet half (thread bc6a5d455da2, operator ruling 2026-09-13):
+# the 17:26 CDT reboot left the chrome reading a bare "graph: no answer" with no
+# statement of WHICH unit was actually down — pg up, mcp dead is indistinguishable from
+# every unit dead, and the #169 shape (a remedy that cannot tell two states apart)
+# repeats every time this line renders with zero diagnosis value. Dependency order: pg
+# first (everything else depends on it), then mcp (the statusline's own real target),
+# then console — the FIRST one that refuses a bare TCP connect is named; all three
+# answering means genuinely "no answer for some other reason" (a slow query, a
+# transient blip), which stays the honest bare message.
+_PORT_PROBES: tuple[tuple[str, int], ...] = (("pg", 5601), ("mcp", 8790), ("console", 8011))
+
+
+def _first_dead_unit(*, timeout: float = 0.3) -> str | None:
+    """A bare TCP connect to each of pg/mcp/console in turn — never more than a socket
+    open+close, no protocol spoken, so this never itself becomes a source of hangs on a
+    chrome render. Returns the first unreachable `name:port`, or None when all three
+    accept a connection (the failure is something else — a slow query, a transient
+    blip — never fabricated as a dead unit that answered fine)."""
+    for name, port in _PORT_PROBES:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+                continue
+        except OSError:
+            return f"{name}:{port}"
+    return None
+
+
 def _post(url: str, data: dict[str, Any], *, timeout: int = 3) -> Any | None:
     try:
         req = urllib.request.Request(url, data=json.dumps(data).encode(),
@@ -272,7 +300,9 @@ def _cmd_statusline(hook: dict[str, Any]) -> int:
 
     if r is None:
         project = project_hint or "?"
-        parts = [f"\u25c8 {project}", f"{_DIM}graph: no answer{_RESET}"]
+        dead = _first_dead_unit()
+        detail = f"graph: no answer \u2014 {dead} unreachable" if dead else "graph: no answer"
+        parts = [f"\u25c8 {project}", f"{_DIM}{detail}{_RESET}"]
     else:
         mail, dm = r.get("mail", 0), r.get("dm", 0)
         team, team_of = r.get("team", 0), r.get("team_of", 0)

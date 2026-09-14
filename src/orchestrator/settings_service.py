@@ -77,6 +77,32 @@ async def settings_with_overlay(pool: asyncpg.Pool) -> Settings:
     return base.model_copy(update=overrides) if overrides else base
 
 
+async def current_stored_value(pool: asyncpg.Pool, key: str) -> Any | None:
+    """THE CURRENT `settings` TABLE VALUE for ONE registered key, regardless of its own
+    `effect` classification (thread bc6a5d455da2, REBOOT SURVIVAL's fleet half) —
+    deliberately NOT routed through `settings_with_overlay`'s own opt-in-per-field
+    'immediate' filter, which this module's own docstring names as A DELIBERATE RISK
+    BOUNDARY (Thoth mail 10040: "THE OVERLAY IS THE RISK"), not an oversight to widen.
+
+    The live specimen this exists for: `wake.trigger.enabled` is registered `effect=
+    'next_tick'` (settings_registry.py), so `settings_with_overlay` never substitutes
+    it — correct for that filter's own stated purpose, but it leaves NO caller any way
+    to read the operator's actual CURRENT stored toggle across a process boundary that
+    lacks the worker's own environment drop-in (a bare CLI invocation run from an
+    interactive shell, during an MCP outage — exactly the trigger-dark false-negative
+    Thoth's mail 10225 diagnosed). This function is that narrow escape hatch: ONE named
+    key, read straight from the stored overlay map, no `effect` filtering at all — never
+    call it in a loop over many keys (use `settings_with_overlay` for that; this pays
+    the same `_overlay_map` cache, just skips its own field-selection step for callers
+    that already know exactly which one key they need). Returns None when nothing has
+    been written for `key` (the caller's own job to fall back to the env/pydantic
+    default), or when `key` is not a registered spec at all."""
+    if spec_by_key(key) is None:
+        return None
+    overlay = await _overlay_map(pool)
+    return overlay.get(key)
+
+
 def _invalidate_overlay_cache() -> None:
     """Called by `write_setting` so a write is visible on the very next read, never
     stale for up to `_OVERLAY_TTL_SECS`; also the test-fixture reset — a module-level

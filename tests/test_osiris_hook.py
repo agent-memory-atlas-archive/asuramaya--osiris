@@ -1054,18 +1054,24 @@ _COUNTS = {"briefs": 3, "mail": 1, "dm": 0, "flight": 0, "souls": 7, "wakes": 4,
 
 def _statusline(
     monkeypatch: Any, tmp_path: Path, *, answer: Any, project_hint: str | None = "testproj",
-    session_id: str | None = None,
+    session_id: str | None = None, dead_unit: str | None = None,
 ) -> str:
     """Render one statusline with `_post` stubbed and the cache redirected into tmp.
 
     `project_hint` stands in for `read_project_label(cwd)`'s real filesystem pin-climb —
     defaulted to a resolvable name so these tests exercise the cache's ordinary, keyed
     behavior; pass `None` to exercise the unresolved-project path instead (no `.osiris`
-    pin anywhere up the tree, e.g. a bare seat-office container or an unpinned repo)."""
+    pin anywhere up the tree, e.g. a bare seat-office container or an unpinned repo).
+
+    `dead_unit` stubs `_first_dead_unit` (thread bc6a5d455da2) — defaults to None (every
+    port answers), the same "no diagnosis available" shape every existing no-answer test
+    here already expects; pass e.g. "mcp:8790" to exercise the naming path instead of
+    letting these tests reach real sockets on the box."""
     monkeypatch.setattr(osiris_hook, "_statusline_cache_path",
                         lambda project: tmp_path / f"{project}.json")
     monkeypatch.setattr(osiris_hook, "_post",
                         lambda *a, **k: answer() if callable(answer) else answer)
+    monkeypatch.setattr(osiris_hook, "_first_dead_unit", lambda **_kw: dead_unit)
     import src.orchestrator.agents as agents_mod
     monkeypatch.setattr(agents_mod, "read_project_label", lambda cwd: project_hint)
     import contextlib
@@ -1156,6 +1162,48 @@ def test_statusline_with_no_answer_and_no_cache_says_only_what_it_knows(
     assert "no answer" in out
     assert "unreachable" not in out
     assert "owe 0" not in out            # absence of data is NOT a count of zero
+
+
+def test_statusline_no_answer_names_the_first_dead_unit(
+    monkeypatch: Any, tmp_path: Path,
+) -> None:
+    """thread bc6a5d455da2, REBOOT SURVIVAL's fleet half: a pg-reachable-but-mcp-dead
+    case used to render the identical bare "no answer" as every-unit-dead — this names
+    which one, so the operator does not have to guess."""
+    out = _statusline(monkeypatch, tmp_path, answer=None, dead_unit="mcp:8790")
+    assert "no answer" in out
+    assert "mcp:8790" in out
+    assert "unreachable" in out
+
+
+def test_first_dead_unit_probes_pg_before_mcp_before_console(
+    monkeypatch: Any,
+) -> None:
+    """Dependency order matters: pg is named even when mcp would also fail to connect,
+    since nothing downstream can be trusted once pg itself is unreachable."""
+    import socket as socket_mod
+
+    def _fake_create_connection(addr: tuple[str, int], timeout: float) -> Any:
+        _host, port = addr
+        if port == 5601:
+            raise OSError("connection refused")
+        import contextlib
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr(socket_mod, "create_connection", _fake_create_connection)
+    assert osiris_hook._first_dead_unit() == "pg:5601"
+
+
+def test_first_dead_unit_returns_none_when_every_port_answers(
+    monkeypatch: Any,
+) -> None:
+    import contextlib
+    import socket as socket_mod
+
+    monkeypatch.setattr(
+        socket_mod, "create_connection",
+        lambda addr, timeout: contextlib.nullcontext())
+    assert osiris_hook._first_dead_unit() is None
 
 
 def test_statusline_never_shares_the_ignorance_bucket_across_sessions(
