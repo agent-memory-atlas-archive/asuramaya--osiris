@@ -284,7 +284,8 @@ def test_parse_session_yield_tolerates_garbage_and_gates() -> None:
     assert [d["summary"] for d in y.decisions] == ["we sense transcripts on a cron"]
     assert y.decisions[0]["kind"] == "ruling"  # unknown kind normalized
     # legacy bare-string threads read as their era's semantics: commitments
-    assert y.threads_opened == [{"summary": "wire the PreCompact hook", "class": "commitment"}]
+    assert y.threads_opened == [{"summary": "wire the PreCompact hook", "class": "commitment",
+                                 "source_line": None}]
     assert y.obligations == ["restart the worker after kernel changes"]
 
 

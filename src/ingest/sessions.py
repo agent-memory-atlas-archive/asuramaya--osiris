@@ -101,8 +101,12 @@ _MAX_SCAN_BYTES = 16 * 1024 * 1024
 # injected reminder) — never operator speech, and local stdout is a secrets surface
 _WRAPPER = re.compile(r"^\s*<(?:command-|local-command-|system-reminder|task-notification)")
 
+# the triage-wake fingerprint (TRIAGE-WAKE HUMILITY, below) — tolerant of `distill`'s own
+# optional `[L<N>] ` line tag (PROVENANCE PIECE 2) sitting in front of the OPERATOR voice.
+_WAKE_MAIL_RE = re.compile(r"^(?:\[L\d+\] )?OPERATOR: You have unread Osiris mail")
 
-def distill(lines: list[str]) -> tuple[str, str | None]:
+
+def distill(lines: list[str], *, tag_lines: bool = False) -> tuple[str, str | None]:
     """Role-tagged dialogue text out of raw transcript JSONL lines, plus the session cwd.
 
     Keeps exactly two voices: the operator's typed messages (string content on `user`
@@ -110,10 +114,17 @@ def distill(lines: list[str]) -> tuple[str, str | None]:
     else — tool_use/tool_result (bulk + printed secrets), thinking (bulk, undelivered),
     sidechains (subagent traffic), compaction summaries (would re-extract the whole
     history every compaction), meta lines — is skipped UNREAD. The yield discipline
-    starts here, before redaction even runs."""
+    starts here, before redaction even runs.
+
+    `tag_lines` (PROVENANCE PIECE 2, ruling bb3e4422): prefixes each surviving part with
+    its ORIGINAL 0-based index into `lines` as `[L<N>]`, so the extraction prompt can
+    report which transcript line a mined item came from — a pure structural pointer, not
+    a change to what is distilled. Default False keeps every existing caller's exact
+    output (byte-for-byte) untouched; only the session-miner's own extraction call sites
+    opt in."""
     parts: list[str] = []
     cwd: str | None = None
-    for raw in lines:
+    for idx, raw in enumerate(lines):
         try:
             d = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -127,6 +138,7 @@ def distill(lines: list[str]) -> tuple[str, str | None]:
             continue
         cwd = d.get("cwd") or cwd
         content = (d.get("message") or {}).get("content")
+        tag = f"[L{idx}] " if tag_lines else ""
         # THE OFF-RECORD SENTINEL (panopticon seam; operator's forks answered
         # 2026-07-19): ‹off-record›…‹on-record› spans are stripped here, BEFORE any
         # extractor sees the dialogue — either voice may mark; the on-disk transcript
@@ -135,14 +147,14 @@ def distill(lines: list[str]) -> tuple[str, str | None]:
             if isinstance(content, str) and content.strip() and not _WRAPPER.match(content):
                 text = strip_off_record(content).strip()
                 if text:
-                    parts.append("OPERATOR: " + text)
+                    parts.append(f"{tag}OPERATOR: " + text)
         elif isinstance(content, list):
             text = strip_off_record("\n".join(
                 b.get("text", "") for b in content
                 if isinstance(b, dict) and b.get("type") == "text"
             )).strip()
             if text:
-                parts.append("CLAUDE: " + text)
+                parts.append(f"{tag}CLAUDE: " + text)
     return "\n\n".join(parts), cwd
 
 
@@ -1085,7 +1097,7 @@ _SYSTEM = (
     "prior run re-performed a task it found inside a transcript instead of mining it.)\n"
     "\n"
     "Return STRICT JSON, no prose, no markdown fences:\n"
-    '{"threads_opened":[{"summary":str,"class":"commitment"|"question"}],'
+    '{"threads_opened":[{"summary":str,"class":"commitment"|"question","line":int}],'
     '"threads_resolved":[str]}\n'
     "\n"
     "THE FIVE RULES. Each is a class of garbage a previous version of you produced in bulk; the "
@@ -1138,6 +1150,11 @@ _SYSTEM = (
     "is about one in ten. Aim higher by returning less.\n"
     "\n"
     "NEVER include credentials, tokens, keys, or long opaque strings.\n"
+    "\n"
+    "- line (threads_opened items, OPTIONAL): every surviving line is tagged [L<N>] at "
+    "its own start. Copy the exact N of the ONE line this item is ABOUT — its source, "
+    "not just where you happened to be reading. Omit the field entirely if you cannot "
+    "point to one line with confidence; never guess a number.\n"
     "\n"
     "NOTE THERE IS NO 'decisions' FIELD. You used to mint them: 1,620 of them, and not one was "
     "ever touched by anyone, ever. A decision is precisely the thing a mind KNOWS it made and "
@@ -1233,8 +1250,10 @@ async def critique_threads(
 @dataclass
 class SessionYield:
     decisions: list[dict[str, str]] = field(default_factory=list)
-    # {'summary','class'} — class='commitment' (owed work) or 'question' (raised, unowned)
-    threads_opened: list[dict[str, str]] = field(default_factory=list)
+    # {'summary','class','source_line'} — class='commitment' (owed work) or 'question'
+    # (raised, unowned); source_line (PROVENANCE PIECE 2, ruling bb3e4422) is the
+    # optional 0-based [L<N>] transcript-line tag the extractor pointed at, int|None.
+    threads_opened: list[dict[str, Any]] = field(default_factory=list)
     threads_resolved: list[str] = field(default_factory=list)
     obligations: list[str] = field(default_factory=list)
 
@@ -1284,10 +1303,12 @@ def parse_session_yield(raw: str) -> SessionYield:
         if isinstance(item, dict):
             s = _clean_sentence(item.get("summary"))
             cls = "commitment" if item.get("class") == "commitment" else "question"
+            line = item.get("line")
+            source_line = line if isinstance(line, int) and line >= 0 else None
         else:
-            s, cls = _clean_sentence(item), "commitment"
+            s, cls, source_line = _clean_sentence(item), "commitment", None
         if s is not None:
-            y.threads_opened.append({"summary": s, "class": cls})
+            y.threads_opened.append({"summary": s, "class": cls, "source_line": source_line})
     for key, out in (("threads_resolved", y.threads_resolved),
                      ("obligations", y.obligations)):
         for item in data.get(key, []) or []:
@@ -1357,16 +1378,141 @@ async def _foreign_owned(pool: asyncpg.Pool, canonical: str, writer: str) -> boo
     ))
 
 
+# --- PROVENANCE PIECE 2 (ruling bb3e4422): possible_upstream from tool_result blocks ------
+
+# raw URLs a WebFetch/WebSearch tool_result actually fetched/returned — a normal
+# https?:// token, cut at whitespace or a closing quote/paren the JSON encoding itself
+# would use to end the string.
+_TOOL_URL_RE = re.compile(r'https?://[^\s"\')>]+')
+# a fleet mail id — ONLY the exact keys the send()/inbox() receipts use, never a bare
+# integer (which would match anything: a port, a count, a byte size).
+_TOOL_MAIL_ID_RE = re.compile(r'"(?:id|sent|reply_to)"\s*:\s*(\d{2,9})\b')
+# a graph object's own canonical string, exactly as search()/graph_search()/recall()
+# hand it back — "thread:<hex>", "decision:<hex>", etc.
+_TOOL_CANONICAL_RE = re.compile(r'"canonical"\s*:\s*"([a-z_]+:[0-9a-f]{6,40})"')
+
+
+def _tool_result_texts_before(
+    lines: list[str], line_idx: int, *, window: int = 6,
+) -> list[str]:
+    """The flattened text of up to `window` tool_result blocks found walking BACKWARD from
+    (not including) `line_idx` — the small, bounded prior-context ruling bb3e4422 asks for
+    ("the current turn plus a small N of prior tool results"), never the whole transcript.
+    Each hit is one raw JSONL line's tool_result content, joined; a line with several
+    tool_result blocks (a parallel tool-call turn) contributes all of them as one hit."""
+    out: list[str] = []
+    for idx in range(min(line_idx, len(lines)) - 1, -1, -1):
+        if len(out) >= window:
+            break
+        try:
+            d = json.loads(lines[idx])
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(d, dict) or d.get("type") != "user":
+            continue
+        content = (d.get("message") or {}).get("content")
+        if not isinstance(content, list):
+            continue
+        chunks: list[str] = []
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            bc = block.get("content")
+            if isinstance(bc, str):
+                chunks.append(bc)
+            elif isinstance(bc, list):
+                chunks.extend(b.get("text", "") for b in bc
+                              if isinstance(b, dict) and b.get("type") == "text")
+        if chunks:
+            out.append("\n".join(chunks))
+    return out
+
+
+async def _upstream_targets(
+    pool: asyncpg.Pool, lines: list[str], source_line: int, *, window: int = 6,
+) -> list[tuple[uuid.UUID | str, dict[str, Any]]]:
+    """Resolve the tool_result text preceding `source_line` into (target, edge
+    properties) pairs — structural id matches ONLY, never text similarity (the
+    ruling's own line): a fleet message id, a graph object's own canonical string, a
+    qualifier-worded citation ("thread <hex>"/"decision <hex>", the SAME extractor
+    `cites` already uses — one implementation, not a second regex path), each resolved
+    to an existing object's `uuid.UUID`; or a fetched URL, returned as its raw `str`
+    (`properties["_is_url"]` marks it) since it may not exist as an object yet — the
+    caller mints/finds it. Overbreadth by design; the caller mints every hit, the
+    credence layer decides what it's worth."""
+    from src.orchestrator.capture import _cited_object_refs, _resolve_cited_object
+
+    targets: dict[uuid.UUID | str, dict[str, Any]] = {}
+    for text in _tool_result_texts_before(lines, source_line, window=window):
+        for m in _TOOL_MAIL_ID_RE.finditer(text):
+            oid = await pool.fetchval(
+                "SELECT id FROM objects WHERE canonical=$1", f"message:{m.group(1)}")
+            if oid is not None and oid not in targets:
+                targets[oid] = {"door": "session-miner:tool_result:message"}
+        for m in _TOOL_CANONICAL_RE.finditer(text):
+            oid = await pool.fetchval(
+                "SELECT id FROM objects WHERE canonical=$1", m.group(1))
+            if oid is not None and oid not in targets:
+                targets[oid] = {"door": "session-miner:tool_result:canonical"}
+        for claimed_type, short_id in _cited_object_refs(text):
+            oid, _reason = await _resolve_cited_object(pool, claimed_type, short_id)
+            if oid is not None and oid not in targets:
+                targets[oid] = {"door": "session-miner:tool_result:cite"}
+        for m in _TOOL_URL_RE.finditer(text):
+            targets.setdefault(m.group(0), {"door": "session-miner:tool_result:url",
+                                            "_is_url": True})
+    return [(k, v) for k, v in targets.items()]
+
+
+async def _mint_possible_upstream(
+    actions: Actions, from_id: uuid.UUID, lines: list[str], source_line: int,
+    observed: datetime,
+) -> int:
+    """Mint `possible_upstream` edges from a freshly-mined Thread to every id its
+    transcript's own preceding tool results actually produced. A URL target is minted/
+    found as a URL object first (piece 2's own external-source rule); every other target
+    is an id already in hand. Idempotent per (from, to) pair within one call; a re-mine
+    of the same Thread from a later tick may add more (a bigger window, a since-resolved
+    citation) but never removes one — the edge only ever withholds independence, so an
+    extra one is never wrong, only unused."""
+    from src.ontology.canonicalize import canonicalize
+
+    minted = 0
+    for target, props in await _upstream_targets(actions.pool, lines, source_line):
+        to_id: uuid.UUID
+        if props.pop("_is_url", False):
+            to_id = await actions.create_or_find_object(
+                "URL", canonicalize("URL", str(target)), _SOURCE)
+        else:
+            assert isinstance(target, uuid.UUID)  # every non-URL target already resolved
+            to_id = target
+        exists = await actions.pool.fetchval(
+            "SELECT 1 FROM links WHERE from_id=$1 AND to_id=$2 AND type='possible_upstream'",
+            from_id, to_id)
+        if exists:
+            continue
+        await actions.create_link(
+            from_id, to_id, "possible_upstream", _SOURCE, observed, _CONF,
+            evidence_class=_EC, properties={**props, "read_at": observed.isoformat()})
+        minted += 1
+    return minted
+
+
 async def _emit_thread(
     actions: Actions, summary: str, *, repo: str | None,
     observed: datetime, kind: str | None = None, source_model: str | None = None,
-    writer: str = _SOURCE,
+    writer: str = _SOURCE, lines: list[str] | None = None, source_line: int | None = None,
 ) -> Any | None:
     """Returns the thread id, or None when the ownership boundary skipped the write. `writer` is
     the SOURCE the assertions carry — the ORIGINATING agent for a mined yield (so credence can
     reach it), or `session-miner` for the miner's OWN observations (e.g. a warm-swap flag, which
     the agent literally cannot assert). The miner is always the ACTOR (audit/event provenance),
-    so a mined row stays distinguishable from a declared one."""
+    so a mined row stays distinguishable from a declared one.
+
+    `lines`+`source_line` (PROVENANCE PIECE 2, ruling bb3e4422): when both are given, mints
+    `possible_upstream` edges to whatever this Thread's own transcript's preceding tool
+    results actually produced — additive, never required; a caller with neither (or an
+    out-of-range `source_line`) writes exactly as before this existed."""
     canon = _canon("thread", summary)
     if await _foreign_owned(actions.pool, canon, writer):
         return None
@@ -1384,6 +1530,8 @@ async def _emit_thread(
     if repo:  # the repo home is the miner's OWN structural inference (cwd->project)
         await link_repo(actions, t, repo, observed,
                         source=_SOURCE, evidence_class=_EC, confidence=_CONF)
+    if lines is not None and source_line is not None and 0 <= source_line < len(lines):
+        await _mint_possible_upstream(actions, t, lines, source_line, observed)
     return t
 
 
@@ -1655,12 +1803,18 @@ async def _stamp_subject(
 async def emit_yield(
     actions: Actions, y: SessionYield, *, repo: str | None,
     observed: datetime | None = None, source_model: str | None = None,
-    origin: str | None = None,
+    origin: str | None = None, lines: list[str] | None = None,
 ) -> dict[str, int]:
     """Write a parsed yield into the graph, DERIVED, behind the ownership boundary.
     Returns counts; `skipped_foreign` is the boundary doing its job (already captured at
     higher trust), never an error. `source_model` = which Claude authored the mined turns
     (read off the transcript), stamped on each object as the missing provenance dimension.
+
+    `lines` (PROVENANCE PIECE 2, ruling bb3e4422): the raw transcript chunk this yield was
+    extracted from, threaded down to `_emit_thread` so a `threads_opened` item carrying its
+    own `source_line` can mint `possible_upstream` edges. Omitted by any caller with no
+    transcript in hand (a replay, a test) — every threads_opened item then simply mints
+    none, same as before this piece existed.
 
     THE SPEAKER IS THE ADVERSARY; THE AGENT IS THE SUBJECT (B4, ruling ceae1604 — this SUPERSEDES
     the earlier reasoning, which was half right and produced the disease). Rows used to be SOURCED
@@ -1723,8 +1877,11 @@ async def emit_yield(
         counts["decisions"] += 1
     opened_now: set[Any] = set()
     for t in y.threads_opened:
-        text, cls = (t["summary"], t.get("class", "question")) if isinstance(t, dict) \
-            else (t, "commitment")
+        if isinstance(t, dict):
+            text, cls = t["summary"], t.get("class", "question")
+            source_line = t.get("source_line")
+        else:
+            text, cls, source_line = t, "commitment", None
         if _dup_of_deliberate(text, prior_threads):
             counts["skipped_dup"] += 1
             continue
@@ -1733,7 +1890,7 @@ async def emit_yield(
         tid = await _emit_thread(actions, text, observed=observed, source_model=source_model,
                                  kind="question" if cls == "question" else None,
                                  repo=_home_repo(known, text, repo) if repo else repo,
-                                 writer=writer)
+                                 writer=writer, lines=lines, source_line=source_line)
         if tid is not None:
             counts["threads"] += 1
             opened_now.add(tid)
@@ -1856,7 +2013,7 @@ async def adversary_pass(
 
     size = await asyncio.to_thread(_file_size, path)
     lines, _ = await asyncio.to_thread(_read_chunk, path, 0, min(size, _MAX_SCAN_BYTES))
-    text, cwd = distill(lines)
+    text, cwd = distill(lines, tag_lines=True)
     if len(text) < _MIN_DISTILLED:
         return report                  # nothing worth a model call — and silence is a fine answer
 
@@ -1870,7 +2027,7 @@ async def adversary_pass(
 
     y = parse_session_yield(raw)
     y.decisions = []                   # it is not asked for them, and it may not land them
-    counts = await emit_yield(actions, y, repo=repo, origin=agent_source,
+    counts = await emit_yield(actions, y, repo=repo, origin=agent_source, lines=lines,
                               source_model=chunk_models[-1] if chunk_models else None)
     report["proposed"] = counts["threads"] + counts["obligations"]
     report["resolve_candidates"] = counts["resolve_candidates"]
@@ -1943,7 +2100,7 @@ async def adversary_pass_from_store(
         report["deferred"] = 1         # backfill the SILENT; never second-guess the diligent
         return report
 
-    text, cwd = distill(lines)
+    text, cwd = distill(lines, tag_lines=True)
     if len(text) < _MIN_DISTILLED:
         return report                  # nothing worth a model call — and silence is a fine answer
 
@@ -1957,7 +2114,7 @@ async def adversary_pass_from_store(
 
     y = parse_session_yield(raw)
     y.decisions = []                   # it is not asked for them, and it may not land them
-    counts = await emit_yield(actions, y, repo=repo, origin=agent_source,
+    counts = await emit_yield(actions, y, repo=repo, origin=agent_source, lines=lines,
                               source_model=chunk_models[-1] if chunk_models else None)
     report["proposed"] = counts["threads"] + counts["obligations"]
     report["resolve_candidates"] = counts["resolve_candidates"]
@@ -2043,8 +2200,8 @@ async def sense_sessions_tick(
                 report["deferred"] = report.get("deferred", 0) + 1
                 continue
             chunk_models = models_in(lines)  # provenance: who authored this excerpt
-            text, cwd = distill(lines)
-            if text.startswith("OPERATOR: You have unread Osiris mail"):
+            text, cwd = distill(lines, tag_lines=True)
+            if _WAKE_MAIL_RE.match(text):
                 # TRIAGE-WAKE HUMILITY (miner overmint, 2026-07-11): a one-shot wake
                 # settles mail and retires; its 'next steps' prose is the MAIL's business
                 # (settled by reply), not project memory. Minting it amplified the wake
@@ -2079,7 +2236,7 @@ async def sense_sessions_tick(
             counts = await emit_yield(
                 actions, y, repo=repo,
                 source_model=chunk_models[-1] if chunk_models else None,
-                origin=agent_source,
+                origin=agent_source, lines=lines,
             )
             if len(chunk_models) > 1:  # a warm rug-pull inside one session — flag it
                 report["swaps"] += await _record_swap(actions, path, chunk_models, repo, lines)
