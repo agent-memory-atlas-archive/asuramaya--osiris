@@ -847,12 +847,23 @@ export async function initSpace(container) {
     if (onFocus) onFocus(null); // shares the clear with an embedding table (console.js)
   }
 
-  // SELECT: inspector only, no dim, no camera move, no path walk — the lightweight act.
-  async function selectObject(id) {
+  // SELECT: inspector only, no dim, no path walk — the lightweight act. `opts.pan` (THE
+  // READING LAYER part C, "harmony": "a table selection pans the graph") re-centers the
+  // camera on the node at the CURRENT zoom level, without space's own click doing this too
+  // — clicking a node already on screen has no reason to re-pan under the cursor.
+  async function selectObject(id, opts) {
     selectedId = id;
     pathFocusId = null;
     pathReachable = new Set();
     if (onFocus) onFocus(id);
+    if (opts && opts.pan) {
+      const nd = idToNode.find((n) => n.id === id);
+      if (nd && nd.x != null && nd.y != null) {
+        camera.position.x = nd.x;
+        camera.position.y = nd.y;
+        markDirty();
+      }
+    }
     applyDim();
     updatePathEdges();
     await inspect(id);
