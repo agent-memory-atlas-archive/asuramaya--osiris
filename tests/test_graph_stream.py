@@ -44,6 +44,7 @@ def test_snapshot_round_trips_through_the_decoder_with_the_exact_count() -> None
         type_code=[0, 1, 0], project_code=[0, 0, 1], weight=[2.0, 0.0, 5.0],
         status_flag=[0, 2, 0], edge_src=[0, 1], edge_dst=[1, 2], edge_type_code=[0, 1],
         types=["Thread", "Decision"], projects=["repo:x", "repo:y"],
+        edge_types=["cites", "in_repo"],
     )
     out = decode_snapshot(data)
     assert out["count"] == 3
@@ -51,6 +52,7 @@ def test_snapshot_round_trips_through_the_decoder_with_the_exact_count() -> None
     assert out["object_ids"] == ["a", "b", "c"]
     assert out["types"] == ["Thread", "Decision"]
     assert out["projects"] == ["repo:x", "repo:y"]
+    assert out["edge_types"] == ["cites", "in_repo"]
     assert out["x"] == pytest.approx([1.0, 2.0, 3.0])
     assert out["y"] == pytest.approx([4.0, 5.0, 6.0])
     assert out["type_code"] == [0, 1, 0]
@@ -66,7 +68,7 @@ def test_snapshot_with_no_edges_still_round_trips() -> None:
     data = encode_snapshot(
         object_ids=["only"], x=[0.0], y=[0.0], type_code=[0], project_code=[0],
         weight=[0.0], status_flag=[0], edge_src=[], edge_dst=[], edge_type_code=[],
-        types=["Thread"], projects=["unfiled"],
+        types=["Thread"], projects=["unfiled"], edge_types=[],
     )
     out = decode_snapshot(data)
     assert out["count"] == 1
@@ -80,6 +82,7 @@ def test_encode_snapshot_rejects_a_mismatched_node_column_length() -> None:
             object_ids=["a", "b"], x=[1.0], y=[1.0, 2.0], type_code=[0, 0],
             project_code=[0, 0], weight=[0.0, 0.0], status_flag=[0, 0],
             edge_src=[], edge_dst=[], edge_type_code=[], types=[], projects=[],
+            edge_types=[],
         )
 
 
@@ -88,7 +91,7 @@ def test_encode_snapshot_rejects_a_mismatched_edge_column_length() -> None:
         encode_snapshot(
             object_ids=["a"], x=[1.0], y=[1.0], type_code=[0], project_code=[0],
             weight=[0.0], status_flag=[0], edge_src=[0, 0], edge_dst=[0],
-            edge_type_code=[0, 0], types=[], projects=[],
+            edge_type_code=[0, 0], types=[], projects=[], edge_types=[],
         )
 
 
@@ -109,6 +112,7 @@ async def test_fetch_snapshot_includes_only_already_placed_objects(
     assert str(b) in out["object_ids"]
     assert out["count"] == len(out["object_ids"])
     assert out["edge_count"] >= 1
+    assert "cites" in out["edge_types"]
 
 
 async def test_fetch_snapshot_positions_match_graph_x_graph_y(actions: Actions) -> None:

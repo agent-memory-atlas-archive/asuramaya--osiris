@@ -12,7 +12,7 @@ the rest reserved), edge_src/edge_dst (Uint32), edge_type_code (Uint8). Array PO
 is the object index -- no redundant index column, per Seshat's own read of the proposal
 (mail 10449).
 
-TWO ADDITIONS BEYOND THE FROZEN BINARY SHAPE, both header-only (never touching the
+THREE ADDITIONS BEYOND THE FROZEN BINARY SHAPE, all header-only (never touching the
 arrays Seshat signed off on), flagged here and in the build report rather than done
 quietly:
   1. `object_ids` -- an index-aligned array of UUID strings in the JSON header. Needed
@@ -24,6 +24,11 @@ quietly:
      `object_ids` array and can resolve a delta's id to ITS OWN local index in O(1)
      either way. This is a documented departure from the dispatch's literal "keyed
      by object index" wording, not a silent one.
+  3. `edge_types` -- a code table for `edge_type_code`, same shape as `types`/
+     `projects`. A gap found by Seshat wiring against the live endpoint (mail 10555):
+     the frozen shape resolved node type/project codes but left `edge_type_code`
+     nameless, which she needs for real relationship color-coding rather than a raw
+     hash-on-int placeholder.
 
 NOTE ON THE RETIRED BIT (worth naming, not a bug): today's snapshot query only ever
 includes objects the layout heartbeat has actually placed, which itself only ever
@@ -62,6 +67,7 @@ def encode_snapshot(
     type_code: list[int], project_code: list[int], weight: list[float],
     status_flag: list[int], edge_src: list[int], edge_dst: list[int],
     edge_type_code: list[int], types: list[str], projects: list[str],
+    edge_types: list[str],
 ) -> bytes:
     """Pure function, no DB: builds the exact wire bytes from already-resolved
     columns -- the DB-facing half (`fetch_snapshot`) is the only caller that ever
@@ -92,8 +98,8 @@ def encode_snapshot(
 
     header = {
         "schema_version": SCHEMA_VERSION, "count": count, "edge_count": edge_count,
-        "types": types, "projects": projects, "object_ids": object_ids,
-        "arrays": offsets,
+        "types": types, "projects": projects, "edge_types": edge_types,
+        "object_ids": object_ids, "arrays": offsets,
     }
     header_bytes = json.dumps(header).encode()
     return struct.pack("<I", len(header_bytes)) + header_bytes + bytes(body)
@@ -108,7 +114,8 @@ def decode_snapshot(data: bytes) -> dict[str, Any]:
     body = data[4 + header_len:]
     out: dict[str, Any] = {
         k: header[k] for k in
-        ("schema_version", "count", "edge_count", "types", "projects", "object_ids")
+        ("schema_version", "count", "edge_count", "types", "projects", "edge_types",
+         "object_ids")
     }
     for name, meta in header["arrays"].items():
         code = str(meta["dtype"])
@@ -176,13 +183,13 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
     edge_src: list[int] = []
     edge_dst: list[int] = []
     edge_type_codes: list[int] = []
+    edge_type_index: dict[str, int] = {}
     if id_index:
         edge_rows = await pool.fetch(
             "SELECT from_id, to_id, type FROM links "
             "WHERE (valid_until IS NULL OR valid_until > now()) "
             "  AND from_id = ANY($1::uuid[]) AND to_id = ANY($1::uuid[])",
             list(id_index.keys()))
-        edge_type_index: dict[str, int] = {}
         for r in edge_rows:
             f, t = r["from_id"], r["to_id"]
             if f not in id_index or t not in id_index:
@@ -194,11 +201,12 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
 
     types = [name for name, _ in sorted(type_index.items(), key=lambda kv: kv[1])]
     projects = [name for name, _ in sorted(project_index.items(), key=lambda kv: kv[1])]
+    edge_types = [name for name, _ in sorted(edge_type_index.items(), key=lambda kv: kv[1])]
     return encode_snapshot(
         object_ids=object_ids, x=xs, y=ys, type_code=type_codes,
         project_code=project_codes, weight=weights, status_flag=statuses,
         edge_src=edge_src, edge_dst=edge_dst, edge_type_code=edge_type_codes,
-        types=types, projects=projects,
+        types=types, projects=projects, edge_types=edge_types,
     )
 
 
