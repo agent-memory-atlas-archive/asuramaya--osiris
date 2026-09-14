@@ -623,6 +623,24 @@ _LINK_TYPES: tuple[LinkType, ...] = (
     LinkType("revises", "A later Artifact version supersedes an earlier one — the "
              "version DAG, same self-referential shape as Commit's own `follows` edge.",
              ("Artifact",), ("Artifact",)),
+    LinkType("possible_upstream", "PROVENANCE BY CHANNEL, NOT BY TEXT (operator ruling "
+             "bb3e4422, 2026-09-14): a fact-write points at an object its own writer's "
+             "session had READ before writing it — read-set stamping at the MCP door "
+             "(inbox leases/peeks, recall, dossier, search/graph_search hits, "
+             "read_citation, ingest_reference; piece 1) or the ids found in the "
+             "tool_result blocks preceding a mined fact's own source line in the same "
+             "transcript, plus a WebFetch/WebSearch result's URL (piece 2). NEVER a "
+             "text-similarity guess — every edge traces to an exact id or canonical "
+             "the reading act actually produced, structural by construction. "
+             "OVERBREADTH BY DESIGN: minted liberally, used ONLY to WITHHOLD "
+             "independence in credence_props (two sources sharing a possible_upstream "
+             "are treated as dependent), NEVER to grant it — a session with an empty "
+             "read-set writes exactly as before this edge existed. Properties: `door` "
+             "(which surface produced the read) and a read timestamp; both carried in "
+             "the link's own `properties` jsonb, no schema migration. Never targets the "
+             "operator's own words.",
+             ("Decision", "Thread"),
+             ("Message", "Decision", "Thread", "Reference", "Agent", "URL")),
 )
 
 OBJECT_TYPES: dict[str, ObjectType] = {t.name: t for t in _OBJECT_TYPES}
