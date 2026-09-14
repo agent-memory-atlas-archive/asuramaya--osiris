@@ -5013,7 +5013,11 @@ async def _fn_upstream_readers(
         if oid not in groups:
             meta = obj_meta.get(oid)
             groups[oid] = {
-                "id": str(oid)[:8],
+                # the FULL id, not the usual 8-char short id (task #64's own table-row
+                # convention feeds dossier()/recall(), which accept a short id; this
+                # Function's own consumer is the "who else read this" UI click-through,
+                # which fetches /objects/{id} directly and needs the real uuid).
+                "id": str(oid),
                 "canonical": meta["canonical"] if meta else None,
                 "name": (resolve_label(meta["type"], label_props.get(oid, {}),
                                        meta["canonical"]).label if meta else str(oid)),

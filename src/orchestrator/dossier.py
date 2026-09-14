@@ -174,6 +174,7 @@ async def entity_dossier(
         )
         entry["distinct_upstreams"] = signals[pname]["distinct_upstreams"]
         entry["disputed"] = signals[pname]["disputed"]
+        entry["upstream_ids"] = signals[pname]["upstream_ids"]
 
     # relationships, both directions, neighbor labelled and typed. Repeated edges
     # (same direction, type, neighbor) are collapsed: a duplicated link carries no

@@ -826,6 +826,7 @@ def create_app(pool: asyncpg.Pool | None = None) -> FastAPI:
                     "agreement": agreement_by_name[r["name"]],
                     "distinct_upstreams": signals[r["name"]]["distinct_upstreams"],
                     "disputed": signals[r["name"]]["disputed"],
+                    "upstream_ids": signals[r["name"]]["upstream_ids"],
                 }
                 for r in props
             ],
