@@ -320,26 +320,62 @@ async def test_watchdog_logs_once_when_a_call_crosses_the_threshold(
 
     monkeypatch.setattr(srv, "_WATCHDOG_POLL_INTERVAL_S", 0.01)
     monkeypatch.setattr(srv, "_WATCHDOG_STALL_THRESHOLD_S", 0.02)
+    monkeypatch.setattr(srv, "_WATCHDOG_REPEAT_INTERVAL_S", 60.0)  # no repeat within this test
     call_id = next(srv._in_flight_next_id)
+    started = time.monotonic() - 1.0
     srv._in_flight_calls[call_id] = {
-        "tool": "search", "caller": "agent:thoth", "started_at": time.monotonic() - 1.0,
-        "logged": False,
+        "tool": "search", "caller": "agent:thoth", "started_at": started,
+        "next_log_at": started + 0.02,
     }
 
     task = asyncio.create_task(srv._watchdog_loop())
     try:
         with caplog.at_level(logging.WARNING, logger="osiris.mcp.watchdog"):
-            await asyncio.sleep(0.08)  # several poll intervals — proves ONCE, not repeated
+            await asyncio.sleep(0.08)  # several poll intervals — proves ONCE here
     finally:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
-    assert srv._in_flight_calls[call_id]["logged"] is True
     slow_records = [r for r in caplog.records if "SLOW TOOL CALL" in r.message]
-    assert len(slow_records) == 1  # exactly once, never re-fired for the same call_id
+    assert len(slow_records) == 1  # not re-fired again within the (long) repeat interval
     assert "'search'" in slow_records[0].message
     assert "agent:thoth" in slow_records[0].message
+
+
+@pytest.mark.asyncio
+async def test_watchdog_logs_again_every_repeat_interval_while_the_call_stays_in_flight(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Thoth mail 10628's own fuller spec: "when any tool call passes 10s, then every
+    30s while it runs" — a call still running well past the first log must keep
+    reminding the journal, not go silent after one warning."""
+    import asyncio
+    import contextlib
+    import logging
+    import time
+
+    monkeypatch.setattr(srv, "_WATCHDOG_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(srv, "_WATCHDOG_STALL_THRESHOLD_S", 0.02)
+    monkeypatch.setattr(srv, "_WATCHDOG_REPEAT_INTERVAL_S", 0.03)
+    call_id = next(srv._in_flight_next_id)
+    started = time.monotonic()
+    srv._in_flight_calls[call_id] = {
+        "tool": "search", "caller": "agent:thoth", "started_at": started,
+        "next_log_at": started + 0.02,
+    }
+
+    task = asyncio.create_task(srv._watchdog_loop())
+    try:
+        with caplog.at_level(logging.WARNING, logger="osiris.mcp.watchdog"):
+            await asyncio.sleep(0.15)  # several repeat intervals, call never removed
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    slow_records = [r for r in caplog.records if "SLOW TOOL CALL" in r.message]
+    assert len(slow_records) >= 2  # the first threshold hit, plus at least one repeat
 
 
 @pytest.mark.asyncio
@@ -354,9 +390,10 @@ async def test_watchdog_never_logs_a_call_under_the_threshold(
     monkeypatch.setattr(srv, "_WATCHDOG_POLL_INTERVAL_S", 0.01)
     monkeypatch.setattr(srv, "_WATCHDOG_STALL_THRESHOLD_S", 5.0)
     call_id = next(srv._in_flight_next_id)
+    started = time.monotonic()
     srv._in_flight_calls[call_id] = {
-        "tool": "search", "caller": "agent:thoth", "started_at": time.monotonic(),
-        "logged": False,
+        "tool": "search", "caller": "agent:thoth", "started_at": started,
+        "next_log_at": started + 5.0,
     }
 
     task = asyncio.create_task(srv._watchdog_loop())
@@ -368,7 +405,6 @@ async def test_watchdog_never_logs_a_call_under_the_threshold(
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
-    assert srv._in_flight_calls[call_id]["logged"] is False
     assert not any("SLOW TOOL CALL" in r.message for r in caplog.records)
 
 
@@ -394,12 +430,14 @@ async def test_tool_traffic_carries_the_in_flight_list(
 
     fresh_id = next(srv._in_flight_next_id)
     stale_id = next(srv._in_flight_next_id)
+    fresh_started = time.monotonic()
+    stale_started = time.monotonic() - 42.0
     srv._in_flight_calls[fresh_id] = {
-        "tool": "mount", "caller": "agent:thoth", "started_at": time.monotonic(),
-        "logged": False}
+        "tool": "mount", "caller": "agent:thoth", "started_at": fresh_started,
+        "next_log_at": fresh_started + srv._WATCHDOG_STALL_THRESHOLD_S}
     srv._in_flight_calls[stale_id] = {
-        "tool": "search", "caller": "agent:seshat",
-        "started_at": time.monotonic() - 42.0, "logged": True}
+        "tool": "search", "caller": "agent:seshat", "started_at": stale_started,
+        "next_log_at": stale_started + srv._WATCHDOG_REPEAT_INTERVAL_S}
 
     out = await srv.tool_traffic(window_minutes=5)
 
@@ -410,6 +448,80 @@ async def test_tool_traffic_carries_the_in_flight_list(
     assert by_id[stale_id]["elapsed_secs"] >= 42.0
     # sorted longest-in-flight first — the row an operator actually needs to see
     assert out["in_flight"][0]["call_id"] == stale_id
+
+
+@pytest.mark.asyncio
+async def test_watchdog_proves_itself_against_a_synthetic_blocking_tool(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """THE WATCHDOG PROVING ITSELF (Thoth mail 10640, tip 2's own explicit ask): the
+    watchdog task and a "tool call" task genuinely running CONCURRENTLY (two real
+    asyncio tasks racing, not one test pre-seeding a stale timestamp and checking it
+    once) — the tool task mirrors BoundedMCP.call_tool's own in-flight register/pop
+    shape exactly (mirrors, not calls — BoundedMCP.call_tool itself needs a live MCP
+    client session's own request context several calls deep, `_conn_key`'s own
+    `ctx.request_context.request`, confirmed live: calling it directly from a bare
+    unit test raises `ValueError: Context is not available outside of a request`
+    before ever reaching the watchdog logic this test wants to exercise, hence
+    mirroring the shape rather than fighting that boundary).
+
+    Thoth's own spec names a 12s blocking tool; this test scales every timing constant
+    down together (poll/threshold/tool-duration all shrunk by the same factor,
+    preserving "the tool call comfortably outlives the stall threshold") so the suite
+    doesn't spend 12 real seconds proving it — the RATIO under test, not the literal
+    12s, is what the mechanism cares about.
+
+    NAMED LIMITATION, not silently glossed over: this synthetic tool `await`s
+    (`asyncio.sleep`), which cooperatively yields the event loop back to the watchdog
+    task — the shape a call doing many small awaited DB round-trips has (arguably the
+    incident's own early "crawled" phase, 45-180s calls that were still eventually
+    answering). A GENUINELY blocking synchronous call (the incident's actual later
+    phase — Sekhmet's `path.read_text()` on the loop thread, never awaited) freezes
+    the ENTIRE event loop, including this watchdog's own polling task, so it could
+    never fire mid-block by construction — no in-process asyncio watchdog can preempt
+    a truly synchronous stall. That is exactly why faulthandler.register(SIGUSR1) (an
+    OS SIGNAL, not a coroutine) is the other, non-optional half of this tip: it is the
+    one door that still works when this one structurally cannot."""
+    import asyncio
+    import contextlib
+    import logging
+    import time
+
+    monkeypatch.setattr(srv, "_WATCHDOG_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(srv, "_WATCHDOG_STALL_THRESHOLD_S", 0.05)
+    monkeypatch.setattr(srv, "_WATCHDOG_REPEAT_INTERVAL_S", 60.0)
+
+    tool_name = "test_synthetic_slow_tool"
+
+    async def _tool_call() -> dict[str, str]:
+        """Mirrors BoundedMCP.call_tool's own in-flight register/pop shape (mcp_server.py,
+        the same block, minus the ctx-dependent caller resolution this test has no live
+        session to supply)."""
+        call_id = next(srv._in_flight_next_id)
+        t0 = time.monotonic()
+        srv._in_flight_calls[call_id] = {
+            "tool": tool_name, "caller": "agent:test", "started_at": t0,
+            "next_log_at": t0 + srv._WATCHDOG_STALL_THRESHOLD_S,
+        }
+        try:
+            await asyncio.sleep(0.15)  # scaled-down stand-in for the dispatched "12s"
+            return {"ok": True}
+        finally:
+            srv._in_flight_calls.pop(call_id, None)
+
+    watchdog = asyncio.create_task(srv._watchdog_loop())
+    try:
+        with caplog.at_level(logging.WARNING, logger="osiris.mcp.watchdog"):
+            result = await _tool_call()
+    finally:
+        watchdog.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watchdog
+
+    assert result == {"ok": True}  # the call itself still completes and returns cleanly
+    slow_records = [r for r in caplog.records if "SLOW TOOL CALL" in r.message]
+    assert slow_records, "the watchdog never fired for a call that ran well past its own threshold"
+    assert tool_name in slow_records[0].message
 
 
 @pytest.mark.asyncio

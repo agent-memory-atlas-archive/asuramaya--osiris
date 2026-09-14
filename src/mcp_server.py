@@ -213,7 +213,8 @@ class BoundedMCP(FastMCP):
         # correctly. Never conflate the two: the watchdog trades attribution precision
         # for a value available the instant the call begins.
         _in_flight_calls[call_id] = {
-            "tool": name, "caller": _caller_for(ctx), "started_at": t0, "logged": False}
+            "tool": name, "caller": _caller_for(ctx), "started_at": t0,
+            "next_log_at": t0 + _WATCHDOG_STALL_THRESHOLD_S}
         result_bytes = 0
         try:
             result = await self._tool_manager.call_tool(
@@ -394,14 +395,18 @@ _TOOL_STATS_BLIND_SPOTS = (
 #   2. This watchdog: BoundedMCP.call_tool (the one seam every tool call already passes
 #      through, bounding + stats) now registers an IN-FLIGHT entry per call and a
 #      background task polls it — the moment any call has been running past
-#      _WATCHDOG_STALL_THRESHOLD_S, it logs ONCE (never repeats for the same call) with
-#      every thread's own stack, unprompted, no operator action required. A genuinely
-#      single-threaded asyncio event loop means "every thread's stack" is really "the one
-#      loop thread's stack plus whatever daemon threads exist" — deliberately not narrowed
-#      to just the loop thread, since a wedge could in principle be a C-extension holding
-#      the GIL from a different thread the loop thread never shows.
+#      _WATCHDOG_STALL_THRESHOLD_S, it logs, then AGAIN every
+#      _WATCHDOG_REPEAT_INTERVAL_S for as long as the same call stays in flight (Thoth
+#      mail 10628, the fuller spec: "when any tool call passes 10s, then every 30s
+#      while it runs") — every thread's own stack, unprompted, no operator action
+#      required. A genuinely single-threaded asyncio event loop means "every thread's
+#      stack" is really "the one loop thread's stack plus whatever daemon threads
+#      exist" — deliberately not narrowed to just the loop thread, since a wedge could
+#      in principle be a C-extension holding the GIL from a different thread the loop
+#      thread never shows.
 _WATCHDOG_POLL_INTERVAL_S = 2.0
 _WATCHDOG_STALL_THRESHOLD_S = 10.0
+_WATCHDOG_REPEAT_INTERVAL_S = 30.0
 _in_flight_calls: dict[int, dict[str, Any]] = {}
 _in_flight_next_id = itertools.count()
 _watchdog_task: asyncio.Task[None] | None = None
@@ -422,7 +427,11 @@ async def _watchdog_loop() -> None:
     """Runs for the life of the process (started lazily on first tool call, same pattern
     `_ensure_tool_stats_flush_task` already uses) — polls `_in_flight_calls`, never
     blocks on anything itself (a blocked event loop would also freeze THIS task, so its
-    own job is only to notice and log, not to unblock)."""
+    own job is only to notice and log, not to unblock). `next_log_at` is a monotonic
+    deadline, not a boolean: the FIRST log fires at `started_at + _WATCHDOG_STALL_
+    THRESHOLD_S`, every log after that reschedules `next_log_at` to
+    `now + _WATCHDOG_REPEAT_INTERVAL_S` — a call still running 90s later logs at
+    roughly 10s, 40s, 70s, not once and then silence."""
     import logging
 
     log = logging.getLogger("osiris.mcp.watchdog")
@@ -430,17 +439,14 @@ async def _watchdog_loop() -> None:
         await asyncio.sleep(_WATCHDOG_POLL_INTERVAL_S)
         now = time.monotonic()
         for call_id, info in list(_in_flight_calls.items()):
-            if info["logged"]:
+            if now < info["next_log_at"]:
                 continue
             elapsed = now - info["started_at"]
-            if elapsed < _WATCHDOG_STALL_THRESHOLD_S:
-                continue
-            info["logged"] = True
+            info["next_log_at"] = now + _WATCHDOG_REPEAT_INTERVAL_S
             _log_all_thread_stacks(
                 log, reason=(
                     f"SLOW TOOL CALL: {info['tool']!r} (caller={info['caller']!r}, "
-                    f"call_id={call_id}) has been in flight {elapsed:.1f}s, past the "
-                    f"{_WATCHDOG_STALL_THRESHOLD_S:.0f}s threshold"))
+                    f"call_id={call_id}) has been in flight {elapsed:.1f}s"))
 
 
 def _ensure_watchdog_task() -> None:
