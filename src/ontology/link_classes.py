@@ -1,0 +1,78 @@
+"""NAVIGABLE SPACE, THE READING LAYER (ruling c5953bb1, operator's word on his own
+screenshot: clusters far apart, huge cross-cluster bundles). Live numbers Thoth measured
+(mail 10595): repo:osiris degree 20,352, principal:analyst:operator degree 18,472,
+dev:asuramaya 9,462 -- every object in the graph draws a spoke to one of a few shared
+hubs via a MEMBERSHIP/IDENTITY edge (in_repo, acts_for, works_in, spawned_by,
+authored_by...), and when the layout heartbeat's intra-project relax pulled on those
+edges too, that spoke became a literal spring pulling every object toward the hub
+regardless of which project it actually lives in -- the bundle.
+
+STRUCTURAL vs SEMANTIC is the fix: a structural edge says WHO BELONGS WHERE (identity,
+membership, authorship, dispatch) -- real, load-bearing, but never a claim about the
+object's own CONTENT, and drawing a spring along it is exactly what produced the
+cross-cluster bundle. A semantic edge is an actual claim about content (this cites that,
+this supersedes that, this is upstream of that) -- the only kind of edge
+graph_layout.py's intra-project relax should ever pull on.
+
+ONE shared table, agreed by DM with Seshat (mail 10604) before this was committed:
+graph_layout.py's own relax-exclusion reads it, graph_stream.py's wire header
+serializes it (`link_type_class`, index-aligned to `edge_types`) so the renderer reads
+the classification off the wire rather than hardcoding a second copy client-side.
+
+TOTAL, NEVER PARTIAL: `link_class()` always returns a value (an unclassified/extension
+type defaults to "semantic" -- the safe default, since a wrongly-semantic structural
+edge just behaves like it did before this fix, never invisibly bundling something new).
+But `test_link_classes.py`'s own population test holds this house to a HIGHER bar than
+the safe default: every link type this codebase's OWN write paths (`create_link`/
+`_link_once` call sites, scanned live) can ever actually mint must appear in one of the
+two EXPLICIT sets below, not silently fall through to the default -- "no unclassified"
+per the ruling's own acceptance line.
+"""
+from __future__ import annotations
+
+STRUCTURAL_LINK_TYPES: frozenset[str] = frozenset({
+    # membership / identity -- an object's own place in the fleet, not a claim about
+    # what it says or means
+    "in_repo", "works_in", "acts_for", "authored_by", "spawned_by",
+    # dispatch / addressing -- who a message or broadcast reaches, not content
+    "sent_by", "addressed_to", "broadcast_to", "replies_to", "in_thread",
+    "holds",
+    # governance / lineage-of-OFFICE (never lineage-of-FACT, see succeeded_from below)
+    "managed_by", "governs", "succeeds_seat", "forked_from", "worktree_of",
+})
+
+# every OTHER link type this codebase's write paths actually mint today (scanned via
+# `create_link`/`_link_once`/`_link` call sites -- test_link_classes.py's own
+# population test re-derives this list live and fails if a new one appears
+# unclassified) -- listed explicitly so a reviewer can see the actual triage, not
+# inferred from "not structural."
+SEMANTIC_LINK_TYPES_KNOWN: frozenset[str] = frozenset({
+    "follows", "cites", "possible_upstream", "informs",
+    "resolved_by", "closed_by", "decided_in", "answers", "grounded_by", "witnesses",
+    "refuted_by", "killed_by", "implements", "rediscovers", "narrows", "peer_of",
+    "produced", "derived_from", "authorized_by", "evaluated_by", "ruled_by", "revises",
+    "mentions", "noted_in", "not_same_as",
+    # lineage-of-FACT (succession/authorship across agent generations): a real claim
+    # ("this session's own words descend from that one's"), and per Thoth's own mail
+    # 10595 listed as semantic, not structural -- pulling on it doesn't bundle by
+    # PROJECT the way a membership edge does.
+    "succeeded_from",
+    # OSINT-domain entity relationships (case/investigation objects, a different
+    # population from the fleet's own Agent/Thread/Decision graph this ruling is
+    # actually about) -- genuine CONTENT claims about an entity (who controls it, what
+    # it owns, who sponsors it), never fleet membership, so semantic is the correct
+    # classification, not merely the safe default.
+    "controlled_by", "has_account", "has_domain", "has_email", "has_url",
+    "investigator", "litigation", "officer", "raises_for", "site", "sponsors",
+    "transacted_with",
+})
+
+
+def link_class(link_type: str) -> str:
+    """"structural" or "semantic" -- total, never raises. An unrecognized/extension
+    type defaults to "semantic" (the safe default: behaves exactly as it did before
+    this fix, never a silent new source of bundling) -- but see the module docstring
+    for why the actually-used population is held to a stricter bar than this default."""
+    if link_type in STRUCTURAL_LINK_TYPES:
+        return "structural"
+    return "semantic"
