@@ -83,7 +83,12 @@ _SUBPROCESS_BASELINE: dict[str, int] = {
     # object-events, succession-chain, candidates, composition, retire-assertion,
     # retire-link, cite, citation) — the identical false-positive class every entry
     # above already names, not genuine new unbounded subprocess calls.
-    "src/cli.py": 81,
+    # 81 -> 82 (2026-09-14, Khnum, NAVIGABLE SPACE THE SERVER piece B, thread
+    # b6cb1d7c0b36, rebased onto Imhotep's own raise above — sum of both, not a
+    # replacement): one new dispatch line, `asyncio.run(cmd_graph_export(...))`, same
+    # false-positive class as every comment above — not a genuine new unbounded
+    # subprocess call.
+    "src/cli.py": 82,
     "src/ingest/files.py": 3,
     "src/ingest/gitlog.py": 3,
     "src/ingest/sessions.py": 3,
