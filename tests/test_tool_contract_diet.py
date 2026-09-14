@@ -1581,7 +1581,15 @@ TOOL_CONTRACT_EXPECTED_COUNT = 86
 # existing one, same class as a new tool. Trimmed to one clause before raising ("seven"
 # corrected to "eight" in the same edit). No new @mcp.tool(), tool count unchanged.
 # Measured exact (137,474).
-TOOL_CONTRACT_CEILING_CHARS = 137474
+# 137474 -> 137755 (2026-09-14, Sekhmet, thread e332177f, Thoth msg 10525 follow-on):
+# `backfill` gains two new params, `limit`/`newest_first`, consulted only by
+# provenance_possible_upstream — the fix for "the oldest-first default made the sample
+# blind: pre-ledger generations can never match" (Thoth's own words). Genuinely new
+# capability on an existing tool, not prose creep; the CLI door (`--limit`/
+# `--newest-first`) gained matching flags in the same change, satisfying the CLI/MCP
+# parity gate rather than declaring an exemption. No new @mcp.tool(), tool count
+# unchanged. Measured exact (137,755).
+TOOL_CONTRACT_CEILING_CHARS = 137755
 
 def test_ceiling_has_exactly_one_executable_assignment() -> None:
     """THE RATCHET'S OWN GUARD (thread c655c757). This file used to carry every historical

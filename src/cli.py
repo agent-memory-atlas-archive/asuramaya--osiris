@@ -5169,19 +5169,24 @@ async def cmd_fleet_prune(
 
 async def cmd_backfill(
     target: str, *, apply: bool = False, because: str | None = None,
-    only_bases: list[str] | None = None, actor: str, as_json: bool = False,
+    only_bases: list[str] | None = None, limit: int | None = None,
+    newest_first: bool = False, actor: str, as_json: bool = False,
     pool: asyncpg.Pool | None = None,
 ) -> int:
-    """osiris backfill <target> [--apply] [--because R] [--only-bases ID,...] [--json]
-    [--actor W] — the console-script door onto orchestrator.backfill.run_backfill, the
-    SAME function the `backfill` MCP tool and the UI's Repairs panel call (thread
-    c89a9873, wave 22, ruling 7be61879). Dry run is the default for every target
-    (returns the receipt, writes nothing); `--apply` performs it.
+    """osiris backfill <target> [--apply] [--because R] [--only-bases ID,...]
+    [--limit N] [--newest-first] [--json] [--actor W] — the console-script door onto
+    orchestrator.backfill.run_backfill, the SAME function the `backfill` MCP tool and
+    the UI's Repairs panel call (thread c89a9873, wave 22, ruling 7be61879). Dry run is
+    the default for every target (returns the receipt, writes nothing); `--apply`
+    performs it.
 
     `agent_project_links` predates the underlying tool's own because-required-to-write
     convention (a historical exemption) — this door does NOT inherit that exemption: a
     `--because` is required to `--apply` regardless of target, a stricter contract this
-    surface imposes on its own, deliberately (thread c89a9873's own scope note)."""
+    surface imposes on its own, deliberately (thread c89a9873's own scope note).
+
+    `--limit`/`--newest-first` (thread e332177f) are consulted only by
+    provenance_possible_upstream, ignored by every other target."""
     from src.orchestrator.backfill import run_backfill
 
     if apply and not (because or "").strip():
@@ -5209,7 +5214,7 @@ async def cmd_backfill(
     try:
         out = await run_backfill(
             pool, target, actor=actor, dry_run=not apply, because=because,
-            only_bases=only_bases)
+            only_bases=only_bases, limit=limit, newest_first=newest_first)
     finally:
         if owns_pool:
             await pool.close()
@@ -7412,6 +7417,15 @@ def _build_parser() -> argparse.ArgumentParser:
                             help="comma-separated base agent ids — only meaningful for "
                                  "the agent_project_links target, ignored by the other "
                                  "six")
+    p_backfill.add_argument("--limit", type=int, default=None,
+                            help="candidate batch size — only meaningful for "
+                                 "provenance_possible_upstream (default 200), ignored "
+                                 "by every other target")
+    p_backfill.add_argument("--newest-first", action="store_true",
+                            help="sample the most recent candidates instead of the "
+                                 "oldest — only meaningful for "
+                                 "provenance_possible_upstream, ignored by every other "
+                                 "target")
     p_backfill.add_argument("--actor", default=_CONSOLE_ACTOR,
                             help=f"who is performing this backfill — defaults to "
                                  f"{_CONSOLE_ACTOR!r}")
@@ -7988,6 +8002,7 @@ def main(argv: list[str] | None = None) -> int:
         only_bases = (args.only_bases.split(",") if args.only_bases else None)
         return asyncio.run(cmd_backfill(
             args.target, apply=args.apply, because=args.because, only_bases=only_bases,
+            limit=args.limit, newest_first=args.newest_first,
             actor=args.actor, as_json=args.as_json))
     if args.command == "heal-seat-transcript":
         return asyncio.run(cmd_heal_seat_transcript(

@@ -70,10 +70,18 @@ _EC = EvidenceClass.DERIVED.value  # a transcript text scan is an inference, sam
 _CONF = confidence_for(EvidenceClass.DERIVED)
 
 
-async def _candidates(pool: asyncpg.Pool, limit: int) -> list[asyncpg.Record]:
+async def _candidates(
+    pool: asyncpg.Pool, limit: int, *, newest_first: bool = False,
+) -> list[asyncpg.Record]:
     """Every Decision/Thread with an agent:-prefixed writer and NO possible_upstream
-    out-edge yet — the live-path gap this backfill exists to close. Oldest first: the
-    writes most likely to predate piece 1's own live wiring are served first."""
+    out-edge yet — the live-path gap this backfill exists to close. Oldest first by
+    default (the writes most likely to predate piece 1's own live wiring); `newest_first`
+    (thread e332177f, Thoth's own follow-on, msg 10525 — "the oldest-first default made
+    the sample blind: pre-ledger generations can never match") flips the order to sample
+    the writers MOST likely to carry a live anchor_sid ledger instead, since the ledger is
+    itself a recent mechanism — the two orders answer different questions and neither
+    subsumes the other over one bounded `limit`."""
+    order = "DESC" if newest_first else "ASC"
     return await pool.fetch(  # type: ignore[no-any-return]
         "SELECT o.id, o.canonical, o.type, a.source_id AS writer, o.created_at "
         "FROM objects o "
@@ -81,7 +89,7 @@ async def _candidates(pool: asyncpg.Pool, limit: int) -> list[asyncpg.Record]:
         "WHERE o.type = ANY($1) AND a.source_id LIKE 'agent:%' "
         "AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_id = o.id "
         "AND l.type = 'possible_upstream') "
-        "ORDER BY o.created_at ASC LIMIT $2",
+        f"ORDER BY o.created_at {order} LIMIT $2",
         list(_TARGET_TYPES), limit)
 
 
@@ -116,21 +124,36 @@ def _find_receipt_line(lines: list[str], canonical: str) -> int | None:
 
 async def backfill_possible_upstream(
     actions: Actions, *, dry_run: bool = True, because: str | None = None,
-    limit: int = _DEFAULT_LIMIT, window: int = _WINDOW, transcript_root: Path | None = None,
+    limit: int = _DEFAULT_LIMIT, newest_first: bool = False, window: int = _WINDOW,
+    transcript_root: Path | None = None,
 ) -> dict[str, Any]:
     """`transcript_root` defaults to `get_settings().osiris_transcripts` — overridable so
     a test (or an operator pointing at an archived tree) never depends on the live
-    fleet's own configured root."""
+    fleet's own configured root.
+
+    THE RECEIPT'S OWN SUMMARY (thread e332177f, Thoth msg 10525): `summary.candidates`/
+    `summary.writers` classify every candidate/writer examined into exactly one of
+    `matched` (a receipt was found — this writer's transcript IS reachable, whether or
+    not that receipt's own preceding window produced any upstream targets),
+    `no_ledger` (the writer carries no `anchor_sid` assertion at all — never attempted a
+    transcript read), or `no_transcript` (a ledger exists but no sid in it resolved to a
+    receipt for this write). A writer with a ledger who matches on ONE candidate and
+    misses on another counts as `matched` at the writer level — the ledger is proven
+    reachable, so the miss is that specific write's own receipt, not the writer's
+    transcript access. `runtime_seconds` times the whole call, wall-clock."""
     if not dry_run and not (because or "").strip():
         return {"error": "backfilling historical provenance without a because is an "
                          "un-audited graph write — cite the ruling/dispatch that "
                          "authorizes it (thread e332177f, Thoth mail 10440), never silent"}
 
     import asyncio
+    import time
 
     from src.ingest.sessions import _upstream_targets
     from src.ontology.canonicalize import canonicalize
     from src.orchestrator.mounts import _transcript_index
+
+    started = time.monotonic()
 
     if transcript_root is None:
         from src.config.settings import get_settings
@@ -144,14 +167,21 @@ async def backfill_possible_upstream(
     skipped: list[dict[str, str]] = []
     file_cache: dict[Path, list[str]] = {}
     examined = 0
+    candidate_tally = {"matched": 0, "no_ledger": 0, "no_transcript": 0}
+    writer_outcomes: dict[str, set[str]] = {}
 
-    for cand in await _candidates(actions.pool, limit):
+    def _tag(writer: str, outcome: str) -> None:
+        candidate_tally[outcome] += 1
+        writer_outcomes.setdefault(writer, set()).add(outcome)
+
+    for cand in await _candidates(actions.pool, limit, newest_first=newest_first):
         examined += 1
         writer = cand["writer"]
         sids = await _anchor_sids(actions.pool, writer)
         if not sids:
             skipped.append({"object": cand["canonical"], "writer": writer,
                             "reason": "writer carries no anchor_sid ledger"})
+            _tag(writer, "no_ledger")
             continue
         receipt_line: int | None = None
         receipt_lines: list[str] | None = None
@@ -175,7 +205,9 @@ async def backfill_possible_upstream(
             skipped.append({"object": cand["canonical"], "writer": writer,
                             "reason": "no receipt for this write found in any of the "
                                      f"writer's {len(sids)} indexed transcript(s)"})
+            _tag(writer, "no_transcript")
             continue
+        _tag(writer, "matched")
 
         for target, props in await _upstream_targets(
             actions.pool, receipt_lines, receipt_line, window=window,
@@ -199,10 +231,25 @@ async def backfill_possible_upstream(
                 "to": to_key, "is_url": is_url, "door": door,
             })
 
+    edges_by_door: dict[str, int] = {}
+    for item in plan:
+        edges_by_door[item["door"]] = edges_by_door.get(item["door"], 0) + 1
+
+    writer_tally = {"matched": 0, "no_ledger": 0, "no_transcript": 0}
+    for outcomes in writer_outcomes.values():
+        if "no_ledger" in outcomes:
+            writer_tally["no_ledger"] += 1
+        elif "matched" in outcomes:
+            writer_tally["matched"] += 1
+        else:
+            writer_tally["no_transcript"] += 1
+
     report: dict[str, Any] = {
-        "dry_run": dry_run, "candidates_examined": examined,
-        "edges_to_mint": len(plan), "plan": plan,
+        "dry_run": dry_run, "candidates_examined": examined, "newest_first": newest_first,
+        "edges_to_mint": len(plan), "edges_by_door": edges_by_door, "plan": plan,
         "skipped_count": len(skipped), "skipped": skipped,
+        "summary": {"candidates": candidate_tally, "writers": writer_tally},
+        "runtime_seconds": round(time.monotonic() - started, 3),
     }
     if dry_run or not plan:
         return report
@@ -225,5 +272,6 @@ async def backfill_possible_upstream(
             from_id, to_id, "possible_upstream", item["writer"], now, _CONF,
             evidence_class=_EC, properties={"door": item["door"], "read_at": now.isoformat()})
         minted += 1
-    report.update({"minted": minted, "because": because})
+    report.update({"minted": minted, "because": because,
+                   "runtime_seconds": round(time.monotonic() - started, 3)})
     return report

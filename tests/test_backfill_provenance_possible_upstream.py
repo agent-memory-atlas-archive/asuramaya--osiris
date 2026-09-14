@@ -130,3 +130,76 @@ async def test_writer_with_no_anchor_sid_ledger_is_reported_skipped_not_silently
     assert report["skipped_count"] == 1
     assert report["skipped"][0]["object"] == "decision:iii999jjj000"
     assert "anchor_sid" in report["skipped"][0]["reason"]
+
+
+# --- thread e332177f, Thoth msg 10525: newest_first + per-writer summary + runtime ----
+
+async def test_summary_classifies_matched_no_ledger_and_no_transcript(
+    actions: Actions, tmp_path: Path,
+) -> None:
+    now = datetime.now(UTC)
+    # matched: a real receipt, findable.
+    await actions.create_or_find_object("Decision", "decision:a00000a00000", "x")
+    lines = [
+        _tool_result(json.dumps({"canonical": "decision:a00000a00000"})),
+        _tool_result(json.dumps({"canonical": "decision:matched0001a2"})),
+    ]
+    await _mint_agent_with_sid(actions, "agent:writer-matched", "sidmatch1deadbeef",
+                               tmp_path, lines)
+    matched_d = await actions.create_or_find_object(
+        "Decision", "decision:matched0001a2", "agent:writer-matched")
+    await actions.assert_property(matched_d, "summary", "a matched write",
+                                  "agent:writer-matched", now, 0.9)
+
+    # no_ledger: writer has zero anchor_sid assertions.
+    no_ledger_d = await actions.create_or_find_object(
+        "Decision", "decision:noledger00001", "agent:writer-no-ledger")
+    await actions.assert_property(no_ledger_d, "summary", "a ledgerless write",
+                                  "agent:writer-no-ledger", now, 0.9)
+
+    # no_transcript: writer HAS a ledger sid, but that sid resolves to no receipt for
+    # this write (the transcript file exists but never mentions this canonical).
+    await _mint_agent_with_sid(
+        actions, "agent:writer-no-transcript", "sidnotranscript1",
+        tmp_path, [_tool_result(json.dumps({"canonical": "decision:unrelated0001"}))])
+    no_transcript_d = await actions.create_or_find_object(
+        "Decision", "decision:missingrcpt001", "agent:writer-no-transcript")
+    await actions.assert_property(no_transcript_d, "summary", "never finds its receipt",
+                                  "agent:writer-no-transcript", now, 0.9)
+
+    report = await backfill_possible_upstream(
+        actions, dry_run=True, transcript_root=tmp_path)
+
+    assert report["summary"]["candidates"] == {
+        "matched": 1, "no_ledger": 1, "no_transcript": 1}
+    assert report["summary"]["writers"] == {
+        "matched": 1, "no_ledger": 1, "no_transcript": 1}
+    assert report["edges_by_door"]
+    assert sum(report["edges_by_door"].values()) == report["edges_to_mint"]
+
+
+async def test_newest_first_flips_candidate_order(actions: Actions, tmp_path: Path) -> None:
+    older = await actions.create_or_find_object(
+        "Decision", "decision:orderolder0001", "agent:writer-order")
+    await actions.assert_property(older, "summary", "the older one",
+                                  "agent:writer-order", datetime(2020, 1, 1, tzinfo=UTC), 0.9)
+    newer = await actions.create_or_find_object(
+        "Decision", "decision:ordernewer0001", "agent:writer-order")
+    await actions.assert_property(newer, "summary", "the newer one",
+                                  "agent:writer-order", datetime(2021, 1, 1, tzinfo=UTC), 0.9)
+
+    oldest_first = await backfill_possible_upstream(
+        actions, dry_run=True, limit=1, transcript_root=tmp_path)
+    newest_first = await backfill_possible_upstream(
+        actions, dry_run=True, limit=1, newest_first=True, transcript_root=tmp_path)
+
+    assert oldest_first["skipped"][0]["object"] == "decision:orderolder0001"
+    assert newest_first["skipped"][0]["object"] == "decision:ordernewer0001"
+    assert newest_first["newest_first"] is True
+
+
+async def test_runtime_seconds_is_reported(actions: Actions, tmp_path: Path) -> None:
+    report = await backfill_possible_upstream(
+        actions, dry_run=True, limit=1, transcript_root=tmp_path)
+    assert isinstance(report["runtime_seconds"], float)
+    assert report["runtime_seconds"] >= 0
