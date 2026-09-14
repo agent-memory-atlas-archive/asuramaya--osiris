@@ -6353,12 +6353,16 @@ async def unwire_informs_fanout(
 
 async def _dispatch_backfill(
     target: str, dry_run: bool, because: str | None, only_bases: list[str] | None,
-    ctx: Context | None,
+    ctx: Context | None, *, limit: int | None = None, newest_first: bool = False,
 ) -> dict[str, Any]:
     """The mount-gate every MCP backfill door shares (this tool, plus the four
     deprecated single-target wrappers below it) — resolves the calling identity, then
     delegates to `run_backfill`, the SAME function the CLI's `osiris backfill` door
-    calls directly (thread c89a9873, wave 22). Never a second dispatch table."""
+    calls directly (thread c89a9873, wave 22). Never a second dispatch table.
+
+    `limit`/`newest_first` (thread e332177f) pass straight through — `run_backfill`
+    itself is the one place that knows only `provenance_possible_upstream` consults
+    them."""
     from src.orchestrator.backfill import run_backfill
 
     ident = await _ident_for(ctx)
@@ -6368,13 +6372,14 @@ async def _dispatch_backfill(
     pool = await _pool_get()
     return await run_backfill(
         pool, target, actor=ident.agent_id, dry_run=dry_run, because=because,
-        only_bases=only_bases)
+        only_bases=only_bases, limit=limit, newest_first=newest_first)
 
 
 @mcp.tool()
 async def backfill(
     target: str, dry_run: bool = True, because: str | None = None,
-    only_bases: list[str] | None = None, ctx: Context | None = None,
+    only_bases: list[str] | None = None, limit: int | None = None,
+    newest_first: bool = False, ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Repair verb, dispatched over `target` — eight structurally distinct backfills (no
     shared logic underneath, only a shared wire shape), delegated to
@@ -6398,12 +6403,15 @@ async def backfill(
     `governs` link from `person:operator` to every active SoftwareProject it doesn't
     already govern, so the single operator today stays chartered over everything) |
     "provenance_possible_upstream" (thread e332177f: back-stamps `possible_upstream` onto
-    historical Decision/Thread writes via each write's transcript receipt)."""
+    historical Decision/Thread writes via each write's transcript receipt — `limit`
+    (default 200) and `newest_first` (default False, oldest-first) are consulted by THIS
+    target only, every other target ignores them)."""
     from src.orchestrator.backfill import BACKFILL_TARGETS
 
     if target not in BACKFILL_TARGETS:
         return {"error": f"unknown target {target!r}", "valid_targets": sorted(BACKFILL_TARGETS)}
-    return await _dispatch_backfill(target, dry_run, because, only_bases, ctx)
+    return await _dispatch_backfill(target, dry_run, because, only_bases, ctx,
+                                    limit=limit, newest_first=newest_first)
 
 
 @mcp.tool(meta={

@@ -74,13 +74,17 @@ async def check_apply_authority(
 async def run_backfill(
     pool: asyncpg.Pool, target: str, *, actor: str, dry_run: bool = True,
     because: str | None = None, only_bases: list[str] | None = None,
+    limit: int | None = None, newest_first: bool = False,
 ) -> dict[str, Any]:
     """Repair verb, dispatched over `target` — see `BACKFILL_TARGETS` for the full set.
     Dry run is the default for every target; `dry_run=False` requires `because` (except
     `agent_project_links`, which predates that convention — callers that want a stricter
     contract than this function's own must enforce it themselves, e.g. the CLI/UI doors
     built for wave 22 impose `because` unconditionally at their own layer). All seven
-    idempotent."""
+    idempotent.
+
+    `limit`/`newest_first` (thread e332177f, Thoth msg 10525) are consulted ONLY by
+    `provenance_possible_upstream` — every other target ignores them, unchanged."""
     if target == "bootstrap_orphan_references":
         from src.ingest.reference import (
             backfill_bootstrap_orphan_references as _f_orphan_refs,
@@ -117,9 +121,11 @@ async def run_backfill(
         return await _f_operator_charter(
             Actions(pool), actor=actor, dry_run=dry_run, because=because)
     if target == "provenance_possible_upstream":
+        from src.orchestrator.provenance_backfill import _DEFAULT_LIMIT
         from src.orchestrator.provenance_backfill import (
             backfill_possible_upstream as _f_provenance_upstream,
         )
         return await _f_provenance_upstream(
-            Actions(pool), dry_run=dry_run, because=because)
+            Actions(pool), dry_run=dry_run, because=because,
+            limit=limit if limit is not None else _DEFAULT_LIMIT, newest_first=newest_first)
     return {"error": f"unknown target {target!r}", "valid_targets": sorted(BACKFILL_TARGETS)}
