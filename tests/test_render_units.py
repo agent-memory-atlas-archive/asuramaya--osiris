@@ -243,6 +243,64 @@ def test_render_falls_back_to_the_shipped_file_when_a_substitution_breaks_the_un
     assert (out / "user" / "osiris-console.service").read_text() == original
 
 
+# --- the transcripts root (thread e332177f, ingest.transcripts_root) ----------------
+
+def test_render_substitutes_transcripts_root_in_place(tmp_path: Path) -> None:
+    deploy = tmp_path / "deploy"
+    user_dir = deploy / "user"
+    user_dir.mkdir(parents=True)
+    (user_dir / "osiris-mcp.service").write_text(
+        "[Unit]\nDescription=fake\n\n[Service]\nType=simple\n"
+        "Environment=OSIRIS_TRANSCRIPTS=%h/.claude/projects\n"
+        "ExecStart=/bin/true\n\n[Install]\nWantedBy=default.target\n")
+    out = tmp_path / "out"
+    n = render(deploy, out, {"ingest.transcripts_root": "/mnt/archive/transcripts"})
+    assert n == 1
+    text = (out / "user" / "osiris-mcp.service").read_text()
+    assert "Environment=OSIRIS_TRANSCRIPTS=/mnt/archive/transcripts" in text
+    assert "%h/.claude/projects" not in text
+
+
+def test_render_transcripts_root_default_is_byte_identical(tmp_path: Path) -> None:
+    deploy = tmp_path / "deploy"
+    user_dir = deploy / "user"
+    user_dir.mkdir(parents=True)
+    (user_dir / "osiris-mcp.service").write_text(
+        "[Unit]\nDescription=fake\n\n[Service]\nType=simple\n"
+        "Environment=OSIRIS_TRANSCRIPTS=%h/.claude/projects\n"
+        "ExecStart=/bin/true\n\n[Install]\nWantedBy=default.target\n")
+    out = tmp_path / "out"
+    n = render(deploy, out, {})  # no override — spec default is None
+    assert n == 0
+    assert (out / "user" / "osiris-mcp.service").read_text() == (
+        user_dir / "osiris-mcp.service").read_text()
+
+
+def test_render_transcripts_root_inserts_a_new_line_when_none_shipped(tmp_path: Path) -> None:
+    deploy = tmp_path / "deploy"
+    user_dir = deploy / "user"
+    user_dir.mkdir(parents=True)
+    (user_dir / "osiris-mcp.service").write_text(
+        "[Unit]\nDescription=fake\n\n[Service]\nType=simple\n"
+        "ExecStart=/bin/true\n\n[Install]\nWantedBy=default.target\n")
+    out = tmp_path / "out"
+    n = render(deploy, out, {"ingest.transcripts_root": "/mnt/archive/transcripts"})
+    assert n == 1
+    text = (out / "user" / "osiris-mcp.service").read_text()
+    assert "Environment=OSIRIS_TRANSCRIPTS=/mnt/archive/transcripts" in text
+    assert text.index("Environment=OSIRIS_TRANSCRIPTS=") < text.index("[Install]")
+
+
+def test_shipped_osiris_mcp_unit_declares_a_transcripts_root() -> None:
+    """thread e332177f: the actual gap this whole lane traces back to — osiris-mcp's own
+    unit never set OSIRIS_TRANSCRIPTS at all, so `settings.osiris_transcripts` defaulted
+    to "" inside the MCP process. Reads the REAL shipped file (not a tmp fixture) —
+    a future edit that drops the line without meaning to fails here, loudly."""
+    repo_root = Path(__file__).resolve().parent.parent
+    text = (repo_root / "deploy" / "user" / "osiris-mcp.service").read_text()
+    assert "Environment=OSIRIS_TRANSCRIPTS=" in text
+
+
 # --- the one async hop --------------------------------------------------------------
 
 async def test_configured_values_reads_the_real_settings_table(

@@ -21,13 +21,15 @@ first `user`-type line whose tool_result content contains that exact string loca
 write's own receipt line; everything the SAME window before it produced is the candidate
 upstream set, identical in shape to the live path's own scan.
 
-WHICH TRANSCRIPT: the writer Agent's own `anchor_sid:*` ledger (current_assertions,
-EXACT canonical only — never lineage-widened; a decision demonstrably came from THIS
-generation's own hand, and widening would risk crediting a sibling generation's reads to
-this one) resolved against the disk transcript index `orchestrator.mounts._transcript_index`
-already maintains (sid -> Path) rather than re-plumbing a soul-store reader — this backfill
-is a rare, deliberate, dry-run-gated act, not a hot liveness check the way that index's
-other caller is.
+WHICH TRANSCRIPT: the writer's LINEAGE-wide `anchor_sid:*` ledger (current_assertions,
+base-prefix widened — CORRECTED from this module's own original "exact generation only"
+reasoning, thread e332177f, decision b677fd14: `record_session_anchor`'s own "first
+writer wins, forever" law means only the FIRST generation ever mounted under a shared
+`job_dir` ever gets the ledger entry, so an exact-generation-only lookup found nothing
+for most CURRENT writers, including this seat's own live session) resolved against the
+disk transcript index `orchestrator.mounts._transcript_index` already maintains (sid ->
+Path) rather than re-plumbing a soul-store reader — this backfill is a rare, deliberate,
+dry-run-gated act, not a hot liveness check the way that index's other caller is.
 
 DOOR NAMING: the thread's own spec asks for `{door: 'backfill:<tool>', read_at}`.
 `<tool>` here names the DETECTION METHOD (message id / canonical / cite / url — the same
@@ -94,14 +96,32 @@ async def _candidates(
 
 
 async def _anchor_sids(pool: asyncpg.Pool, agent_id: str) -> list[str]:
-    """This EXACT agent generation's own session ids, freshest first — never a lineage-
-    widened read (see module docstring)."""
+    """This writer's LINEAGE-wide session ids, freshest first (thread e332177f, Thoth
+    mail 10576, decision b677fd14 — CORRECTED from this function's own original "never
+    lineage-widened" reasoning). `record_session_anchor`'s own exists-check is scoped to
+    ANY active Agent, never a specific one, and `job_dir`/session id is durable across
+    `--resume`/compaction WITHIN one lineage — so only the FIRST generation ever mounted
+    under a given job_dir ever gets its own `anchor_sid` entry; every successor generation
+    is structurally excluded by design ("first writer wins, forever," mounts.py's own
+    law). Verified live: agent:seat-af50a33e-g49 (this session) carries ZERO anchor_sid
+    assertions of its own, while an ancestor generation of the SAME lineage already
+    claimed the job_dir's sid weeks earlier. The risk this function's own original
+    docstring worried about — "crediting a sibling generation's reads to this one" —
+    does not actually exist: a shared job_dir/anchor_sid IS the same underlying
+    transcript continuity, exactly the fact `mounts.agent_liveness`/
+    `_lineage_transcript_mtime` already lean on lineage-wide, never per-generation. Same
+    base-prefix widening those functions use (`_generation`'s own root, never a fresh
+    graph walk) — one precedent, not a second lineage-resolution mechanism."""
+    from src.orchestrator.agents import _generation
+
+    base = _generation(agent_id)[0]
     rows = await pool.fetch(
         "SELECT a.value #>> '{}' AS sid FROM current_assertions a "
         "JOIN objects o ON o.id = a.object_id "
-        "WHERE o.type = 'Agent' AND o.canonical = $1 AND a.name LIKE 'anchor_sid:%' "
-        "ORDER BY a.observed_at DESC LIMIT $2",
-        agent_id, _MAX_SIDS_PER_WRITER)
+        "WHERE o.type = 'Agent' AND a.name LIKE 'anchor_sid:%' "
+        "AND (o.canonical = $1 OR o.canonical = $2 OR o.canonical LIKE $2 || '-%') "
+        "ORDER BY a.observed_at DESC LIMIT $3",
+        agent_id, base, _MAX_SIDS_PER_WRITER)
     return [str(r["sid"]) for r in rows if r["sid"]]
 
 
@@ -180,7 +200,7 @@ async def backfill_possible_upstream(
         sids = await _anchor_sids(actions.pool, writer)
         if not sids:
             skipped.append({"object": cand["canonical"], "writer": writer,
-                            "reason": "writer carries no anchor_sid ledger"})
+                            "reason": "writer's lineage carries no anchor_sid ledger"})
             _tag(writer, "no_ledger")
             continue
         receipt_line: int | None = None

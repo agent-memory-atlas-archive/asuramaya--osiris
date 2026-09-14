@@ -203,3 +203,38 @@ async def test_runtime_seconds_is_reported(actions: Actions, tmp_path: Path) -> 
         actions, dry_run=True, limit=1, transcript_root=tmp_path)
     assert isinstance(report["runtime_seconds"], float)
     assert report["runtime_seconds"] >= 0
+
+
+# --- thread e332177f, decision b677fd14: anchor_sid is looked up lineage-wide ---------
+
+async def test_a_successor_generation_matches_via_its_ancestors_anchor_sid(
+    actions: Actions, tmp_path: Path,
+) -> None:
+    """record_session_anchor's own "first writer wins, forever" law means only the FIRST
+    generation ever mounted under a shared job_dir gets the anchor_sid ledger entry —
+    every successor generation of the SAME lineage must still resolve through it."""
+    now = datetime.now(UTC)
+    upstream = await actions.create_or_find_object("Decision", "decision:b00000b00000", "x")
+    lines = [
+        _tool_result(json.dumps({"canonical": "decision:b00000b00000"})),
+        _tool_result(json.dumps({"canonical": "decision:successor000a1"})),
+    ]
+    # the ledger entry lives on the ANCESTOR generation, never the successor's own.
+    await _mint_agent_with_sid(actions, "agent:widentest", "sidwide1deadbeef",
+                               tmp_path, lines)
+    await actions.create_or_find_object("Agent", "agent:widentest-ii", "test")
+    decision = await actions.create_or_find_object(
+        "Decision", "decision:successor000a1", "agent:widentest-ii")
+    await actions.assert_property(
+        decision, "summary", "written by the successor generation",
+        "agent:widentest-ii", now, 0.9)
+
+    report = await backfill_possible_upstream(
+        actions, dry_run=True, transcript_root=tmp_path)
+
+    assert report["edges_to_mint"] == 1
+    entry = report["plan"][0]
+    assert entry["from"] == "decision:successor000a1"
+    assert entry["writer"] == "agent:widentest-ii"  # sourced to the REAL writer
+    assert entry["to"] == str(upstream)
+    assert report["summary"]["candidates"]["matched"] == 1
