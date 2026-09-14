@@ -50,23 +50,18 @@ from src.parsers.base import EvidenceClass
 N1_IDLE_DAYS = 7
 N2_SILENCE_DAYS = 7
 
-# ANSWERED-BY CONFIDENCE (thread 3a9d9a5d89fa, Ra XL's measured report, mail 10351/
-# 10358): `mint_bears_on`'s own `answers` edges are a deliberate agent judgment, not an
-# algorithmic auto-linker — Ra's two false matches (361bf7fc, dbb72299) are mis-
-# citations, not a matching-algorithm bug, so this can only ever be a CONFIDENCE signal
-# on top of an already-real edge, never a filter deciding which edges exist. MEASURED
-# live against every `answers` edge in this graph (1181, 2026-09-14, obligation summary
-# vs. cited decision summary, pg_trgm `similarity()` — the SAME metric mailbox.py's own
-# `_SAME_STORY_SIM` already trusts for a different question): the distribution is NOT a
-# clean separator — 93% of ALL edges (true citations included) score under 0.4, because
-# a decision routinely resolves an obligation in different words than the obligation's
-# own summary, not a paraphrase of it. 0.30 (this constant, reused rather than invented)
-# catches dbb72299 (0.284) but NOT 361bf7fc's own six edges (0.332-0.363, inside the
-# same range plenty of genuine citations also occupy) — a directional signal, honestly
-# imperfect, never a hard filter: everything below it still shows, just as "possibly
-# answered" instead of "ALREADY ANSWERED", never silently dropped either way.
-_ANSWERED_SIM_THRESHOLD = 0.30
-
+# ANSWERS EDGE MINTED BY REAL RESOLVE (thread 367cfafd, Imhotep's finding 18028547,
+# operator's word 2026-09-14) SUPERSEDES the sim-tiered wording this constant used to
+# gate (thread 3a9d9a5d89fa's own 0.30 threshold, measured 2026-09-14 against 1181 live
+# `answers` edges: 93% of ALL edges, true citations included, scored under 0.4 — not a
+# clean separator, so a text-similarity score was never an honest signal for whether an
+# edge counts as "answered", only for how confident the WORDING should sound about an
+# edge that already, structurally, exists). The fix removes the tier rather than tuning
+# it: `_quote_summary` below now reads the `answers` edge alone — present or absent,
+# never a text-scored maybe. `mint_bears_on`'s own edges stay exactly as sanctioned
+# (Thoth's receipt-honesty law 42176e16 — a deliberate, non-auto-closing citation, never
+# removed or downgraded); what changed is only that this nudge no longer tries to guess,
+# by text, how much to trust one.
 _HYGIENE_EC = EvidenceClass.DERIVED.value
 _SANCTIONED_HYGIENE_ACTOR = "cron:obligation_hygiene_heartbeat"
 
@@ -108,11 +103,9 @@ async def _open_obligation_rows(pool: asyncpg.Pool) -> list[dict[str, Any]]:
     own sweep found FOUR of six stale board rows already carried, unrouted, before
     mint_bears_on existed at all. Never suppresses or reclassifies the nudge; only lets
     it say "already answered by decision X" instead of blindly asking the owner to
-    re-measure something someone already did. Each entry also carries `sim` —
-    `_score_answer_similarity`'s own pg_trgm score against the obligation's own summary
-    — so `_quote_summary` can tell a confident citation from a shaky one (thread
-    3a9d9a5d89fa, Ra XL's two false matches, 361bf7fc/dbb72299: `mint_bears_on` records
-    a deliberate judgment call, and judgment calls are sometimes wrong)."""
+    re-measure something someone already did. READ AS-IS, NEVER TEXT-SCORED (thread
+    367cfafd, superseding the sim-tiered read this docstring used to describe): the edge
+    alone decides the wording now — see `_quote_summary`."""
     from src.orchestrator.capture import (
         CONTESTED_SQL,
         LAST_SUMMARY_TOUCH_SQL,
@@ -138,36 +131,8 @@ async def _open_obligation_rows(pool: asyncpg.Pool) -> list[dict[str, Any]]:
         "FROM objects o "
         f"WHERE o.type='Thread' AND o.merged_into IS NULL AND o.status='active' "
         f"  AND {_STATUS_SQL}='open' AND {_KIND_SQL}='obligation'")
-    summary_by_id = {r["id"]: r["summary"] or "" for r in rows}
     answers_by_thread = await thread_answering_decisions(pool, [r["id"] for r in rows])
-    await _score_answer_similarity(pool, answers_by_thread, summary_by_id)
     return [{**dict(r), "answered_by": answers_by_thread.get(r["id"], [])} for r in rows]
-
-
-async def _score_answer_similarity(
-    pool: asyncpg.Pool,
-    answers_by_thread: dict[uuid.UUID, list[dict[str, Any]]],
-    summary_by_id: dict[uuid.UUID, str],
-) -> None:
-    """Attaches `sim` (a pg_trgm float, 0.0 on any comparison against empty text) to
-    every entry `thread_answering_decisions` returned, IN PLACE — one batched query for
-    every (obligation, cited decision) pair at once, never N round trips for N answered
-    rows. A no-op (nothing to score) when nothing carries an `answered_by` at all, the
-    common case for a sweep's own tick."""
-    pairs: list[tuple[uuid.UUID, int, str, str]] = [
-        (tid, i, summary_by_id.get(tid, ""), a["summary"])
-        for tid, answers in answers_by_thread.items()
-        for i, a in enumerate(answers)
-    ]
-    if not pairs:
-        return
-    rows = await pool.fetch(
-        "SELECT s.i AS i, similarity(s.a, s.b) AS sim FROM "
-        "unnest($1::int[], $2::text[], $3::text[]) AS s(i, a, b)",
-        list(range(len(pairs))), [p[2] for p in pairs], [p[3] for p in pairs])
-    sims = {r["i"]: float(r["sim"] or 0.0) for r in rows}
-    for idx, (tid, i, _, _) in enumerate(pairs):
-        answers_by_thread[tid][i]["sim"] = sims.get(idx, 0.0)
 
 
 async def _owner_active_since(pool: asyncpg.Pool, owner: str, since: datetime) -> bool:
@@ -201,26 +166,26 @@ def _quote_summary(item: dict[str, Any]) -> str:
     row is still open and still needs a human act), only sparing the owner a redundant
     re-measurement of something someone already found.
 
-    TWO CONFIDENCE TIERS, NEVER A DROP (thread 3a9d9a5d89fa, Ra XL's own two false
-    matches, 361bf7fc/dbb72299): `sim` >= `_ANSWERED_SIM_THRESHOLD` keeps the strong
-    "ALREADY ANSWERED by" wording; anything below reads "possibly answered by" instead
-    — still shown, still named, never silently hidden (a false "already answered" and a
-    silently-dropped real citation are the SAME failure: something that should have
-    made a reader look, didn't)."""
+    NO TIER, NO TEXT SCORE (thread 367cfafd, Imhotep's finding 18028547, operator's word
+    2026-09-14 — supersedes the sim-tiered "possibly answered" wording this docstring
+    used to describe, thread 3a9d9a5d89fa): the `answers` edge is read ALONE, never
+    weighted by how similar its citing decision's own words happen to be — the edge
+    itself is already the deliberate act (`mint_bears_on`/`record_decision(resolves=)`/
+    `resolve_thread(artifact=<decision>)`), never a text guess, so a caller confident
+    enough to mint it earns the plain "ALREADY ANSWERED" wording. Present -> named
+    plainly; absent -> says so plainly ("no recorded answer") rather than silently
+    omitting the clause — a reader should never have to infer which case they're in."""
     age = item.get("summary_age_days")
     aged = f"{item['summary']!r}, unchanged for {age} day(s)" if age is not None \
         else f"{item['summary']!r}"
     if item.get("contested"):
         aged = f"{aged} — CONTESTED: a newer note disputes this summary, unresolved"
     answers = item.get("answered_by") or []
-    strong = [a for a in answers if a.get("sim", 0.0) >= _ANSWERED_SIM_THRESHOLD]
-    weak = [a for a in answers if a.get("sim", 0.0) < _ANSWERED_SIM_THRESHOLD]
-    if strong:
-        quoted = "; ".join(f"{a['id']} ({a['summary']!r})" for a in strong)
-        aged = f"{aged} — ALREADY ANSWERED by {len(strong)} decision(s): {quoted}"
-    if weak:
-        quoted = "; ".join(f"{a['id']} ({a['summary']!r})" for a in weak)
-        aged = f"{aged} — possibly answered by {len(weak)} decision(s), unconfirmed: {quoted}"
+    if answers:
+        quoted = "; ".join(f"{a['id']} ({a['summary']!r})" for a in answers)
+        aged = f"{aged} — ALREADY ANSWERED by {len(answers)} decision(s): {quoted}"
+    else:
+        aged = f"{aged} — no recorded answer"
     return aged
 
 

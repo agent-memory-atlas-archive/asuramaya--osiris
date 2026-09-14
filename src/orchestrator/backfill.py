@@ -23,7 +23,7 @@ from src.actions.core import Actions
 BACKFILL_TARGETS = frozenset({
     "bootstrap_orphan_references", "boot_alarm_commit_links", "task_sync_citation_links",
     "lineage_repo_links", "agent_project_links", "closed_by_real_sources",
-    "operator_charter",
+    "operator_charter", "provenance_possible_upstream",
 })
 
 # CLI-ONLY FOR APPLY (thread c89a9873's own scope note, wave 22): operator_charter mints
@@ -116,4 +116,10 @@ async def run_backfill(
         from src.orchestrator.capture import backfill_operator_charter as _f_operator_charter
         return await _f_operator_charter(
             Actions(pool), actor=actor, dry_run=dry_run, because=because)
+    if target == "provenance_possible_upstream":
+        from src.orchestrator.provenance_backfill import (
+            backfill_possible_upstream as _f_provenance_upstream,
+        )
+        return await _f_provenance_upstream(
+            Actions(pool), dry_run=dry_run, because=because)
     return {"error": f"unknown target {target!r}", "valid_targets": sorted(BACKFILL_TARGETS)}

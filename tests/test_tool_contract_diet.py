@@ -1574,7 +1574,14 @@ TOOL_CONTRACT_EXPECTED_COUNT = 86
 # visibility): `threads`'s own docstring gains one clause naming its new
 # `project_owned_not_shown` field — no new @mcp.tool(), tool count unchanged. Measured
 # exact (137,307).
-TOOL_CONTRACT_CEILING_CHARS = 137307
+# 137307 -> 137474 (2026-09-14, Sekhmet, thread e332177f, wave 24 dispatch): `backfill`'s
+# own docstring gains one new target, `provenance_possible_upstream` (the provenance
+# backfill, back-stamping `possible_upstream` onto historical writes from each write's
+# own transcript receipt) — genuinely new repair capability, not prose creep on an
+# existing one, same class as a new tool. Trimmed to one clause before raising ("seven"
+# corrected to "eight" in the same edit). No new @mcp.tool(), tool count unchanged.
+# Measured exact (137,474).
+TOOL_CONTRACT_CEILING_CHARS = 137474
 
 def test_ceiling_has_exactly_one_executable_assignment() -> None:
     """THE RATCHET'S OWN GUARD (thread c655c757). This file used to carry every historical

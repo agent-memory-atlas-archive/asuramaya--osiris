@@ -6376,13 +6376,13 @@ async def backfill(
     target: str, dry_run: bool = True, because: str | None = None,
     only_bases: list[str] | None = None, ctx: Context | None = None,
 ) -> dict[str, Any]:
-    """Repair verb, dispatched over `target` — seven structurally distinct backfills (no
+    """Repair verb, dispatched over `target` — eight structurally distinct backfills (no
     shared logic underneath, only a shared wire shape), delegated to
     `src.orchestrator.backfill.run_backfill` — the SAME function the CLI's own
     `osiris backfill` door and the UI's Repairs panel call (thread c89a9873, wave 22):
     never a second, drifted copy of this dispatch. Dry run is the default for every
     target; `dry_run=False` requires `because` (except `agent_project_links`, which
-    predates that convention). All seven idempotent.
+    predates that convention). All eight idempotent.
 
     `target=`: "bootstrap_orphan_references" (links an orphaned `ref:osiris`-stamped
     Reference to the SoftwareProject its own canonical prefix names) |
@@ -6396,7 +6396,9 @@ async def backfill(
     SystemSource `_mint_closed_by` mints today, then retires the now-edgeless
     placeholder) | "operator_charter" (thread 1d5b9773, "authority by charter": mints a
     `governs` link from `person:operator` to every active SoftwareProject it doesn't
-    already govern, so the single operator today stays chartered over everything)."""
+    already govern, so the single operator today stays chartered over everything) |
+    "provenance_possible_upstream" (thread e332177f: back-stamps `possible_upstream` onto
+    historical Decision/Thread writes via each write's transcript receipt)."""
     from src.orchestrator.backfill import BACKFILL_TARGETS
 
     if target not in BACKFILL_TARGETS:
