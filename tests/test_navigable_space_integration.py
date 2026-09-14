@@ -35,12 +35,14 @@ def test_index_mounts_space_via_a_module_script() -> None:
     assert "window.OsirisSpace" in _INDEX_HTML
 
 
-def test_legacy_cytoscape_board_moves_to_a_hidden_mount_not_deleted() -> None:
-    # Board (kanban) and the legacy neighborhood board are chopped from the UI now, but
-    # their code stays until piece 3 -- ensureBoard() still needs somewhere harmless to
-    # mount that never fights the canvas now permanently living in #cy.
-    assert 'id="cy-legacy"' in _INDEX_HTML
-    assert 'Osiris.makeBoard($("cy-legacy")' in _CONSOLE_JS
+def test_the_legacy_cytoscape_board_is_gone_for_real_now() -> None:
+    # piece 3 (ruling c5953bb1, Thoth DM 10596/10619/10631): the hidden #cy-legacy mount
+    # this integration piece deliberately kept ensureBoard()/Osiris.makeBoard on is now
+    # actually deleted, not just unreachable from the UI -- see
+    # tests/test_navspace_piece3_retirement.py for the fuller retirement proof.
+    assert 'id="cy-legacy"' not in _INDEX_HTML
+    assert "ensureBoard" not in _CONSOLE_JS
+    assert "makeBoard" not in _CONSOLE_JS
 
 
 # --- graph and table coexist: a collapsible drawer, never a hard Table/Graph switch --------

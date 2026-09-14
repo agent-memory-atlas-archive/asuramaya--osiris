@@ -1663,15 +1663,6 @@ select.field:focus, input.field:focus { border-color: var(--border-focus); }
   flex: 0 0 auto;
 }
 
-.viewsw-tabs {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 2px;
-}
 
 .view-tab {
   background: transparent;
@@ -1821,34 +1812,6 @@ select.field:focus, input.field:focus { border-color: var(--border-focus); }
 .graph-breadcrumbs .crumb.current { color: #fff; border-color: var(--blue); }
 .graph-breadcrumbs .crumb-sep { color: var(--faint); font-size: 11px; align-self: center; }
 
-/* View Switcher Segmented Control */
-.viewsw {
-  display: inline-flex;
-  gap: 0;
-  border: 1px solid var(--border2);
-  border-radius: 7px;
-  overflow: hidden;
-  background: var(--panel2);
-}
-.viewsw button {
-  background: transparent;
-  border: 0;
-  border-left: 1px solid var(--border2);
-  padding: 5px 12px;
-  font-size: 11.5px;
-  font-weight: 550;
-  cursor: pointer;
-  color: var(--muted);
-  transition: all .12s;
-}
-.viewsw button:first-child { border-left: 0; }
-.viewsw button.on {
-  background: var(--chip);
-  color: var(--blue);
-  box-shadow: inset 0 0 0 1px rgba(88, 166, 255, 0.3);
-}
-.viewsw button:hover:not(.on) { color: var(--text); background: rgba(255, 255, 255, 0.04); }
-
 .lin { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
 .lin .step { background: var(--chip); border: 1px solid var(--border2); border-radius: 6px; padding: 2px 7px; font-family: var(--font-mono); }
 .lin .arr { color: var(--faint); }
@@ -1899,24 +1862,6 @@ select.field:focus, input.field:focus { border-color: var(--border-focus); }
 .focused-badge { color: var(--blue); font-size: 10.5px; flex-shrink: 0; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 300px; }
 .focused-badge:hover { color: var(--text); }
 .live { color: var(--accent); }
-
-/* STAGE VIEW SWITCHER FOOTER (Docked at bottom of stage) */
-.stage-viewsw-footer {
-  position: absolute;
-  bottom: 12px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 30;
-  display: flex;
-  align-items: center;
-  background: var(--panel2);
-  border: 1px solid var(--border2);
-  border-radius: 8px;
-  padding: 3px;
-  box-shadow: 0 8px 24px rgba(0,0,0,0.6);
-  backdrop-filter: blur(8px);
-  pointer-events: auto;
-}
 
 /* CARDS GRID VIEW */
 .cards-grid {
