@@ -4,6 +4,9 @@ gate `write_setting` copies from `backup_settings.write_backup_settings`/`charte
 and the opt-in-per-field overlay `settings_with_overlay`."""
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any
+
 import pytest
 from src.actions.core import Actions
 from src.orchestrator.settings_service import (
@@ -165,7 +168,9 @@ def test_invalidate_overlay_cache_is_idempotent_on_an_empty_cache() -> None:
     _invalidate_overlay_cache()
 
 
-# --- secrets are never written through this door --------------------------------------
+# --- THE SECRETS ROTATE ACT: a write on a secret_ref key IS a rotate (thread ----------
+# --- f4498ab304e4's own follow-up, Thoth mail 10441) — the real value goes into the ---
+# --- spec's own backing_file, never the settings table, never echoed back -------------
 
 # --- `live`: the running/shipped counterpart, null when not cheap (thread c5ba8681) ---
 
@@ -259,19 +264,182 @@ async def test_list_settings_and_get_setting_both_carry_a_live_key(actions: Acti
     assert "live" in got
 
 
-async def test_write_setting_refuses_a_secret_ref_outright(
+def _fake_secret_spec(key: str = "test.fake_secret", **overrides: Any) -> Any:
+    from dataclasses import replace
+
+    from src.config import settings_registry
+
+    base = replace(settings_registry.SETTINGS[0], key=key, type="secret_ref",
+                   authority="operator", requires_because=False, backing_file=None,
+                   env_field="test_fake_secret")
+    return replace(base, **overrides) if overrides else base
+
+
+async def test_write_setting_secret_ref_refuses_with_no_backing_file(
     actions: Actions, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No secret_ref is registered yet (thread f4498ab304e4's own follow-up), so this
-    exercises the refusal path directly against a synthetic spec rather than waiting
-    for a real one to exist."""
+    """A secret_ref spec declared with no backing_file (a registry mistake — every real
+    one must carry one) refuses loudly rather than silently doing nothing or crashing."""
+    from src.orchestrator import settings_service as svc
+
+    fake = _fake_secret_spec()
+    monkeypatch.setattr(svc, "spec_by_key", lambda key: fake if key == fake.key else None)
+
+    out = await svc.write_setting(actions.pool, fake.key, "value", actor="operator")
+    assert "error" in out and "backing_file" in out["error"]
+
+
+async def test_write_setting_secret_ref_rejects_an_empty_value(
+    actions: Actions, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from src.orchestrator import settings_service as svc
+
+    fake = _fake_secret_spec(backing_file=str(tmp_path / "secrets.env"))
+    monkeypatch.setattr(svc, "spec_by_key", lambda key: fake if key == fake.key else None)
+
+    out = await svc.write_setting(actions.pool, fake.key, "   ", actor="operator")
+    assert "error" in out and "non-empty" in out["error"]
+    assert not (tmp_path / "secrets.env").exists()
+
+
+async def test_write_setting_secret_ref_rotates_into_the_file_never_the_table(
+    actions: Actions, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The full round trip: the real value lands in the backing file (a KEY=value line,
+    0600), a bare {"rotated": true} marker lands in the `settings` table (queried
+    directly here, bypassing get_setting/list_settings, to prove the REAL value never
+    reaches the table at all — not merely that it isn't returned), and the receipt
+    never echoes `value`."""
+    import stat
+
+    from src.orchestrator import settings_service as svc
+
+    backing = tmp_path / "secrets.env"
+    fake = _fake_secret_spec(backing_file=str(backing))
+    monkeypatch.setattr(svc, "spec_by_key", lambda key: fake if key == fake.key else None)
+
+    out = await svc.write_setting(
+        actions.pool, fake.key, "sk-super-secret-1", actor="operator", because="rotate it")
+    assert out.get("rotated") is True
+    assert "value" not in out
+    assert out["key"] == fake.key
+
+    assert backing.read_text().strip() == "TEST_FAKE_SECRET=sk-super-secret-1"
+    assert stat.S_IMODE(backing.stat().st_mode) == 0o600
+
+    row = await actions.pool.fetchrow(
+        "SELECT value FROM settings WHERE key=$1 AND scope='box' AND scope_id=''", fake.key)
+    assert row is not None
+    stored = row["value"]
+    import json as _json
+    stored_py = _json.loads(stored) if isinstance(stored, str) else stored
+    assert stored_py is True  # the marker, never the real value
+
+
+async def test_write_setting_secret_ref_rotate_updates_not_appends(
+    actions: Actions, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A second rotation replaces the existing KEY= line rather than appending a
+    duplicate — the file stays exactly one line for this key."""
+    from src.orchestrator import settings_service as svc
+
+    backing = tmp_path / "secrets.env"
+    fake = _fake_secret_spec(backing_file=str(backing))
+    monkeypatch.setattr(svc, "spec_by_key", lambda key: fake if key == fake.key else None)
+
+    await svc.write_setting(actions.pool, fake.key, "first-value", actor="operator")
+    await svc.write_setting(actions.pool, fake.key, "second-value", actor="operator")
+
+    lines = backing.read_text().splitlines()
+    assert lines == ["TEST_FAKE_SECRET=second-value"]
+
+
+async def test_write_setting_secret_ref_preserves_unrelated_lines(
+    actions: Actions, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The rotate never re-serializes the whole file — an unrelated line already
+    present (another daemon's own secret/config) survives untouched."""
+    from src.orchestrator import settings_service as svc
+
+    backing = tmp_path / "secrets.env"
+    backing.write_text("DATABASE_URL=postgresql://x\nOTHER_KEY=unrelated\n")
+    fake = _fake_secret_spec(backing_file=str(backing))
+    monkeypatch.setattr(svc, "spec_by_key", lambda key: fake if key == fake.key else None)
+
+    await svc.write_setting(actions.pool, fake.key, "new-secret", actor="operator")
+
+    lines = backing.read_text().splitlines()
+    assert "DATABASE_URL=postgresql://x" in lines
+    assert "OTHER_KEY=unrelated" in lines
+    assert "TEST_FAKE_SECRET=new-secret" in lines
+
+
+async def test_write_setting_secret_ref_names_the_daemon_that_must_restart(
+    actions: Actions, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Same `effect.startswith("restart:")` -> `result["note"]` convention every other
+    write receipt already uses — reused, not duplicated, for a rotate."""
+    from src.orchestrator import settings_service as svc
+
+    fake = _fake_secret_spec(
+        backing_file=str(tmp_path / "secrets.env"), effect="restart:osiris-worker")
+    monkeypatch.setattr(svc, "spec_by_key", lambda key: fake if key == fake.key else None)
+
+    out = await svc.write_setting(actions.pool, fake.key, "value", actor="operator")
+    assert out["note"] == "takes effect on osiris-worker's next restart, not automatically"
+
+
+async def test_the_real_registered_secret_spec_rotates_live(
+    actions: Actions, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """`secrets.etherscan_api_key` is the one real secret_ref spec registered today
+    (SECRETS ROTATE ACT) — proves the LIVE registry entry's own key/env_field/effect/
+    authority, not just a synthetic fake, exercised against a scratch copy of its
+    backing_file (never the box's real one — `backing_file` is the only field
+    redirected here, everything else about the spec is exactly what ships)."""
     from dataclasses import replace
 
     from src.config import settings_registry
     from src.orchestrator import settings_service as svc
 
-    fake = replace(settings_registry.SETTINGS[0], key="test.fake_secret", type="secret_ref")
+    real = settings_registry.spec_by_key("secrets.etherscan_api_key")
+    assert real is not None and real.type == "secret_ref" and real.backing_file
+    assert real.env_field == "etherscan_api_key"
+
+    scratch = tmp_path / "secrets.env"
+    redirected = replace(real, backing_file=str(scratch))
+    monkeypatch.setattr(
+        svc, "spec_by_key", lambda key: redirected if key == real.key else None)
+
+    out = await svc.write_setting(
+        actions.pool, real.key, "sk-live-round-trip", actor="operator",
+        because="test the real registered spec")
+    assert out.get("rotated") is True
+    assert scratch.read_text().strip() == "ETHERSCAN_API_KEY=sk-live-round-trip"
+    assert out["note"] == "takes effect on osiris-worker's next restart, not automatically"
+
+
+async def test_settings_with_overlay_never_substitutes_a_secret_marker(
+    actions: Actions, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The type-mismatch guard in `settings_with_overlay` itself: an `effect='immediate'`
+    secret_ref (synthetic — every real one registered today is `restart:<unit>`, so this
+    proves the filter holds even for a shape that isn't registered) never lands its
+    boolean `{"rotated": true}` marker on a str-typed Settings attribute.
+
+    Patches `svc.SETTINGS` directly (never `settings_registry.SETTINGS`) — this
+    module's own docstring on `settings_with_overlay` names exactly why a source-module
+    patch would be silently ignored: the name was already bound at import time."""
+    from src.orchestrator import settings_service as svc
+
+    fake = _fake_secret_spec(
+        key="test.fake_immediate_secret", effect="immediate",
+        backing_file=str(tmp_path / "secrets.env"), env_field="etherscan_api_key")
     monkeypatch.setattr(svc, "spec_by_key", lambda key: fake if key == fake.key else None)
+    monkeypatch.setattr(svc, "SETTINGS", (*svc.SETTINGS, fake))
 
     out = await svc.write_setting(actions.pool, fake.key, "value", actor="operator")
-    assert "error" in out and "rotat" in out["error"].lower()
+    assert out.get("rotated") is True
+
+    result = await svc.settings_with_overlay(actions.pool)
+    assert isinstance(result.etherscan_api_key, str)  # never True/the boolean marker

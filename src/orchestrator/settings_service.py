@@ -72,7 +72,13 @@ async def settings_with_overlay(pool: asyncpg.Pool) -> Settings:
     overrides = {
         spec.env_field: overlay[spec.key]
         for spec in SETTINGS
+        # secret_ref excluded on purpose (SECRETS ROTATE ACT, thread f4498ab304e4's own
+        # follow-up): its stored `settings` row is a bare {"rotated": true} MARKER, never
+        # the real value (rotate_secret writes the real value to spec.backing_file
+        # instead) — substituting that marker onto a str-typed Settings field would
+        # silently corrupt it, so this filter is load-bearing, not defensive dead code.
         if spec.effect == "immediate" and spec.env_field and spec.key in overlay
+        and spec.type != "secret_ref"
     }
     return base.model_copy(update=overrides) if overrides else base
 
@@ -289,6 +295,74 @@ def _validate_value(spec: SettingSpec, value: Any) -> dict[str, str] | None:
     return None
 
 
+def _write_env_file_line(path: str, key: str, value: str) -> None:
+    """Rewrite (or append) one KEY=value line in a flat EnvironmentFile= — the exact
+    shape systemd's own EnvironmentFile= consumes (deploy/osiris.env.example), never a
+    full re-serialization that could reorder or clobber unrelated lines/comments.
+    Creates the file (and its parent directory) with 0600 perms if it doesn't exist yet
+    — a secret, never world- or group-readable."""
+    import os
+    from pathlib import Path
+
+    p = Path(path)
+    lines = p.read_text().splitlines() if p.exists() else []
+    prefix = f"{key}="
+    new_line = f"{key}={value}"
+    for i, line in enumerate(lines):
+        if line.startswith(prefix):
+            lines[i] = new_line
+            break
+    else:
+        lines.append(new_line)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("\n".join(lines) + "\n")
+    os.chmod(p, 0o600)
+
+
+async def _rotate_secret(
+    pool: asyncpg.Pool, spec: SettingSpec, value: Any, *, actor: str, because: str,
+    scope_id: str,
+) -> dict[str, Any]:
+    """THE SECRETS ROTATE ACT (thread f4498ab304e4's own follow-up, Thoth mail 10441):
+    `write_setting`'s own secret_ref branch — a write on a secret_ref key IS a rotate,
+    the same door, no second action to learn. The real value goes into `spec`'s own
+    `backing_file` (0600, a KEY=value line, `env_field.upper()` as the key) — NEVER the
+    `settings` table and NEVER echoed back in the receipt. Only a bare `{"rotated":
+    true}` marker lands in the table (rev-bumped the same way every other write is),
+    preserving `list_settings`/`get_setting`'s own pre-existing `{"set": stored is not
+    None}` bookkeeping (`_current_value`) without the table ever holding the real
+    value."""
+    if not isinstance(value, str) or not value.strip():
+        return {"error": "must be a non-empty string",
+                "errors": [{"field": spec.key, "message": "must be a non-empty string"}]}
+    if not spec.backing_file or not spec.env_field:
+        return {"error": f"{spec.key!r} has no backing_file/env_field declared — "
+                         "cannot rotate"}
+    try:
+        _write_env_file_line(spec.backing_file, spec.env_field.upper(), value)
+    except OSError as exc:
+        return {"error": f"could not write {spec.backing_file}: {exc}"}
+    row = await pool.fetchrow(
+        "INSERT INTO settings (key, scope, scope_id, value, updated_by, rev) "
+        "VALUES ($1, $2, $3, 'true'::jsonb, $4, 1) "
+        "ON CONFLICT (key, scope, scope_id) DO UPDATE SET "
+        "  value='true'::jsonb, updated_by=excluded.updated_by, "
+        "  rev=settings.rev+1, updated_at=now() "
+        "RETURNING rev",
+        spec.key, spec.scope, scope_id, actor)
+    _invalidate_overlay_cache()
+    result: dict[str, Any] = {
+        "key": spec.key, "rotated": True, "rev": row["rev"], "because": because,
+        "effect": spec.effect,
+    }
+    if spec.effect.startswith("restart:"):
+        unit = spec.effect.split(":", 1)[1]
+        result["note"] = f"takes effect on {unit}'s next restart, not automatically"
+    elif spec.effect == "next_deploy":
+        result["note"] = "takes effect on the next `osiris deploy`, not automatically"
+    return result
+
+
 async def _authorized(
     pool: asyncpg.Pool, spec: SettingSpec, *, actor: str, scope_id: str, ruling: str | None,
 ) -> str | None:
@@ -324,7 +398,10 @@ async def write_setting(
     generalized over the registry rather than one hardcoded field set. Returns
     `{"error": ..., "errors": [{"field","message"}, ...]}` on any refusal (structured,
     Seshat's fold 5, never one bare string for a menu to show per-field), or
-    `{"key","value","rev"}` on success."""
+    `{"key","value","rev"}` on success — EXCEPT a `type='secret_ref'` key, where a
+    write IS a rotate (`_rotate_secret`, SECRETS ROTATE ACT, thread f4498ab304e4's own
+    follow-up): `{"key","rotated":true,"rev",...}`, never `value` — the real secret
+    goes into the spec's own backing file, never this table, never echoed back."""
     spec = spec_by_key(key)
     if spec is None:
         return {"error": f"unknown setting key: {key!r} — not in the registry"}
@@ -336,9 +413,8 @@ async def write_setting(
     if auth_error:
         return {"error": auth_error}
     if spec.type == "secret_ref":
-        return {"error": "secret_ref settings are never written through this door — "
-                         "rotating a secret is its own act, not yet built (thread "
-                         "f4498ab304e4's own follow-up)"}
+        return await _rotate_secret(
+            pool, spec, value, actor=actor, because=because, scope_id=scope_id)
     field_error = _validate_value(spec, value)
     if field_error:
         return {"error": field_error["message"], "errors": [field_error]}

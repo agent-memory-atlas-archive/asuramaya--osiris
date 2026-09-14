@@ -286,6 +286,26 @@ def test_settings_panel_secret_ref_never_gets_a_save_button() -> None:
     assert "it.type === 'secret_ref'" in body
 
 
+def test_settings_panel_secret_ref_gets_a_rotate_button_instead() -> None:
+    """SECRETS ROTATE ACT (thread f4498ab304e4's own follow-up, Thoth mail 10441): the
+    empty cell `secret_ref` used to render (a Save button would silently no-op — that
+    door refused outright until this pass) is now a Rotate button wired to its own
+    confirm-then-POST function, not saveSetting's own value-reading path."""
+    body = _JS.split("function renderSettingsPanelHtml(items)", 1)[1].split(
+        "\nfunction ", 1)[0]
+    assert "rotateSecret(" in body
+    assert ">Rotate<" in body
+
+
+def test_rotate_secret_function_exists_and_never_reads_settingsfieldvalue() -> None:
+    assert "async function rotateSecret(key)" in _JS
+    body = _JS.split("async function rotateSecret(key)", 1)[1].split(
+        "\nasync function ", 1)[0]
+    assert "settingsFieldValue" not in body  # no <input> exists for a secret to read
+    assert "fetch('/settings'" in body
+    assert "confirm(" in body  # unconditional, never gated on item.consequence
+
+
 def test_settings_panel_shows_a_live_value_only_when_the_backend_sends_one() -> None:
     """Thread c5ba8681 (Imhotep's own follow-up, not yet built): a future non-null
     `live` field just appears beside `value` — no UI change needed when it arrives."""

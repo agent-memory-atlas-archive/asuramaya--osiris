@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 SettingType = Literal[
@@ -59,7 +60,17 @@ class SettingSpec:
     `item_shape`: for `type='records'` only — {field_name: SettingType} describing one
     record's own shape (e.g. backup's `offbox_repositories`: {'url': 'str',
     'schedule': 'schedule', 'enabled': 'bool'}); the generic `records` validator checks
-    every item against this shape rather than a bespoke per-key loop."""
+    every item against this shape rather than a bespoke per-key loop.
+
+    `backing_file`: for `type='secret_ref'` only (SECRETS ROTATE ACT, thread
+    f4498ab304e4's own follow-up, Thoth mail 10441) — the flat KEY=value file a rotate
+    writes into (settings_service.py's `write_setting`, its own secret_ref branch),
+    NEVER the `settings` table. `env_field` doubles here as the KEY= name within that
+    file (uppercased) rather than a live `Settings` attribute to overlay — a secret's
+    real value is never substituted into a live `Settings` object by
+    `settings_with_overlay` (explicitly excluded there), only read by the consuming
+    daemon at its own next boot, off the same file its systemd unit's own
+    EnvironmentFile= already sources."""
 
     key: str
     type: SettingType
@@ -74,7 +85,58 @@ class SettingSpec:
     consequence: Literal["low", "high"] = "low"
     write_name: str | None = None
     env_field: str | None = None
+    backing_file: str | None = None
 
+
+# THE MANAGER OVERLAY'S OWN FIRST KNOB (SECRETS ROTATE ACT + MANAGER OVERLAY, thread
+# f4498ab304e4's own follow-up, Thoth mail 10441): the WAKE LADDER's docstring above
+# already named this exact gap — `osiris_lease_refuse` lives on manager/daemon.py's own
+# `Manager._lease_gate`, a different process from the worker, with no existing
+# `settings_with_overlay` wiring. That wiring now exists (`_lease_gate` calls
+# `settings_with_overlay(self._pool)`, same pattern every arq_worker.py tick already
+# uses) — 'immediate' is honest here for the same reason it is for the daemon kill
+# switches above: read fresh on every lease attempt, never cached at process boot.
+_MANAGER_OVERLAY: tuple[SettingSpec, ...] = (
+    SettingSpec("daemon.lease_refuse.enabled", "bool", False, effect="immediate",
+               consequence="high", requires_because=True,
+               env_field="osiris_lease_refuse"),
+)
+
+# THE SECRETS ROTATE ACT'S OWN BACKING FILE (thread f4498ab304e4's follow-up, Thoth mail
+# 10441): the SAME shared EnvironmentFile= every deployed unit already sources
+# (deploy/*.service's own `EnvironmentFile=/etc/osiris/osiris.env`) — decision 0524d40e's
+# proposed soul-key design independently reaches for this identical file (OSIRIS_SOUL_
+# KEY_FILE) rather than a dedicated per-secret file, "no new deploy step" being the
+# shared reasoning. Falls back to a dev-box `.env` at the repo root (this worktree has
+# no /etc/osiris/osiris.env at all — confirmed absent, same gap cli.py's own bootstrap
+# door names) so a rotate is exercisable here without writing into a system directory a
+# dev box has no business touching.
+SECRET_BACKING_FILE: str = (
+    "/etc/osiris/osiris.env" if Path("/etc/osiris/osiris.env").exists()
+    else str(Path(__file__).resolve().parents[2] / ".env")
+)
+
+# THE FIRST REAL secret_ref SPEC (SECRETS ROTATE ACT, thread f4498ab304e4's own
+# follow-up, Thoth mail 10441): `secret_ref` has been a declared SettingType since THE
+# SETTINGS MENU piece 1 with zero live specs exercising it — write_setting's own
+# secret_ref branch was an unconditional refusal until this pass. `etherscan_api_key`
+# (settings.py's own field, read fresh but from a STATIC os.environ snapshot by
+# src/ingest/etherscan.py, never re-exported by a running process) is the one genuinely
+# secret-shaped value already in this codebase with no registry entry at all —
+# `effect='restart:osiris-worker'` because that snapshot only ever refreshes on the
+# worker's own next boot, the exact "daemon that must restart" the write receipt names
+# (settings_service.py's own existing `restart:<unit>` -> `result["note"]` convention,
+# reused verbatim, not duplicated). `authority='operator'`: rotating a real external
+# credential is not citable via a standing ruling the way a config knob is.
+_SECRETS: tuple[SettingSpec, ...] = (
+    # default="" (not None) matches Settings.etherscan_api_key's own field default —
+    # test_settings_registry.py's test_every_default_matches_the_live_settings_default
+    # checks every env_field-carrying spec against it, secrets included.
+    SettingSpec("secrets.etherscan_api_key", "secret_ref", "",
+               effect="restart:osiris-worker", authority="operator",
+               consequence="high", requires_because=True,
+               env_field="etherscan_api_key", backing_file=SECRET_BACKING_FILE),
+)
 
 _DAEMON_KILL_SWITCHES: tuple[SettingSpec, ...] = (
     SettingSpec("daemon.pit_watch.enabled", "bool", False, effect="immediate",
@@ -196,11 +258,13 @@ _BACKUP_SETTINGS: tuple[SettingSpec, ...] = (
 # sense it is for the miner budgets: a write is live on the very NEXT trigger_mail cron
 # pass (arq_worker.py's own `trigger_mail` wrapper now threads
 # `settings_with_overlay(actions.pool)` down through `trigger_mail_tick`'s own `st`,
-# which is what every one of these fields is actually read from). Two knobs deliberately
+# which is what every one of these fields is actually read from). One knob deliberately
 # NOT included here: `osiris_lease_refuse` lives on a different process entirely (the
-# manager daemon, manager/daemon.py's own `_lease_gate`) with no existing
-# `settings_with_overlay` wiring anywhere in that module — a bigger, riskier first step
-# than this pass's own scope, flagged as a follow-up rather than rushed. The
+# manager daemon, manager/daemon.py's own `_lease_gate`) — registered separately as
+# `_MANAGER_OVERLAY` above instead (SECRETS ROTATE ACT + MANAGER OVERLAY, Thoth mail
+# 10441: the "bigger, riskier first step" flagged here as a follow-up is now built —
+# `_lease_gate` calls `settings_with_overlay(self._pool)` the same way every tick
+# function below does). The
 # `wake_worker`/`dispatch_dm` pass-through at trigger.py's own wake() tool path (line
 # ~2721 passes the wake_worker's raw incoming `settings` param, not its resolved `st`)
 # is a pre-existing inconsistency, harmless today (both resolve to the same bare read)
@@ -399,8 +463,8 @@ _POOL_SIZES: tuple[SettingSpec, ...] = (
 )
 
 SETTINGS: tuple[SettingSpec, ...] = (
-    _DAEMON_KILL_SWITCHES + _MINER_BUDGETS + _BACKUP_SETTINGS + _WAKE_LADDER + _DIAGNOSTICS
-    + _DAEMON_UNIT_LITERALS + _POOL_SIZES
+    _MANAGER_OVERLAY + _SECRETS + _DAEMON_KILL_SWITCHES + _MINER_BUDGETS + _BACKUP_SETTINGS
+    + _WAKE_LADDER + _DIAGNOSTICS + _DAEMON_UNIT_LITERALS + _POOL_SIZES
 )
 
 
