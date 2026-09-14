@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Osiris — navigable space (spike)</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0d1219; color: #e6edf3;
+               font: 13px/1.4 -apple-system, system-ui, sans-serif; overflow: hidden; }
+  #canvas-wrap { position: absolute; inset: 0; }
+  canvas { display: block; }
+  #hud { position: absolute; top: 8px; left: 8px; background: rgba(13,18,25,0.85);
+         border: 1px solid #30363d; border-radius: 6px; padding: 8px 10px; z-index: 10;
+         min-width: 260px; white-space: pre; }
+  #hud button { background: #21262d; color: #e6edf3; border: 1px solid #30363d;
+                border-radius: 4px; padding: 3px 8px; margin-top: 6px; cursor: pointer; }
+  #labels { position: absolute; inset: 0; pointer-events: none; z-index: 5; }
+  .lbl { position: absolute; font-size: 10px; color: #c9d1d9; background: rgba(13,18,25,0.75);
+         padding: 1px 4px; border-radius: 3px; transform: translate(-50%, -140%);
+         white-space: nowrap; }
+</style>
+</head>
+<body>
+<div id="canvas-wrap"></div>
+<div id="labels"></div>
+<div id="hud">loading…</div>
+<script type="module" src="space.js"></script>
+</body>
+</html>
