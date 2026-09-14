@@ -1,9 +1,11 @@
 """Credence — the upstream dual of the authority chain: a re-report can't out-credence its source.
 
-The spawned_by tree is the independence oracle. These tests drive the pure resolver — the relay
-clamp, the Tier-2 relay-vs-dispute split, the verification rebuttal, independent corroboration,
-the deepest-first no-leak invariant, and the laundering flag — plus one end-to-end pass over real
-Postgres.
+The spawned_by/succeeded_from forest is the independence oracle (PROVENANCE PIECE 3, ruling
+bb3e4422, widened the oracle from spawned_by alone to include a minted successor's own
+succeeded_from edge). These tests drive the pure resolver — the relay clamp, the Tier-2
+relay-vs-dispute split, the verification rebuttal, independent corroboration, the deepest-first
+no-leak invariant, and the laundering flag — plus end-to-end passes over real Postgres, both for
+a spawned sub-agent and for a minted successor.
 """
 from __future__ import annotations
 
@@ -203,3 +205,82 @@ async def test_credence_props_surfaces_a_genuine_dispute_over_the_graph(actions:
     assert d.name == "verdict"
     assert {p[0] for p in d.positions} == {"agent:pa", "agent:pb"}
     assert {p[1] for p in d.positions} == {"the migration is safe", "the migration is unsafe"}
+
+
+# --- PROVENANCE PIECE 3 (ruling bb3e4422): succession in the independence oracle ----
+# `_parent_forest` now unions succeeded_from with spawned_by — a minted successor sits
+# in the SAME child→parent forest as an ordinary spawned sub-agent, so the identical
+# three outcomes (relay / dispute / observation-rebuttal) apply across a succession edge.
+
+async def test_credence_props_clamps_a_successor_relay_over_the_graph(
+    actions: Actions,
+) -> None:
+    # agent:anc-a (ancestor) and agent:anc-b (its MINTED SUCCESSOR, succeeded_from — not
+    # spawned_by) assert the SAME claim (reworded); the ancestor never looked and relays at
+    # an inflated grade → clamped to the successor's own origin grade, same as a spawned child.
+    o = await actions.create_or_find_object("SoftwareProject", "repo:succ-relay-demo", "test")
+    a = await actions.create_or_find_object("Agent", "agent:anc-a", "fleet-observer")
+    b = await actions.create_or_find_object("Agent", "agent:anc-b", "fleet-observer")
+    await actions.create_link(b, a, "succeeded_from", "fleet-observer", NOW, 0.6,
+                              evidence_class=EvidenceClass.DIRECT_OBSERVATION.value)
+    await actions.assert_property(a, "backed_by_observation", False, "fleet-observer", NOW,
+                                  0.6, evidence_class=EvidenceClass.DIRECT_OBSERVATION.value)
+    await actions.assert_property(o, "status", "The pipeline is GREEN.", "agent:anc-a", NOW,
+                                  0.9, evidence_class=EvidenceClass.SELF_DECLARED.value)
+    await actions.assert_property(o, "status", "pipeline is green", "agent:anc-b", NOW, 0.6,
+                                  evidence_class=EvidenceClass.DIRECT_OBSERVATION.value)
+    res = await credence_props(actions, [o])
+    winners = {w.name: w for w in res.winners}
+    assert winners["status"].source_id == "agent:anc-b"   # the successor's own origin
+    assert winners["status"].confidence == pytest.approx(0.6, abs=1e-6)
+    assert "agent:anc-a" in winners["status"].laundering   # the ancestor's relay flagged
+    assert res.disputes == []                              # a paraphrase relay, not a dispute
+
+
+async def test_credence_props_surfaces_a_genuine_successor_dispute_over_the_graph(
+    actions: Actions,
+) -> None:
+    # the ancestor (never looked) and its minted successor assert MATERIALLY DIFFERENT
+    # values → the ancestor is DISPUTING its own successor's claim, not relaying it.
+    o = await actions.create_or_find_object("SoftwareProject", "repo:succ-dispute-demo", "test")
+    a = await actions.create_or_find_object("Agent", "agent:disp-a", "fleet-observer")
+    b = await actions.create_or_find_object("Agent", "agent:disp-b", "fleet-observer")
+    await actions.create_link(b, a, "succeeded_from", "fleet-observer", NOW, 0.6,
+                              evidence_class=EvidenceClass.DIRECT_OBSERVATION.value)
+    await actions.assert_property(a, "backed_by_observation", False, "fleet-observer", NOW,
+                                  0.6, evidence_class=EvidenceClass.DIRECT_OBSERVATION.value)
+    await actions.assert_property(o, "verdict", "the migration is safe", "agent:disp-a", NOW,
+                                  0.9, evidence_class=EvidenceClass.SELF_DECLARED.value)
+    await actions.assert_property(o, "verdict", "the migration is unsafe", "agent:disp-b", NOW,
+                                  0.6, evidence_class=EvidenceClass.DIRECT_OBSERVATION.value)
+    res = await credence_props(actions, [o])
+    winners = {w.name: w for w in res.winners}
+    assert winners["verdict"].laundering == ()             # no false laundering accusation
+    (d,) = res.disputes
+    assert d.name == "verdict"
+    assert {p[0] for p in d.positions} == {"agent:disp-a", "agent:disp-b"}
+
+
+async def test_credence_props_a_successor_with_its_own_observation_is_not_clamped(
+    actions: Actions,
+) -> None:
+    # the ancestor DID look (backed_by_observation=True) before restating a DIFFERENT value
+    # from its successor's own claim → verification, not relay: neither clamped nor disputed,
+    # the same rebuttal outcome the pure resolver already proves for a spawned ancestor.
+    o = await actions.create_or_find_object("SoftwareProject", "repo:succ-rebuttal-demo", "test")
+    a = await actions.create_or_find_object("Agent", "agent:reb-a", "fleet-observer")
+    b = await actions.create_or_find_object("Agent", "agent:reb-b", "fleet-observer")
+    await actions.create_link(b, a, "succeeded_from", "fleet-observer", NOW, 0.6,
+                              evidence_class=EvidenceClass.DIRECT_OBSERVATION.value)
+    await actions.assert_property(a, "backed_by_observation", True, "fleet-observer", NOW,
+                                  0.6, evidence_class=EvidenceClass.DIRECT_OBSERVATION.value)
+    await actions.assert_property(o, "status", "verified", "agent:reb-a", NOW, 0.9,
+                                  evidence_class=EvidenceClass.SELF_DECLARED.value)
+    await actions.assert_property(o, "status", "observed", "agent:reb-b", NOW, 0.6,
+                                  evidence_class=EvidenceClass.DIRECT_OBSERVATION.value)
+    res = await credence_props(actions, [o])
+    winners = {w.name: w for w in res.winners}
+    assert winners["status"].source_id == "agent:reb-a" and winners["status"].confidence == \
+        pytest.approx(0.9, abs=1e-6)
+    assert winners["status"].laundering == ()
+    assert res.disputes == []

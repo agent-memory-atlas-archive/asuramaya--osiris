@@ -37,7 +37,13 @@ sources resolves IDENTICALLY to winning_props (grade DESC, recency DESC) — thi
 refinement that bites ONLY when a relay would otherwise out-rank its origin, or when an ancestor
 genuinely disagrees.
 
-SCOPE (v1): the clamp acts among AGENT sources (`agent:*`) related by spawned_by. The
+SCOPE (v1): the clamp acts among AGENT sources (`agent:*`) related by spawned_by OR
+succeeded_from (PROVENANCE PIECE 3, ruling bb3e4422: "provenance by channel, not by
+text") — a minted successor is treated identically to a spawned sub-agent, since both
+edge types store the same `(child, parent)` shape and the pure resolver never inspects
+which one built its `parent_of` map: a successor restating its ancestor's claim is a
+relay (clamped unless it looked), a disagreeing successor is a dispute, and a successor
+with its own observation act stands. The
 session-miner now SOURCES each extraction to the ORIGINATING agent (`agent:<session>`, DERIVED,
 with `session-miner` as the actor — see ingest/sessions.emit_yield), so a mined fact carries the
 agent's own identity and sits IN this tree: the clamp reaches it, and the miner is no longer the
@@ -181,7 +187,9 @@ def resolve_credence(
     looked: Mapping[str, bool],
 ) -> CredenceResult:
     """Resolve each (object, name) to its lineage-aware winner AND surface genuine disputes.
-    `parent_of` is the spawned_by child→parent map; `looked` is backed_by_observation per agent
+    `parent_of` is the spawned_by/succeeded_from child→parent map (PROVENANCE PIECE 3): a
+    minted successor sits in this same forest as an ordinary spawned sub-agent, so it is
+    resolved by identical structural rules. `looked` is backed_by_observation per agent
     source (default False = the conservative "never looked", the only state we clamp/dispute)."""
     groups: dict[tuple[str, str], list[Claim]] = {}
     for c in claims:
@@ -242,12 +250,19 @@ def resolve_credence(
 
 
 async def _parent_forest(actions: Actions) -> dict[str, str]:
-    """The whole spawned_by child→parent map (canonical→canonical). The delegation forest is
-    small (one node per sub-agent), so we load it whole rather than walk per lookup."""
+    """The whole child→parent map (canonical→canonical), `spawned_by` UNION `succeeded_from`
+    (PROVENANCE PIECE 3, ruling bb3e4422) — the independence oracle now treats a minted
+    successor exactly like a spawned sub-agent: both edge types store `from_id=child,
+    to_id=parent` (confirmed against agents.py's own mint path), so a successor restating its
+    ancestor's claim relays/clamps, a disagreeing successor disputes, and one with its own
+    `backed_by_observation` stands — the SAME three outcomes `resolve_credence` already proves
+    for spawned_by, since the pure resolver never inspects how `parent_of` was built. The
+    delegation+succession forest is small (one row per sub-agent or minted heir), so we load
+    it whole rather than walk per lookup."""
     rows = await actions.pool.fetch(
         "SELECT c.canonical AS child, p.canonical AS parent "
         "FROM links l JOIN objects c ON c.id = l.from_id JOIN objects p ON p.id = l.to_id "
-        "WHERE l.type = 'spawned_by'")
+        "WHERE l.type IN ('spawned_by', 'succeeded_from')")
     return {r["child"]: r["parent"] for r in rows}
 
 
