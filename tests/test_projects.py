@@ -182,7 +182,9 @@ async def test_assert_project_property_stamps_a_named_property(actions: Actions)
     await _stub_project(actions, "repo:app1", "app1")
     out = await assert_project_property(actions, project="app1", name="merged_into",
                                         value="repo:bytebye", actor="agent:test")
+    oid = out.pop("id", None)
     assert out == {"project": "repo:app1", "name": "merged_into", "value": "repo:bytebye"}
+    assert oid  # the written object's own id — PROVENANCE PIECE 1's stamping needs it
     val = await actions.pool.fetchval(
         "SELECT a.value #>> '{}' FROM objects o JOIN current_assertions a "
         "ON a.object_id=o.id AND a.name='merged_into' WHERE o.canonical='repo:app1'")

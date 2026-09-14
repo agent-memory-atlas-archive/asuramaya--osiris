@@ -110,6 +110,11 @@ _RESET_TABLES = (
     "links", "llm_usage", "mcp_tool_stats", "merge_candidates", "message_recipients",
     "object_events", "outbox", "pit_watch_alarms", "resource_leases", "search_log",
     "search_vectors",
+    # session_reads (migration 0069, PROVENANCE PIECE 1) joined here the same day it
+    # shipped, ahead of the harness_messages/soul_lines gap this comment block already
+    # names twice — FK-only to objects (like `links` above, same unordered position),
+    # so no ordering constraint among this tuple's own members.
+    "session_reads",
     # soul_lines/soul_sessions (migration 0050) were missing from the day the table
     # shipped, the exact same shape as harness_messages' own gap above: FK-free by
     # construction (0050 declares neither table with a REFERENCES/FOREIGN KEY — a

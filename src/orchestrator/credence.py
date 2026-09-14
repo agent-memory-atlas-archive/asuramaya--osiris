@@ -277,6 +277,64 @@ async def _looked_map(actions: Actions, srcs: set[str]) -> dict[str, bool]:
     return {r["src"]: bool(r["looked"]) for r in rows}
 
 
+async def upstream_sets(
+    actions: Actions, object_id: Any, source_ids: Sequence[str],
+) -> dict[str, frozenset[str]]:
+    """PROVENANCE PIECE 1's own IO leg (thread da545039f2ba): for each of `source_ids`,
+    the set of `possible_upstream` targets (str object ids) it minted FROM `object_id` —
+    orthogonal to `_parent_forest`'s spawned_by ancestry, one query for every source on
+    this object at once (a dossier property view calls this per-object, not per-
+    property — reused across every property name that object carries)."""
+    if not source_ids:
+        return {}
+    rows = await actions.pool.fetch(
+        "SELECT source_id, to_id FROM links WHERE from_id=$1 AND type='possible_upstream' "
+        "AND source_id = ANY($2::text[])", object_id, list(source_ids))
+    out: dict[str, set[str]] = {s: set() for s in source_ids}
+    for r in rows:
+        out[r["source_id"]].add(str(r["to_id"]))
+    return {k: frozenset(v) for k, v in out.items()}
+
+
+def distinct_upstream_count(
+    upstream_of: Mapping[str, frozenset[str]], looked: Mapping[str, bool] | None = None,
+) -> int:
+    """Connected-components count over a (object,name) group's own sources, two sources
+    joined whenever they share ANY possible_upstream target (ruling bb3e4422: "used only
+    to withhold independence, never to grant it" — this count only ever goes DOWN from
+    len(upstream_of), never up; a source with an empty upstream set stays its own,
+    un-collapsed component).
+
+    `looked` is the SAME Tier-1 rebuttal signal (`backed_by_observation`) resolve_credence
+    already exempts from the spawned_by clamp — a source that provably performed its own
+    observation act is NEVER collapsed into another's witness here either, even sharing a
+    possible_upstream target: it may have verified, and verification is corroboration, not
+    relay (resolve_credence's own docstring, applied identically to this second leg).
+    credence_props' own clamp/dispute/rebuttal MATH is untouched by this function — a
+    SEPARATE signal surfaced beside it, not folded into it."""
+    looked = looked or {}
+    sources = list(upstream_of)
+    parent = {s: s for s in sources}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i, a in enumerate(sources):
+        if not upstream_of[a] or looked.get(a, False):
+            continue
+        for b in sources[i + 1:]:
+            if looked.get(b, False):
+                continue
+            if upstream_of[a] & upstream_of[b]:
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[ra] = rb
+    return len({find(s) for s in sources})
+
+
 async def credence_props(actions: Actions, oids: Sequence[Any]) -> CredenceResult:
     """The lineage-aware resolution over `oids` — winning_props with the upstream credence
     discipline layered on. Fetches the latest per-source assertions, the spawned_by forest, and
