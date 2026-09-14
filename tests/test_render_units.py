@@ -197,6 +197,50 @@ def test_render_console_defaults_are_byte_identical(tmp_path: Path) -> None:
         user_dir / "osiris-console.service").read_text()
 
 
+def test_render_substitutes_console_graceful_shutdown_independently(tmp_path: Path) -> None:
+    """THE CONSOLE GRACEFUL SHUTDOWN (thread 0be2f790's own deploy-reliability
+    follow-up, Thoth DM 10653)."""
+    deploy = tmp_path / "deploy"
+    user_dir = deploy / "user"
+    user_dir.mkdir(parents=True)
+    _write_daemon_unit(user_dir, "osiris-console", memory_max="512M",
+                       extra_execstart=" --factory src.api.app:create_app "
+                                       "--host 127.0.0.1 --port 8011 "
+                                       "--timeout-graceful-shutdown 10")
+    out = tmp_path / "out"
+    n = render(deploy, out, {"daemon.osiris_console.graceful_shutdown_secs": 20})
+    assert n == 1
+    text = (out / "user" / "osiris-console.service").read_text()
+    assert "--timeout-graceful-shutdown 20" in text
+
+
+def test_render_console_graceful_shutdown_default_is_byte_identical(tmp_path: Path) -> None:
+    deploy = tmp_path / "deploy"
+    user_dir = deploy / "user"
+    user_dir.mkdir(parents=True)
+    _write_daemon_unit(user_dir, "osiris-console", memory_max="512M",
+                       extra_execstart=" --factory src.api.app:create_app "
+                                       "--host 127.0.0.1 --port 8011 "
+                                       "--timeout-graceful-shutdown 10")
+    out = tmp_path / "out"
+    n = render(deploy, out, {"daemon.osiris_console.memory_max": "512M",
+                             "daemon.osiris_console.host": "127.0.0.1",
+                             "daemon.osiris_console.port": 8011,
+                             "daemon.osiris_console.graceful_shutdown_secs": 10})
+    assert n == 0
+    assert (out / "user" / "osiris-console.service").read_text() == (
+        user_dir / "osiris-console.service").read_text()
+
+
+def test_shipped_osiris_console_unit_declares_a_graceful_shutdown_timeout() -> None:
+    """Reads the REAL shipped file (not a tmp fixture), same discipline
+    test_shipped_osiris_mcp_unit_declares_a_transcripts_root already holds — a future
+    edit that drops the flag without meaning to fails here, loudly."""
+    repo_root = Path(__file__).resolve().parent.parent
+    text = (repo_root / "deploy" / "user" / "osiris-console.service").read_text()
+    assert "--timeout-graceful-shutdown " in text
+
+
 def test_render_skips_the_daemon_lane_when_no_user_dir_exists(tmp_path: Path) -> None:
     deploy = tmp_path / "deploy"
     deploy.mkdir()

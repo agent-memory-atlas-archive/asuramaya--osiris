@@ -418,6 +418,17 @@ _DAEMON_UNIT_LITERALS: tuple[SettingSpec, ...] = (
                validate=_validate_port, authority="operator_or_ruling",
                requires_because=True, consequence="high",
                write_name="daemon_unit_literals"),
+    # THE CONSOLE GRACEFUL SHUTDOWN (thread 0be2f790's own deploy-reliability
+    # follow-up, Thoth DM 10653): uvicorn's own drain window before it force-closes
+    # in-flight connections on shutdown — an open SSE stream (a browser holding
+    # /graph/stream/deltas or /console/stream across a restart) never disconnects on
+    # its own, so this bounds how long a restart waits on it before systemd's own
+    # TimeoutStopSec (90s default, unset on this unit) would otherwise SIGKILL the
+    # whole process. 10s default matches the shipped unit's own literal.
+    SettingSpec("daemon.osiris_console.graceful_shutdown_secs", "int", 10,
+               effect="next_deploy", validate=_validate_positive_int,
+               authority="operator_or_ruling", requires_because=True,
+               consequence="high", write_name="daemon_unit_literals"),
     # osiris-pg-autotune.timer, the second of the two "hand-installed timer" census
     # targets — osiris-preflight.timer was ALREADY brought under deploy management by
     # piece 3 (one of BACKUP_TIMER_UNITS, its schedule already backup.timer_schedule.
