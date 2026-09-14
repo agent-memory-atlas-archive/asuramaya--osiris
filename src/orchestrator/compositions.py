@@ -4960,8 +4960,77 @@ async def _fn_backup_status(
     }
 
 
+async def _fn_upstream_readers(
+    pool: asyncpg.Pool, subject: uuid.UUID | None, args: dict[str, Any]
+) -> Any:
+    """THE UPSTREAM-CENTRIC READ (PROVENANCE PIECE 3(b), thread b4477e9e, ruling
+    bb3e4422) — the cross-object half nothing else covers. `credence.upstream_sets`
+    answers "what did THIS source read before writing?", per source; this is the
+    REVERSE: given `subject` (any object a read-set could have pointed at — a Message,
+    a URL-keyed external-source object, or any ordinary object), every fact whose
+    writer minted a `possible_upstream` edge naming `subject`, grouped by the writing
+    object — "who could plausibly trace to this, and what did they go on to assert?"
+
+    ONE FUNCTION, THE EXISTING GENERIC DOOR PAIR (no bespoke MCP tool or REST route):
+    seeded as the saved composition `upstream-readers` (DEFAULT_COMPOSITIONS below), so
+    `POST /compositions/upstream-readers/run` (body `{"subject": "<id>"}`) and MCP
+    `composition(action='run', name='upstream-readers', subject='<id>')` BOTH already
+    exist and both call the SAME `run_composition` — REST and MCP never call each other,
+    same law every bespoke door pair here holds, satisfied by the composition substrate
+    itself rather than a new one. The "who else read this upstream" UI expansion from a
+    property row reuses this identical Function against whichever upstream id(s) that
+    row's own source appears in (already fetched client-side via the dossier's own
+    `upstream_sets` data) — no separate backend surface.
+
+    `possible_upstream` is OVERBROAD BY DESIGN (provenance.py's own docstring: "used
+    only to withhold independence, never to grant it") — an edge here is "could
+    plausibly trace", never a claim this exact fact used that exact read; the `door`/
+    `read_at` per fact are the edge's own stamped context, not proof of use."""
+    if subject is None:
+        return {"error": "upstream-readers needs a subject — the upstream object id"}
+    rows = await pool.fetch(
+        "SELECT ca.object_id, ca.name, ca.value #>> '{}' AS value, ca.source_id, "
+        "       ca.confidence, ca.observed_at, "
+        "       l.properties->>'door' AS door, l.properties->>'read_at' AS read_at "
+        "FROM links l "
+        "JOIN current_assertions ca ON ca.object_id = l.from_id AND ca.source_id = l.source_id "
+        "WHERE l.to_id = $1 AND l.type = 'possible_upstream' "
+        "ORDER BY ca.object_id, ca.name",
+        subject,
+    )
+    if not rows:
+        return []
+    obj_ids = list({r["object_id"] for r in rows})
+    obj_meta = {
+        r["id"]: r
+        for r in await pool.fetch(
+            "SELECT id, type, canonical FROM objects WHERE id = ANY($1::uuid[])", obj_ids)
+    }
+    label_props = await fetch_label_props(pool, obj_ids)
+    groups: dict[uuid.UUID, dict[str, Any]] = {}
+    for r in rows:
+        oid = r["object_id"]
+        if oid not in groups:
+            meta = obj_meta.get(oid)
+            groups[oid] = {
+                "id": str(oid)[:8],
+                "canonical": meta["canonical"] if meta else None,
+                "name": (resolve_label(meta["type"], label_props.get(oid, {}),
+                                       meta["canonical"]).label if meta else str(oid)),
+                "facts": [],
+            }
+        groups[oid]["facts"].append({
+            "name": r["name"], "value": r["value"], "source_id": r["source_id"],
+            "confidence": float(r["confidence"]) if r["confidence"] is not None else None,
+            "observed_at": r["observed_at"].isoformat() if r["observed_at"] else None,
+            "door": r["door"], "read_at": r["read_at"],
+        })
+    return list(groups.values())
+
+
 _FUNCTIONS: dict[str, Function] = {
     "backup_status": _fn_backup_status,
+    "upstream_readers": _fn_upstream_readers,
     "coinvest": _fn_coinvest,
     "subject_report": _fn_subject_report,
     "screen_network": _fn_screen,
@@ -6731,6 +6800,12 @@ DEFAULT_COMPOSITIONS: dict[str, dict[str, Any]] = {
     # opinion left engine code (no more hardcoded read-model + bespoke MCP tool per lens).
     "co-investment-ties": {"op": "function", "name": "coinvest"},
     "who-is-this": {"op": "function", "name": "subject_report"},
+    # PROVENANCE PIECE 3(b) (thread b4477e9e): the upstream-centric read — subject =
+    # any object a read-set could point at (Message, URL, or ordinary object). REST/MCP
+    # mirrors are the existing generic composition doors (POST /compositions/
+    # upstream-readers/run, composition(action='run', name='upstream-readers')), no
+    # bespoke door pair needed.
+    "upstream-readers": {"op": "function", "name": "upstream_readers"},
     "screen-financing-network": {"op": "function", "name": "screen_network"},
     # the dedicated canon view: the project's design memory (Palantir/Notion + own docs),
     # rendered as a sectioned read-model. Run with no subject; `consult_canon(q)` queries it.
@@ -6929,6 +7004,8 @@ _COMP_META: dict[str, tuple[str, str]] = {
     "family-consistency": ("engine", "config families that should agree but don't"),
     "family-drift": ("engine", "how config families drift over time"),
     "lap": ("engine", "one object's provenance timeline — how belief formed"),
+    "upstream-readers": ("engine", "who could plausibly trace to this upstream object, "
+                                   "and what they went on to write"),
     "overhead": ("engine", "what the harness itself costs — hidden channels, cache vs "
                           "fresh, reminders, compactions, retained telemetry"),
     "operational-vs-disclosed-geography": ("casework", "where an org operates vs claims"),

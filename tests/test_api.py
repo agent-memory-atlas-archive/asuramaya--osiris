@@ -104,6 +104,25 @@ async def test_get_object_resolves_name_via_the_full_chain(
     assert r.json()["name"] == "measure it yourself, not from memory"
 
 
+async def test_get_object_carries_the_same_agreement_signals_as_the_dossier_route(
+    client: httpx.AsyncClient, actions: Actions,
+) -> None:
+    """PROVENANCE PIECE 3(b) (thread b4477e9e): the plain browse object view used to
+    bypass credence entirely — every property row now carries agreement/distinct_
+    upstreams/disputed, the SAME shared signal /objects/{id}/dossier already had."""
+    obj = await actions.create_or_find_object("SoftwareProject", "repo:objsig", "test")
+    now = datetime.now(UTC)
+    await actions.assert_property(obj, "status", "open", "agent:one", now, 0.9)
+    await actions.assert_property(obj, "status", "resolved", "agent:two", now, 0.9)
+    r = await client.get(f"/objects/{obj}")
+    assert r.status_code == 200
+    rows = [p for p in r.json()["properties"] if p["name"] == "status"]
+    assert len(rows) == 2
+    assert {row["agreement"] for row in rows} == {"contradicting"}
+    assert all(isinstance(row["distinct_upstreams"], int) for row in rows)
+    assert all(row["disputed"] is False for row in rows)  # no ancestry → never disputed
+
+
 async def test_objects_search_is_word_order_proof(
     client: httpx.AsyncClient, actions: Actions
 ) -> None:

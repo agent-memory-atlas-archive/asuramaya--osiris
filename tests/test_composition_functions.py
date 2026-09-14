@@ -120,7 +120,7 @@ async def test_function_registry_is_listable(actions: Actions) -> None:
                                 "practices", "project", "project_worktrees", "pulse",
                                 "reference_catalog",
                                 "roadmap_open", "screen_network", "search", "subject_report",
-                                "triage", "wall"]
+                                "triage", "upstream_readers", "wall"]
 
 
 async def test_briefing_is_a_sections_op_tree(actions: Actions) -> None:
@@ -599,3 +599,75 @@ async def test_backup_status_uses_the_configured_vault_path_when_no_test_overrid
     res = await run_spec(actions.pool, {"op": "function", "name": "backup_status",
                                         "args": {"backups": str(tmp_path / "b")}}, None)
     assert res["items"]["vault"]["dumps"]["count"] == 1
+
+
+# --- upstream_readers (PROVENANCE PIECE 3(b), thread b4477e9e) ----------------------
+
+def test_upstream_readers_is_registered_and_subject_required() -> None:
+    from src.orchestrator.compositions import _SUBJECT_FREE
+
+    assert "upstream_readers" in list_functions()
+    assert "upstream_readers" not in _SUBJECT_FREE
+
+
+async def test_upstream_readers_needs_a_subject(actions: Actions) -> None:
+    # the generic subject-required guard (_eval, not in _SUBJECT_FREE) raises before the
+    # Function's own body ever runs — same door every other subject-required Function uses.
+    await seed_default_compositions(actions.pool)
+    with pytest.raises(ValueError, match="requires a subject"):
+        await run_spec(
+            actions.pool, {"op": "function", "name": "upstream_readers", "args": {}}, None)
+
+
+async def test_upstream_readers_groups_facts_by_the_writing_object(actions: Actions) -> None:
+    # agent:reader read `upstream` through some door, then wrote two facts to `written` —
+    # stamp_possible_upstream (piece 1) is what mints the edge in real traffic; the test
+    # mints it directly to isolate the Function's own read.
+    upstream = await actions.create_or_find_object("SoftwareProject", "repo:upstream-src", "test")
+    written = await actions.create_or_find_object("SoftwareProject", "repo:written-obj", "test")
+    now = datetime.now(UTC)
+    await actions.create_link(written, upstream, "possible_upstream", "agent:reader", now, 1.0,
+                              properties={"door": "recall", "read_at": now.isoformat()})
+    await actions.assert_property(written, "status", "green", "agent:reader", now, 0.9)
+    await actions.assert_property(written, "note", "looks fine", "agent:reader", now, 0.6)
+    await seed_default_compositions(actions.pool)
+    res = await run_spec(
+        actions.pool,
+        {"op": "function", "name": "upstream_readers", "args": {}}, upstream)
+    items = res["items"]
+    assert len(items) == 1
+    group = items[0]
+    assert group["canonical"] == "repo:written-obj"
+    names = {f["name"] for f in group["facts"]}
+    assert names == {"status", "note"}
+    for f in group["facts"]:
+        assert f["source_id"] == "agent:reader"
+        assert f["door"] == "recall"
+
+
+async def test_upstream_readers_empty_when_nothing_points_here(actions: Actions) -> None:
+    lonely = await actions.create_or_find_object("SoftwareProject", "repo:lonely-upstream",
+                                                  "test")
+    await seed_default_compositions(actions.pool)
+    res = await run_spec(
+        actions.pool, {"op": "function", "name": "upstream_readers", "args": {}}, lonely)
+    assert res["items"] == []
+
+
+async def test_upstream_readers_reachable_via_the_saved_composition_mirror(
+    actions: Actions,
+) -> None:
+    """The 'REST + MCP mirrors' law, satisfied by the existing generic composition
+    doors (POST /compositions/upstream-readers/run, MCP composition(action='run')) once
+    seeded — both call run_composition, proven here directly."""
+    upstream = await actions.create_or_find_object("SoftwareProject", "repo:mirror-src", "test")
+    written = await actions.create_or_find_object("SoftwareProject", "repo:mirror-written",
+                                                   "test")
+    now = datetime.now(UTC)
+    await actions.create_link(written, upstream, "possible_upstream", "agent:mir", now, 1.0,
+                              properties={"door": "search", "read_at": now.isoformat()})
+    await actions.assert_property(written, "status", "ok", "agent:mir", now, 0.9)
+    await seed_default_compositions(actions.pool)
+    res = await run_composition(actions.pool, "upstream-readers", upstream)
+    assert len(res["items"]) == 1
+    assert res["items"][0]["canonical"] == "repo:mirror-written"
