@@ -40,6 +40,12 @@
   <aside id="right" class="rail"><div class="insp-empty" id="insp"><div style="font-weight:700;font-size:13px;letter-spacing:0.5px;text-transform:uppercase;color:var(--text);margin-bottom:8px">Provenance Inspector</div>Click any object to inspect its evidence grade and relationships.</div></aside>
 </div>
 <script src="osiris.js"></script>
-<script type="module" src="space.js"></script>
+<script type="module">
+  import { initSpace } from "./space.js";
+  initSpace().catch((err) => {
+    document.getElementById("status-line").textContent = `ERROR: ${err.message}`;
+    console.error(err);
+  });
+</script>
 </body>
 </html>

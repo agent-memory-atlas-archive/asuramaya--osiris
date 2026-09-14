@@ -105,15 +105,17 @@ def test_board_exposes_expand_and_collapse_one_hop() -> None:
     assert "n.degree() === 1" in _JS  # collapse only prunes leaves hanging off the center
 
 
-def test_search_box_and_breadcrumbs_are_wired_in_console_js() -> None:
+def test_breadcrumbs_are_wired_in_console_js() -> None:
+    # NAVIGABLE SPACE, INTEGRATION (mail 10550, test_navigable_space_integration.py):
+    # the graph-search box inside #cy is now wired directly by space.js's own initSpace()
+    # (same ids) rather than console.js's graphSearchInput/pickGraphSearch, and "expand/
+    # collapse one hop" doesn't apply to a renderer that already shows every positioned
+    # object at once -- both superseded here, not migrated. Breadcrumbs survive, now
+    # riding space's own focusObject instead of a fresh REST fetch + cytoscape mergeGraph.
     console_js = (Path(__file__).parent.parent / "src" / "ui" / "static" / "console.js").read_text()
-    assert "function graphSearchInput(q)" in console_js
-    assert "function pickGraphSearch(i)" in console_js and "focus(item.id)" in console_js
     assert "function pushBreadcrumb(id, label)" in console_js
     assert "function jumpToBreadcrumb(i)" in console_js
     assert "function stepBackBreadcrumb()" in console_js
-    assert "function expandFocusOneHop()" in console_js
-    assert "function collapseFocusOneHop()" in console_js
 
 
 def test_escape_steps_back_a_breadcrumb_when_nothing_more_local_consumed_it() -> None:
@@ -126,8 +128,6 @@ def test_graph_search_and_breadcrumb_markup_exist() -> None:
     html = (Path(__file__).parent.parent / "src" / "ui" / "static" / "index.html").read_text()
     assert 'id="graph-search"' in html
     assert 'id="graph-breadcrumbs"' in html
-    assert 'onclick="expandFocusOneHop()"' in html
-    assert 'onclick="collapseFocusOneHop()"' in html
 
 
 # --- item 7: Browse tiles carry an edge-count badge ---------------------------------------
@@ -145,8 +145,13 @@ def test_browse_tiles_render_the_edge_count_badge() -> None:
     assert console_js.count("edgeCountBadge(o.id)") >= 2  # table row AND board card
 
 
-def test_focus_no_longer_forces_a_layout_on_every_click() -> None:
+def test_focus_no_longer_touches_the_board_at_all() -> None:
+    # NAVIGABLE SPACE, INTEGRATION (mail 10550): focus() used to fetch a fresh one-hop
+    # neighborhood and merge it into the cytoscape board on every click -- now the whole
+    # graph is already loaded client-side, so focus() delegates straight to space's own
+    # focusObject and never touches ensureBoard()/mergeGraph at all.
     console_js = (Path(__file__).parent.parent / "src" / "ui" / "static" / "console.js").read_text()
-    assert "(ensureBoard()).layout((ensureBoard()).cy.nodes().length > 1)" not in console_js
-    assert ("(ensureBoard()).mergeGraph(g); (ensureBoard()).focusNode(id); "
-            "(ensureBoard()).fit();") in console_js
+    body = console_js.split("async function focus(id, fromBreadcrumb)", 1)[1].split(
+        "\n}\n", 1)[0]
+    assert "ensureBoard()" not in body
+    assert "space.focusObject(id)" in body

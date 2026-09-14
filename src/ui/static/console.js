@@ -13,52 +13,23 @@ let BOARD_GROUP_BY = 'auto', SYNCING = false, CONSOLE_REV = 0, SHOW_AGENTS = fal
 let TRUE_COUNTS = null; // uncapped per-type census from /objects/counts (#196) — null until loaded
 let OBJECTS_LIMIT = 1500, OBJECTS_HAS_MORE = false, OBJECTS_LOADING_MORE = false;
 
+// NAVIGABLE SPACE, INTEGRATION (decision "NAVIGABLE SPACE, INTEGRATION SHAPE", mail 10550):
+// the three.js renderer (space.js, mounted via #cy in index.html's own module script, see
+// window.__spaceReady) now owns browse's default graph view — the whole-graph LOD toggle
+// that used to live over the SAME cytoscape board (Thoth dispatch 9563's Atlas fold) is
+// superseded, not migrated: space shows every positioned object at once, always, so there
+// is no "whole graph" mode to toggle into separately any more. `ensureBoard()`'s cytoscape
+// instance survives, retargeted at the hidden #cy-legacy — Board (the kanban projection)
+// and this legacy mount are BOTH slated for real removal in piece 3, not here.
 var board = null;
 function ensureBoard() {
   if (!board && typeof Osiris !== "undefined" && Osiris.makeBoard) {
-    board = Osiris.makeBoard($("cy"),
+    board = Osiris.makeBoard($("cy-legacy"),
       function(id, deep, type) { return deep ? primaryAction(id, type) : inspectOnly(id); },
       function(id, type, ev) { return ev && showActionMenu(ev.clientX, ev.clientY, id, type); },
-      function(level) { setGraphLevelBadge(level); });
+      function() {});
   }
   return board;
-}
-
-// WHOLE-GRAPH LOD (Thoth dispatch 9563, folded from the retired Atlas into browse's own
-// graph mode — "keep working the graph view on browse," the operator's own word): a second
-// mode over the SAME #cy canvas/board, never a second surface. `renderEntityExplorerStage()`
-// (below) leaves the board alone while this is 'whole' — whole-graph mode owns the canvas
-// until the toggle explicitly hands it back.
-var GRAPH_MODE = 'neighborhood'; // 'neighborhood' | 'whole'
-function toggleGraphMode() {
-  if (GRAPH_MODE === 'whole') {
-    GRAPH_MODE = 'neighborhood';
-    (ensureBoard()).exitWholeGraph();
-    setGraphModeUI();
-    renderEntityExplorerStage(); // repopulate the neighborhood board fresh
-  } else {
-    GRAPH_MODE = 'whole';
-    (ensureBoard()).loadSupernodes();
-    setGraphModeUI();
-  }
-}
-function setGraphModeUI() {
-  var whole = GRAPH_MODE === 'whole';
-  var modeBtn = $('graph-mode-btn'); if (modeBtn) modeBtn.textContent = whole ? 'Neighborhood' : 'Whole Graph';
-  var zoomBtn = $('graph-zoomout-btn'); if (zoomBtn) zoomBtn.style.display = whole ? '' : 'none';
-  // Re-layout/Expand/Collapse are neighborhood-only verbs (a whole-graph position came
-  // from the server; re-laying it out client-side would fight the heartbeat every render).
-  ['graph-relayout-btn', 'graph-expand-btn', 'graph-collapse-btn'].forEach(function(id) {
-    var el = $(id); if (el) el.style.display = whole ? 'none' : '';
-  });
-  setGraphLevelBadge(whole ? 'supernodes' : '');
-}
-function setGraphLevelBadge(level) {
-  var el = $('graph-level-badge'); if (!el) return;
-  el.textContent = level === 'supernodes' ? 'projects' : (level === 'clusters' ? 'types' : (level === 'nodes' ? 'objects' : ''));
-}
-function wholeGraphZoomOut() {
-  var b = ensureBoard(); b.wholeGraphZoomOut(); setGraphLevelBadge(b.wholeGraphLevel());
 }
 
 function setStatus(s) { $("status").textContent = s; }
@@ -68,21 +39,16 @@ function showPanel() { $('stage').classList.add('panel'); }
 // ── Surface Switching ────────────────────────────────────────────────────────
 async function switchSurface(surface) {
   if (surface !== 'pane') closePaneStream();  // never leak an open SSE connection off-pane
-  // whole-graph mode lives only inside browse's own #cy controls — leaving browse with it
-  // still on would strand the toggle in a state its own controls no longer show.
-  if (ACTIVE_SURFACE === 'browse' && surface !== 'browse' && GRAPH_MODE === 'whole') {
-    GRAPH_MODE = 'neighborhood';
-    (ensureBoard()).exitWholeGraph();
-  }
   ACTIVE_SURFACE = surface; postConsole({ surface });
   document.querySelectorAll('.lens-item').forEach(el => el.classList.toggle('sel', el.dataset.surface === surface));
   $('page-title').textContent = surface.charAt(0).toUpperCase() + surface.slice(1);
   if (surface === 'browse') {
-    $('entity-taxonomy-bar').style.display = 'flex'; $('viewsw').style.display = '';
+    $('entity-taxonomy-bar').style.display = 'flex';
+    showBoard(); // the space canvas (#cy) + browse's own table drawer, never the shared #result panel
     if (!SET.length) await loadObjectSet(); renderEntityExplorer();
   } else {
-    $('entity-taxonomy-bar').style.display = 'none'; $('viewsw').style.display = 'none';
-    (ensureBoard()).clear(); showBoard();
+    $('entity-taxonomy-bar').style.display = 'none';
+    (ensureBoard()).clear(); showPanel();
     if (surface === 'mailbox') renderMailbox();
     if (surface === 'pane') renderPane();
     if (surface === 'projects') renderProjects();
@@ -350,34 +316,34 @@ function renderEntityToolbar() {
 }
 function toggleEntityType(t) { if (t === 'All') SELECTED_ENTITY_TYPES.clear(); else { if (SELECTED_ENTITY_TYPES.has(t)) SELECTED_ENTITY_TYPES.delete(t); else SELECTED_ENTITY_TYPES.add(t); } renderEntityExplorer(); }
 function filterEntitySearch(q) { ENTITY_SEARCH_QUERY = q; renderEntityExplorer(); }
-function setEntityView(mode) { ENTITY_VIEW_MODE = mode; renderEntityExplorerStage(); }
 function toggleTableSort(col) { TABLE_SORT_DIR = TABLE_SORT_COL === col ? (TABLE_SORT_DIR === 'asc' ? 'desc' : 'asc') : 'asc'; TABLE_SORT_COL = col; renderEntityExplorerStage(); }
 function inspectAndToggleRow(id) { inspectOnly(id); EXPANDED_ROWS.has(id) ? EXPANDED_ROWS.delete(id) : EXPANDED_ROWS.add(id); renderEntityExplorerStage(); }
-function setBoardGroupBy(mode) { BOARD_GROUP_BY = mode; renderEntityExplorerStage(); }
 function sortIcon(col) { return TABLE_SORT_COL === col ? (TABLE_SORT_DIR === 'asc' ? ' \u25b4' : ' \u25be') : ''; }
-function clearAll() { (ensureBoard()).clear(); setStatus('Board cleared.'); }
-
-async function renderEntityExplorer() { $('entity-taxonomy-bar').style.display = 'flex'; renderEntityToolbar(); renderSwitcher(); renderEntityExplorerStage(); }
-function renderSwitcher() {
-  const el = $('viewsw'); if (!el || ACTIVE_SURFACE !== 'browse') { if (el) el.innerHTML = ''; return; }
-  el.innerHTML = '<button class="view-tab' + (ENTITY_VIEW_MODE === 'table' ? ' on' : '') + '" onclick="setEntityView(\'table\')">Table</button><button class="view-tab' + (ENTITY_VIEW_MODE === 'board' ? ' on' : '') + '" onclick="setEntityView(\'board\')">Board</button><button class="view-tab' + (ENTITY_VIEW_MODE === 'graph' ? ' on' : '') + '" onclick="setEntityView(\'graph\')">Graph</button>';
+async function renderEntityExplorer() { $('entity-taxonomy-bar').style.display = 'flex'; renderEntityToolbar(); renderEntityExplorerStage(); }
+// NAVIGABLE SPACE, INTEGRATION (mail 10550): "graph and table COEXIST in the middle — your
+// default: the graph canvas fills the section with the table as a collapsible drawer beneath
+// it, the Table/Graph switch becomes 'show table'". Table/Board/Graph's old three-way
+// view-tab switcher (renderSwitcher, ENTITY_VIEW_MODE) is superseded by this one boolean —
+// #viewsw stays in the markup, empty/unused (piece 3 removes it alongside Board/cytoscape).
+let TABLE_DRAWER_OPEN = false;
+function toggleTableDrawer() {
+  TABLE_DRAWER_OPEN = !TABLE_DRAWER_OPEN;
+  const el = $('browse-drawer'); if (el) el.classList.toggle('open', TABLE_DRAWER_OPEN);
 }
 function renderEntityExplorerStage() {
   const filtered = getFilteredEntities(); setStatus(filtered.length + ' of ' + SET.length + ' entities');
-  if (ENTITY_VIEW_MODE === 'graph') {
-    showBoard();
-    // whole-graph mode owns the canvas until toggleGraphMode() explicitly hands it back —
-    // an incidental filter/search change while it's on must not silently repopulate the
-    // neighborhood board underneath it.
-    if (GRAPH_MODE === 'whole') return;
-    (ensureBoard()).clear();
-    if (filtered.length) (ensureBoard()).placeObjects(filtered.slice(0, 200).map(o => ({ id: o.id, type: o.type, label: o.display_label || o.name || o.canonical || o.id })));
-    return;
-  }
-  const container = $('result');
-  if (ENTITY_VIEW_MODE === 'board') { renderBoardProjection(container, filtered); showPanel(); return; }
-  renderTableProjection(container, filtered); showPanel();
+  const countEl = $('browse-drawer-count'); if (countEl) countEl.textContent = filtered.length.toLocaleString();
+  renderTableProjection($('browse-table'), filtered);
 }
+// shares the selection between the space canvas and the table drawer (mail 10550's own
+// "the two share the selection") — space.js calls this via its onFocus hook (index.html's
+// module script wires window.onSpaceFocus through), console.js's own inspectOnly/focus
+// reach FOCUS directly and call it too so a table click paints the same way.
+function onSpaceFocus(id) {
+  FOCUS = id;
+  if (ACTIVE_SURFACE === 'browse') renderEntityExplorerStage(); // repaints the 'sel' row
+}
+window.onSpaceFocus = onSpaceFocus;
 
 // ── Key/ID rendering ─────────────────────────────────────────────────────────
 // A key is either a NAME (repo:osiris -> "osiris", a handle, a slug) or an OPAQUE
@@ -920,75 +886,22 @@ function stepBackBreadcrumb() {
   focus(BREADCRUMBS[BREADCRUMBS.length - 1].id, true);
   return true;
 }
+// NAVIGABLE SPACE, INTEGRATION (mail 10550): focus() used to fetch a fresh one-hop
+// neighborhood and merge it into the cytoscape board — now the whole graph is already
+// loaded client-side in space.js, so "focus a node" is exactly space's own focusObject:
+// walk upstream, dim the rest, zoom-to-fit, open the inspector. No REST round-trip, no
+// board to clear. Falls back to the plain inspector fetch if space hasn't finished
+// mounting yet (a cold click right at page load).
 async function focus(id, fromBreadcrumb) {
   FOCUS = id; postConsole({ focused_object_id: id });
-  $('entity-taxonomy-bar').style.display = 'none'; $('viewsw').style.display = 'none';
-  showBoard(); (ensureBoard()).clear();
-  const g = await fetch('/objects/' + id + '/graph?hops=1').then(r => r.json());
-  let capped = 0;
-  if (g.nodes.length > 29) { capped = g.nodes.length - 1; const keep = new Set([id, ...g.nodes.filter(n => n.id !== id).slice(0, 28).map(n => n.id)]); g.nodes = g.nodes.filter(n => keep.has(n.id)); g.edges = g.edges.filter(e => keep.has(e.source) && keep.has(e.target)); }
-  // WAVE A item 5 (thread 8839): mergeGraph decides layout() for itself now (only an
-  // otherwise-empty board gets one; an already-populated board lands new nodes near their
-  // neighbors instead) — this call site just frames whatever landed, it never re-shuffles it.
-  (ensureBoard()).mergeGraph(g); (ensureBoard()).focusNode(id); (ensureBoard()).fit();
-  inspect(id);
-  var self = g.nodes.find(function(n){ return n.id === id; });
-  if (!fromBreadcrumb) pushBreadcrumb(id, self ? self.label : id.slice(0, 8));
-  setStatus(capped ? 'Showing 28 of ' + capped + ' connections.' : (ensureBoard()).cy.nodes().length + ' objects on the board.');
+  if (ACTIVE_SURFACE !== 'browse') await switchSurface('browse');
+  const space = window.OsirisSpace || (window.__spaceReady && await window.__spaceReady);
+  if (space) await space.focusObject(id); else await inspect(id);
+  if (!fromBreadcrumb) pushBreadcrumb(id, id.slice(0, 8));
 }
-// WAVE A item 6: expand/collapse the CURRENT selection's own one-hop neighborhood WITHOUT
-// clearing the board (focus() always does; this is the additive verb search/inspect use to
-// widen or narrow what's already on screen around one node).
-async function expandFocusOneHop() {
-  if (!FOCUS) { setStatus('Select a node first.'); return; }
-  var added = await (ensureBoard()).expandOneHop(FOCUS);
-  setStatus(added ? 'Expanded: +' + added + ' element(s).' : 'Nothing new to expand.');
-}
-function collapseFocusOneHop() {
-  if (!FOCUS) { setStatus('Select a node first.'); return; }
-  var n = (ensureBoard()).collapseOneHop(FOCUS);
-  setStatus(n ? 'Collapsed ' + n + ' leaf node(s).' : 'Nothing to collapse.');
-}
-// ── Graph search box (item 6) ───────────────────────────────────────────────
-let GRAPH_SEARCH_ITEMS = [], GRAPH_SEARCH_SEL = 0, GRAPH_SEARCH_TIMER = null, GRAPH_SEARCH_TOKEN = 0;
-function graphSearchInput(q) {
-  var dd = $('graph-search-dd'); if (!dd) return;
-  clearTimeout(GRAPH_SEARCH_TIMER);
-  if (!q || !q.trim()) { dd.style.display = 'none'; GRAPH_SEARCH_ITEMS = []; return; }
-  var myToken = ++GRAPH_SEARCH_TOKEN;
-  GRAPH_SEARCH_TIMER = setTimeout(async function() {
-    var hits = [];
-    try {
-      var res = await fetch('/search?q=' + encodeURIComponent(q) + '&limit=8').then(function(r){return r.json();});
-      hits = Array.isArray(res.hits) ? res.hits : (Array.isArray(res) ? res : []);
-    } catch(e) { hits = []; }
-    if (myToken !== GRAPH_SEARCH_TOKEN) return;
-    GRAPH_SEARCH_ITEMS = hits.filter(function(h){ return h && h.id; });
-    GRAPH_SEARCH_SEL = 0;
-    renderGraphSearchList();
-  }, 200);
-}
-function renderGraphSearchList() {
-  var dd = $('graph-search-dd'); if (!dd) return;
-  if (!GRAPH_SEARCH_ITEMS.length) { dd.style.display = 'none'; return; }
-  dd.style.display = 'block';
-  dd.innerHTML = GRAPH_SEARCH_ITEMS.map(function(h, i) {
-    var label = h.display_label || h.label || h.name || h.canonical || h.id;
-    return '<div class="dd-item' + (i === GRAPH_SEARCH_SEL ? ' sel' : '') + '" onclick="pickGraphSearch(' + i + ')"><div class="dd-item-main"><span class="dd-item-name">' + esc(label) + '</span><span class="dd-item-hint">' + esc(h.type || '') + '</span></div></div>';
-  }).join('');
-}
-function pickGraphSearch(i) {
-  var item = GRAPH_SEARCH_ITEMS[i]; if (!item) return;
-  $('graph-search-dd').style.display = 'none'; $('graph-search').value = '';
-  focus(item.id);
-}
-function graphSearchKey(e) {
-  if (!GRAPH_SEARCH_ITEMS.length) return;
-  if (e.key === 'ArrowDown') { e.preventDefault(); GRAPH_SEARCH_SEL = Math.min(GRAPH_SEARCH_SEL + 1, GRAPH_SEARCH_ITEMS.length - 1); renderGraphSearchList(); }
-  else if (e.key === 'ArrowUp') { e.preventDefault(); GRAPH_SEARCH_SEL = Math.max(GRAPH_SEARCH_SEL - 1, 0); renderGraphSearchList(); }
-  else if (e.key === 'Enter') { e.preventDefault(); pickGraphSearch(GRAPH_SEARCH_SEL); }
-  else if (e.key === 'Escape') { $('graph-search-dd').style.display = 'none'; }
-}
+// the graph-search/-dd box inside #cy is now wired directly by space.js's own initSpace()
+// (same ids, its own listener) — "expand/collapse one hop" doesn't apply to a renderer that
+// already shows every positioned object at once; both superseded, not migrated.
 async function inspect(id) {
   FOCUS = id;
   var obj = await fetch('/objects/' + id).then(function(r){return r.json();}).catch(function(){return null;});
@@ -1048,7 +961,11 @@ function inspectOnly(id) {
     badge.style.display = "inline";
     badge.textContent = "Inspect: " + id.slice(0, 8) + "";
   }
-  inspect(id);
+  // a table-drawer row click "shares the selection" with the space canvas (mail 10550) —
+  // focusObject also opens the inspector itself, so this replaces the plain inspect(id)
+  // call whenever the canvas is actually mounted and visible (browse).
+  if (ACTIVE_SURFACE === 'browse' && window.OsirisSpace) window.OsirisSpace.focusObject(id);
+  else inspect(id);
 }
 async function openAsSet(oid, type, dir, label) {
   const g = await fetch('/objects/' + oid + '/graph?hops=1').then(r => r.json());

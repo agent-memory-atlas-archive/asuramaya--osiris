@@ -1,11 +1,13 @@
 // NAVIGABLE SPACE, THE RENDERER — piece 2, THE VIEW (thread 71c4ca0d, Thoth DM 10436,
-// operator rulings f832c3a4/0a3d6719). The operator's own repeated corrections settled the
-// shape, twice: (1) zoom is LOOKING only, never a data-tier switch — navigation is a
-// CLICK; (2) a click doesn't change what's loaded either — "more like click to highlight"
-// — every positioned object is drawn AT ONCE (matching 0a3d6719's own original wording,
-// "an engine that can handle all objects at once"), and a click only lights the clicked
-// object's neighborhood, dims everything else, and opens the inspector. There is no tier
-// concept left in this file — that was this session's own wrong turn, corrected live.
+// operator rulings f832c3a4/0a3d6719), now INTEGRATED (decision "NAVIGABLE SPACE,
+// INTEGRATION SHAPE", mail 10550): mounted inside /ui/'s own browse stage in place of the
+// old #cy cytoscape container, not a separate page. The operator's own repeated corrections
+// settled the interaction shape, twice: (1) zoom is LOOKING only, never a data-tier switch —
+// navigation is a CLICK; (2) a click doesn't change what's loaded either — "more like click
+// to highlight" — every positioned object is drawn AT ONCE (matching 0a3d6719's own original
+// wording, "an engine that can handle all objects at once"), and a click only lights the
+// clicked object's neighborhood, dims everything else, and opens the inspector. There is no
+// tier concept in this file.
 //
 // Labels: the operator caught a real lag bug — DOM label positions were only recomputed on
 // a debounce, so they visibly fell behind the WebGL scene during a drag. Fixed by splitting
@@ -13,37 +15,112 @@
 // the ALREADY-CHOSEN labels sit on screen" (cheap — one Vector3.project() per label, no
 // resort), which now runs every render frame, not just after panning/zooming settles.
 //
-// Data source: still today's /objects/viewport (wave B item 2), tiled+paginated over the
-// full positioned extent exactly as piece 1's own spike proved out — no new server route.
-// Switches to Khnum's GET /graph/stream (thread b6cb1d7c0b36) the moment it lands, per
-// DM 10436.
+// Data source: Khnum's GET /graph/stream (thread b6cb1d7c0b36, wire format frozen by DM
+// 10439/10449/10451) — one binary snapshot, decoded client-side (decodeSnapshot below),
+// no more client-side tiling/pagination. GET /graph/stream/deltas SSE-polls the outbox for
+// incremental moves/retirements after the initial snapshot lands (op:'moved'|'retired').
+// Positions and collision avoidance (rings) are entirely Khnum's layout heartbeat's own —
+// this module reads x/y as given and never relaxes them client-side.
+//
+// KNOWN GAP (flagged to Khnum, DM 10554/10555, not blocking): the wire header's `types`/
+// `projects` arrays resolve node type_code/project_code, but edge_type_code has no matching
+// name array yet — edge color-coding below hashes the raw int until that lands, then swaps
+// to real relationship names with no shape change on this side.
+//
+// Mounts via initSpace(container) rather than running as a page-load IIFE, so console.js
+// (the live /ui/ shell) can own the container lifecycle; space.html keeps working as a
+// standalone dev harness by calling initSpace() against its own fixed ids.
 
 import * as THREE from "./vendor/three.module.js";
 
-const labelsEl = document.getElementById("labels");
-const wrap = document.getElementById("canvas-wrap");
-const statusEl = document.getElementById("status-line");
-const levelBadge = document.getElementById("graph-level-badge");
-const searchInput = document.getElementById("graph-search");
-const searchDd = document.getElementById("graph-search-dd");
-const rightRail = document.getElementById("right");
-
-function setStatus(text) { statusEl.textContent = text; }
-
 // colour-code an edge by its relationship type — a stable hash-to-hue, since no link-type
-// palette exists server-side yet (only /schema's own object_types carry colours).
+// palette exists server-side yet (only /schema's own object_types carry colours). Falls back
+// to hashing the raw edge_type_code int until Khnum's edge_types name array lands.
 const _edgeColorCache = new Map();
 function colorForEdgeType(type) {
-  if (_edgeColorCache.has(type)) return _edgeColorCache.get(type);
+  const key = String(type);
+  if (_edgeColorCache.has(key)) return _edgeColorCache.get(key);
   let h = 0;
-  for (let i = 0; i < type.length; i++) h = (h * 31 + type.charCodeAt(i)) >>> 0;
+  for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0;
   const hue = h % 360;
   const c = `hsl(${hue}, 55%, 55%)`;
-  _edgeColorCache.set(type, c);
+  _edgeColorCache.set(key, c);
   return c;
 }
 
-async function main() {
+// ---- GET /graph/stream wire decode (a JS twin of graph_stream.decode_snapshot) ---------
+// 4-byte LE uint32 header length, that many bytes of UTF-8 JSON header, then the raw arrays
+// back to back at the byte offsets the header's own `arrays` map names.
+const _DTYPE_CTOR = { f: Float32Array, H: Uint16Array, B: Uint8Array, I: Uint32Array };
+function decodeSnapshot(buf) {
+  const dv = new DataView(buf);
+  const headerLen = dv.getUint32(0, true);
+  const headerBytes = new Uint8Array(buf, 4, headerLen);
+  const header = JSON.parse(new TextDecoder().decode(headerBytes));
+  const bodyStart = 4 + headerLen;
+  const out = { ...header, arrays: undefined };
+  for (const [name, meta] of Object.entries(header.arrays)) {
+    const Ctor = _DTYPE_CTOR[meta.dtype];
+    // typed-array views need an offset that's a multiple of their own element size — the
+    // wire format packs arrays back to back with no padding, so a Float32/Uint32 view at a
+    // non-4-aligned offset throws; slice+copy is the safe general case (arrays here are a
+    // few hundred KB at most, not worth hand-padding the server's own byte layout for).
+    const byteOff = bodyStart + meta.offset;
+    const bytes = buf.slice(byteOff, byteOff + meta.length * Ctor.BYTES_PER_ELEMENT);
+    out[name] = new Ctor(bytes);
+  }
+  return out;
+}
+
+async function fetchStreamSnapshot() {
+  const buf = await fetch("/graph/stream").then((r) => r.arrayBuffer());
+  const snap = decodeSnapshot(buf);
+  const nodes = [];
+  for (let i = 0; i < snap.count; i++) {
+    nodes.push({
+      id: snap.object_ids[i],
+      type: snap.types[snap.type_code[i]],
+      project: snap.projects[snap.project_code[i]],
+      x: snap.x[i], y: snap.y[i],
+      degree: snap.weight[i],
+      statusFlag: snap.status_flag[i],
+    });
+  }
+  const edges = [];
+  for (let i = 0; i < snap.edge_count; i++) {
+    edges.push({
+      source: snap.object_ids[snap.edge_src[i]],
+      target: snap.object_ids[snap.edge_dst[i]],
+      type: (snap.edge_types && snap.edge_types[snap.edge_type_code[i]]) ?? snap.edge_type_code[i],
+    });
+  }
+  return { nodes, edges };
+}
+
+// resolves DOM refs from a passed-in container map, falling back to the same fixed ids
+// space.html's own standalone page has always used — lets console.js mount this against
+// its own #cy-replacement markup while space.html keeps working unchanged.
+function resolveContainer(container) {
+  const byId = (id) => document.getElementById(id);
+  return {
+    wrap: (container && container.wrap) || byId("canvas-wrap"),
+    labelsEl: (container && container.labels) || byId("labels"),
+    statusEl: (container && container.status) || byId("status-line"),
+    levelBadge: (container && container.levelBadge) || byId("graph-level-badge"),
+    searchInput: (container && container.searchInput) || byId("graph-search"),
+    searchDd: (container && container.searchDd) || byId("graph-search-dd"),
+    rightRail: (container && container.rightRail) || byId("right"),
+    fitBtn: (container && container.fitBtn) || byId("fit-btn"),
+    upBtn: (container && container.upBtn) || byId("up-btn"),
+    onFocus: (container && container.onFocus) || null, // (id) => void, shares selection with the table
+  };
+}
+
+export async function initSpace(container) {
+  const { wrap, labelsEl, statusEl, levelBadge, searchInput, searchDd, rightRail, fitBtn, upBtn, onFocus } =
+    resolveContainer(container);
+  function setStatus(text) { statusEl.textContent = text; }
+
   const typeColors = await loadTypeColors();
 
   // ---- renderer / scene / camera -----------------------------------------------------
@@ -60,7 +137,12 @@ async function main() {
   scene.background = new THREE.Color(0x0d1219);
   const pickScene = new THREE.Scene();
 
-  let viewSize = 1300; // world extent is roughly [-600,600]^2 (measured); start fully zoomed out
+  // world extent depends entirely on Khnum's own layout heartbeat (deterministic hash
+  // placement, piece A) and is NOT a fixed constant — a project-center hash can land
+  // anywhere; fitToNodes() (below) frames the camera from the real loaded bbox instead of
+  // a guessed number the moment the first snapshot lands, and Fit re-measures live rather
+  // than resetting to a stale guess.
+  let viewSize = 1300;
   const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
   camera.position.set(0, 0, 5);
   camera.lookAt(0, 0, 0);
@@ -227,62 +309,69 @@ async function main() {
     return m;
   }
 
-  // ---- load EVERY positioned object at once (piece 1's own spike loader) ------------
-  async function loadFullGraph() {
-    const EXTENT = 600;
-    const TILE = 100;
-    const nodesById = new Map();
-    const edgeKeys = new Set();
-    const edges = [];
-    let requestCount = 0;
-
-    async function fetchTile(minx, maxx, miny, maxy) {
-      let excludeIds = [];
-      for (;;) {
-        const qs = new URLSearchParams({
-          minx: String(minx), maxx: String(maxx), miny: String(miny), maxy: String(maxy),
-          limit: "5000",
-        });
-        if (excludeIds.length) qs.set("exclude", excludeIds.join(","));
-        requestCount++;
-        let r;
-        for (let attempt = 0; ; attempt++) {
-          try { r = await fetch(`/objects/viewport?${qs}`).then((x) => x.json()); break; }
-          catch (err) {
-            if (attempt >= 2) throw err;
-            await new Promise((res) => setTimeout(res, 150 * (attempt + 1)));
-          }
-        }
-        for (const n of r.nodes) {
-          if (!nodesById.has(n.id)) nodesById.set(n.id, n);
-          excludeIds.push(n.id);
-        }
-        for (const e of r.edges) {
-          const k = `${e.source}|${e.target}|${e.type}`;
-          if (!edgeKeys.has(k)) { edgeKeys.add(k); edges.push(e); }
-        }
-        if (r.nodes.length < 5000) break;
-        if (r.nodes.length === 0) break;
-      }
+  // frames the camera around the REAL bounding box of whatever's currently loaded —
+  // the fixed viewSize=1300 default this used to reset to was measured against the old
+  // force-relax layout's small extent and reads as "zoomed into one dense cluster" against
+  // Khnum's new deterministic hash-placement layout, whose extent can run tens of
+  // thousands of world units wide depending on how far apart two project hashes land.
+  function fitToNodes(list) {
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const nd of list) {
+      if (nd.x == null || nd.y == null) continue;
+      minX = Math.min(minX, nd.x); maxX = Math.max(maxX, nd.x);
+      minY = Math.min(minY, nd.y); maxY = Math.max(maxY, nd.y);
     }
-
-    const tiles = [];
-    for (let x = -EXTENT; x < EXTENT; x += TILE) {
-      for (let y = -EXTENT; y < EXTENT; y += TILE) tiles.push([x, x + TILE, y, y + TILE]);
-    }
-    const CONC = 8;
-    let next = 0;
-    async function worker() { while (next < tiles.length) { const i = next++; await fetchTile(...tiles[i]); } }
-    await Promise.all(Array.from({ length: CONC }, worker));
-
-    return { nodes: Array.from(nodesById.values()), edges, requestCount };
+    if (!Number.isFinite(minX)) return;
+    camera.position.x = (minX + maxX) / 2;
+    camera.position.y = (minY + maxY) / 2;
+    const span = Math.max(maxX - minX, maxY - minY, 0);
+    viewSize = Math.max(30, span * 1.1 + 40);
+    updateFrustum();
+    rescaleForZoom();
   }
 
   setStatus("loading the whole graph…");
-  const { nodes, edges, requestCount } = await loadFullGraph();
+  let { nodes, edges } = await fetchStreamSnapshot();
   buildScene(nodes, edges);
-  setStatus(`${nodes.length} objects, ${edges.length} edges (${requestCount} requests)`);
+  fitToNodes(nodes);
+  setStatus(`${nodes.length} objects, ${edges.length} edges`);
   levelBadge.textContent = "whole graph";
+
+  // ---- deltas: GET /graph/stream/deltas is an SSE poll-diff over the outbox, keyed by
+  // object id (not array index — see the module docstring). Applied live so the canvas
+  // never needs a full reload after the first snapshot; a 'retired' delta drops the node
+  // from the next full rebuild rather than trying to hide a single InstancedMesh instance
+  // (there is no per-instance visibility toggle cheaper than a rebuild at this node count).
+  let nodesById = new Map(nodes.map((nd) => [nd.id, nd]));
+  let pendingRebuild = false;
+  function scheduleRebuild() {
+    if (pendingRebuild) return;
+    pendingRebuild = true;
+    setTimeout(() => {
+      pendingRebuild = false;
+      nodes = Array.from(nodesById.values());
+      buildScene(nodes, edges);
+      if (focusId) applyDim();
+      setStatus(`${nodes.length} objects, ${edges.length} edges (live)`);
+    }, 250);
+  }
+  try {
+    const es = new EventSource("/graph/stream/deltas");
+    es.onmessage = (ev) => {
+      let delta;
+      try { delta = JSON.parse(ev.data); } catch { return; }
+      if (delta.op === "retired") {
+        nodesById.delete(delta.id);
+        scheduleRebuild();
+      } else if (delta.op === "moved") {
+        const nd = nodesById.get(delta.id);
+        if (nd && delta.x != null && delta.y != null) { nd.x = delta.x; nd.y = delta.y; scheduleRebuild(); }
+      }
+    };
+    es.onerror = () => { /* browser auto-reconnects an EventSource; nothing to do here */ };
+  } catch (err) {
+    console.error("graph/stream/deltas unavailable", err);
+  }
 
   // "highlight nodes all the way upstream" — walked CLIENT-SIDE off the already-loaded
   // edge list (the whole-graph load makes this free: no new endpoint). Osiris convention
@@ -429,20 +518,20 @@ async function main() {
       'letter-spacing:0.5px;text-transform:uppercase;color:var(--text);margin-bottom:8px">' +
       "Provenance Inspector</div>Click any object to inspect its evidence grade and relationships.</div>";
     setStatus(`${idToNode.length} objects, ${edges.length} edges`);
+    if (onFocus) onFocus(null); // shares the clear with an embedding table (console.js)
   }
 
-  document.getElementById("fit-btn").addEventListener("click", () => {
-    camera.position.x = 0; camera.position.y = 0; viewSize = 1300;
-    updateFrustum();
-    rescaleForZoom();
+  fitBtn.addEventListener("click", () => {
+    fitToNodes(idToNode);
     scheduleLabelPick();
   });
-  document.getElementById("up-btn").addEventListener("click", clearFocus);
+  upBtn.addEventListener("click", clearFocus);
 
   // ---- focus = HIGHLIGHT, never a reload (inspector stays HTML) ---------------------
   async function focusObject(id) {
     focusId = id;
     litIds = walkUpstream(id);
+    if (onFocus) onFocus(id); // shares the selection with an embedding table (console.js)
 
     // zoom-to-fit: frame the camera around exactly the lit set's own bounding box (padded),
     // not a fixed small viewSize centered on the click — "zooming them to where they make
@@ -606,14 +695,11 @@ async function main() {
   loop();
   pickLabels();
 
-  window.__space = {
-    focusObject, clearFocus, loadFullGraph,
+  const api = {
+    focusObject, clearFocus, inspect,
     get idToNode() { return idToNode; },
     camera, pickAt, mesh: () => mesh, worldPerPx, nodeRadiusPx, renderer,
   };
+  window.__space = api; // kept for existing debugging/test scripts, same shape as before
+  return api;
 }
-
-main().catch((err) => {
-  setStatus(`ERROR: ${err.message}`);
-  console.error(err);
-});
