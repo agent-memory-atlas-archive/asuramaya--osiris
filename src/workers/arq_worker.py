@@ -269,6 +269,50 @@ async def expand_case_job(ctx: dict[str, Any], case_id: str) -> int:
     return await expand_case(ctx["cascade"], uuid.UUID(case_id))
 
 
+async def provenance_backfill_job(
+    ctx: dict[str, Any], *, dry_run: bool, because: str | None, limit: int,
+    newest_first: bool, actor: str, receipt_ref: str,
+) -> dict[str, Any]:
+    """THE STALL, its own fix, item 1 (thread 0be2f790, Thoth mail 10626, 2026-09-14
+    evening): `backfill(target='provenance_possible_upstream')` used to read real
+    transcripts — some 200-470MB — on osiris-mcp's own event loop thread, starving the
+    whole fleet's shared connection for 19 minutes before the operator restarted it by
+    hand. No transcript byte is EVER read there again: the MCP door now enqueues THIS
+    job on osiris-worker (its own process, its own loop) and returns a job id; this
+    function does the real work and posts the receipt as a thread annotation when it's
+    done, exactly where a caller checking back would look. The CLI door
+    (`cmd_backfill`) still calls `backfill_possible_upstream` in-process — it IS its
+    own process, so the starvation risk this job exists to avoid does not apply there.
+
+    Streaming, the byte cap, and the wall-clock budget all live inside
+    `backfill_possible_upstream` itself (items 2-4 of the same ruling) — this wrapper
+    only supplies the worker-side execution boundary and the receipt's own delivery."""
+    from src.orchestrator.capture import annotate_thread
+    from src.orchestrator.provenance_backfill import backfill_possible_upstream
+
+    pool = ctx["pool"]
+    actions = Actions(pool)
+    report = await backfill_possible_upstream(
+        actions, dry_run=dry_run, because=because, limit=limit, newest_first=newest_first)
+    summary = report.get("summary", {})
+    note = (
+        f"WORKER RECEIPT (provenance_backfill_job, requested by {actor}): "
+        f"dry_run={report.get('dry_run')} newest_first={report.get('newest_first')} "
+        f"candidates_examined={report.get('candidates_examined')}/"
+        f"{report.get('candidates_total')} partial={report.get('partial')} "
+        f"edges_to_mint={report.get('edges_to_mint')} "
+        f"edges_by_door={report.get('edges_by_door')} "
+        f"skipped_count={report.get('skipped_count')} "
+        f"summary.candidates={summary.get('candidates')} "
+        f"summary.writers={summary.get('writers')} "
+        f"max_scan_bytes={report.get('max_scan_bytes')} "
+        f"runtime_seconds={report.get('runtime_seconds')}"
+        + (f" minted={report['minted']}" if "minted" in report else "")
+        + (f" error={report['error']}" if "error" in report else ""))
+    await annotate_thread(actions, receipt_ref, note, source="cron:provenance_backfill")
+    return report
+
+
 async def evaluate_watch(ctx: dict[str, Any]) -> int:
     """The tripwire: match new outbox mutations against active watches."""
     return await evaluate_watches(ctx["pool"])
@@ -1420,7 +1464,7 @@ if _layout_tick_minutes * 60 != _layout_tick_seconds:
 
 class WorkerSettings:
     # enqueueable jobs (the API hands heavy work here instead of running it inline)
-    functions: list[Any] = [expand_case_job, sweep_session]
+    functions: list[Any] = [expand_case_job, sweep_session, provenance_backfill_job]
     # RUN_AT_STARTUP HARDENING (Thoth's diagnosis + go-ahead, DM 1338/1350): a cron job WITHOUT
     # run_at_startup only SETS next_run on the worker's first heartbeat rather than firing
     # immediately (arq's own run_cron) — it needs the process to survive uninterrupted to its

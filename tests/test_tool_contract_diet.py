@@ -1597,7 +1597,14 @@ TOOL_CONTRACT_EXPECTED_COUNT = 87
 # cadence, the SAME function the CLI's `osiris layout --migrate` door and the REST
 # `/layout/migrate` route call. Genuinely new capability, no existing tool covers a
 # bulk placement pass run to quiescence. Measured exact (138,513).
-TOOL_CONTRACT_CEILING_CHARS = 138513
+# 137755 -> 137863 (2026-09-14, Sekhmet, thread 0be2f790, Thoth mail 10626): a real
+# 469MB transcript read on osiris-mcp's own event loop thread starved the shared
+# fleet-wide connection for 19 minutes — provenance_possible_upstream's own docstring
+# clause now says the target runs asynchronously (a job id back at once, the receipt as
+# a thread annotation when osiris-worker finishes), a genuine caller-visible behavior
+# change on an existing param set, not prose creep. Trimmed once before raising. No new
+# @mcp.tool(), tool count unchanged. Measured exact (137,863).
+TOOL_CONTRACT_CEILING_CHARS = 138621
 
 def test_ceiling_has_exactly_one_executable_assignment() -> None:
     """THE RATCHET'S OWN GUARD (thread c655c757). This file used to carry every historical
