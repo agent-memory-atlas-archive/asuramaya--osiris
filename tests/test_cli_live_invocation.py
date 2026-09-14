@@ -56,11 +56,16 @@ from src.cli import (
     cmd_backlog,
     cmd_bind_seat_tree,
     cmd_boot_status,
+    cmd_candidates,
     cmd_charter_for,
+    cmd_citation,
+    cmd_cite,
+    cmd_composition,
     cmd_correct_agent_house,
     cmd_correct_pin_value,
     cmd_desk,
     cmd_detach_seat,
+    cmd_dossier,
     cmd_establish_office,
     cmd_fleet,
     cmd_fleet_prune,
@@ -74,6 +79,7 @@ from src.cli import (
     cmd_lint,
     cmd_merge,
     cmd_migrate,
+    cmd_object_events,
     cmd_promote,
     cmd_proposal,
     cmd_rebind_seat,
@@ -87,6 +93,8 @@ from src.cli import (
     cmd_resync_seat_house,
     cmd_retention,
     cmd_retire_agent,
+    cmd_retire_assertion,
+    cmd_retire_link,
     cmd_retire_project,
     cmd_retire_seat,
     cmd_roster,
@@ -99,6 +107,7 @@ from src.cli import (
     cmd_smoke_chaos,
     cmd_status,
     cmd_stop,
+    cmd_succession_chain,
     cmd_sweep_seat_disk,
     cmd_team,
     cmd_thread,
@@ -282,6 +291,28 @@ NO_WRITE_INVOCATIONS: dict[str, Any] = {
     # (settings_service.get_setting's own "unknown setting key" refusal) — a pure
     # read regardless, never anything write-shaped.
     "settings": lambda a: cmd_settings("get", key="no-such-key-anywhere", pool=a.pool),
+    # CLI PARITY, THE NEXT CENSUS GAPS (Thoth mail 10441, thread 163c6832): dossier/
+    # object-events/succession-chain/candidates/composition are all pure reads called
+    # over the wire (same shape as show/search above); retire-assertion/retire-link/
+    # cite resolve-first-then-refuse on a nonexistent ref strictly before any write
+    # (retirement.py's own body, read directly — see the CLI door's own docstring);
+    # citation is a pure read, never writes.
+    "dossier": lambda a: cmd_dossier("no-such-ref-anywhere"),
+    "object-events": lambda a: cmd_object_events("no-such-ref-anywhere"),
+    "succession-chain": lambda a: cmd_succession_chain("no-such-ref-anywhere"),
+    "candidates": lambda a: cmd_candidates(project="no-such-project-anywhere", limit=1),
+    "composition": lambda a: cmd_composition("list"),
+    "retire-assertion": lambda a: cmd_retire_assertion(
+        "no-such-ref-anywhere", "no_such_property", 999999999, "x", "test",
+        actor="operator", pool=a.pool),
+    "retire-link": lambda a: cmd_retire_link(
+        "no-such-ref-anywhere", "no-such-other-ref-anywhere", "no_such_link_type", "test",
+        actor="operator", pool=a.pool),
+    "cite": lambda a: cmd_cite(
+        "no-such-ref-anywhere", "no-such-agent-anywhere", 0, "test",
+        actor="operator", pool=a.pool),
+    "citation": lambda a: cmd_citation(
+        "no-such-ref-anywhere", "no-such-agent-anywhere", pool=a.pool),
 }
 
 # CLI commands the population gate below knows are NOT in NO_WRITE_INVOCATIONS, each

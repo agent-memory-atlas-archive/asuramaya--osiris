@@ -78,7 +78,12 @@ _SUBPROCESS_BASELINE: dict[str, int] = {
     # sibling `proc.communicate()` on the timeout branch (draining an already-killed
     # process, genuinely near-instant) IS inline-marked instead — both are safe,
     # this one just isn't textually markable without hiding the real timeout.
-    "src/cli.py": 72,
+    # 72 -> 81 (2026-09-14, Imhotep, CLI PARITY THE NEXT CENSUS GAPS, Thoth mail 10441,
+    # thread 163c6832): nine new `asyncio.run(cmd_X(...))` dispatch lines (dossier,
+    # object-events, succession-chain, candidates, composition, retire-assertion,
+    # retire-link, cite, citation) — the identical false-positive class every entry
+    # above already names, not genuine new unbounded subprocess calls.
+    "src/cli.py": 81,
     "src/ingest/files.py": 3,
     "src/ingest/gitlog.py": 3,
     "src/ingest/sessions.py": 3,

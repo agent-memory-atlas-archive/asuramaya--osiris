@@ -318,6 +318,52 @@ CLI_ONLY_PARAMS = {
         "below, INVERTED and renamed — identical shape to heal-seat-anchor's own entry "
         "above, same reasoning (#204: the CLI door built for the #199 lane 3B audit's "
         "original specimen).",
+    # CLI PARITY, THE NEXT CENSUS GAPS (Thoth mail 10441, thread 163c6832): every new
+    # read/write door's own --json is a PRESENTATION flag, not an act — same reasoning
+    # as fleet's own entry above, repeated once per new command rather than folded into
+    # a blanket exemption (the house convention every prior --json entry already keeps).
+    ("dossier", "as_json"): "a PRESENTATION flag, not an act — same reasoning as fleet's "
+        "own entry above.",
+    ("object-events", "as_json"): "a PRESENTATION flag, not an act — same reasoning as "
+        "fleet's own entry above.",
+    ("succession-chain", "as_json"): "a PRESENTATION flag, not an act — same reasoning "
+        "as fleet's own entry above.",
+    ("candidates", "as_json"): "a PRESENTATION flag, not an act — same reasoning as "
+        "fleet's own entry above.",
+    # 'composition' is a DISPATCHER tool (COMPOSITION_INPUT_SCHEMA's oneOf, task #202,
+    # operator ruling f9182ad7): its own bare top-level schema has NO properties at all
+    # (every real param lives behind one of the save/run/list branches) — same shape
+    # `_mcp_dispatcher_action_params()`'s own docstring names for every dispatcher's
+    # bare name. This CLI door (Thoth mail 10441, thread 163c6832) fans across all
+    # three branches via a single --action argument that varies per invocation, so no
+    # one 'tool:action' pseudo-name can capture the union the way stop/mint-seat/
+    # thread's own single-branch pseudo-names do — same precedent as 'audit' (one
+    # door, not a subcommand each, by design), just declared per-param here rather
+    # than at NO_MCP_EQUIVALENT's whole-command level since 'composition' the bare
+    # tool name does exist (with an empty property set, not absent). The CLI door
+    # itself calls call_mcp_tool(url, 'composition', {action, ...}) — same function,
+    # same params per action — checked by reading cmd_composition's own body, not this
+    # table's per-param mechanism.
+    ("composition", "action"): "dispatcher fan-out param — see the block comment above.",
+    ("composition", "name"): "dispatcher fan-out param — see the block comment above.",
+    ("composition", "spec"): "dispatcher fan-out param — see the block comment above.",
+    ("composition", "kind"): "dispatcher fan-out param — see the block comment above.",
+    ("composition", "room"): "dispatcher fan-out param — see the block comment above.",
+    ("composition", "subject"): "dispatcher fan-out param — see the block comment above.",
+    ("composition", "fields"): "dispatcher fan-out param — see the block comment above.",
+    ("composition", "take"): "dispatcher fan-out param — see the block comment above.",
+    ("composition", "depth"): "dispatcher fan-out param — see the block comment above.",
+    ("composition", "offset"): "dispatcher fan-out param — see the block comment above.",
+    ("composition", "as_json"): "a PRESENTATION flag, not an act — same reasoning as "
+        "fleet's own entry above.",
+    ("retire-assertion", "as_json"): "a PRESENTATION flag, not an act — same reasoning "
+        "as unmerge's own entry above.",
+    ("retire-link", "as_json"): "a PRESENTATION flag, not an act — same reasoning as "
+        "unmerge's own entry above.",
+    ("cite", "as_json"): "a PRESENTATION flag, not an act — same reasoning as unmerge's "
+        "own entry above.",
+    ("citation", "as_json"): "a PRESENTATION flag, not an act — same reasoning as "
+        "fleet's own entry above.",
 }
 
 # CLI COMMAND -> ITS REAL MCP TARGET, when dash-to-underscore is the wrong mapping (task
@@ -375,6 +421,12 @@ CLI_TO_MCP_NAME: dict[str, str] = {
     # entry above: the CLI door's own params (project, tag, because) already match the
     # dispatcher branch's own names 1:1.
     "set-project-tag": "project:set_tag",
+    # CLI PARITY, THE NEXT CENSUS GAPS (Thoth mail 10441, thread 163c6832): the two
+    # short terminal-native names the dispatch asked for by name — real, live,
+    # standalone tools, so they belong here (matching 1:1 on params) rather than in
+    # NO_MCP_EQUIVALENT, same shape as `decide`/`status` above.
+    "cite": "cite_transcript",
+    "citation": "read_citation",
 }
 
 # (mcp_tool, param) -> reason: an MCP-only param with no CLI counterpart.

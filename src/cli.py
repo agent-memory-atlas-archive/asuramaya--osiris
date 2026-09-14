@@ -1482,6 +1482,354 @@ async def cmd_search(query: str, *, limit: int = 15, as_json: bool = False) -> i
     return 0
 
 
+# --- CLI PARITY, THE NEXT CENSUS GAPS (Thoth mail 10441, thread 163c6832) --------------------
+# Four read doors over the wire (dossier/object_events/succession_chain/candidates — no
+# single MCP tool named "inspect" exists to mirror, and candidates() has no ref param at
+# all, so this ships as four flat 1:1 mirrors rather than one dispatcher door), plus
+# composition's own CLI face, plus the two genuinely-uncovered write doors
+# (retire-assertion/retire-link) and the two short citation names Thoth's dispatch asked
+# for by name (cite/citation, CLI_TO_MCP_NAME-mapped onto cite_transcript/read_citation).
+
+async def cmd_dossier(object_ref: str, *, want_relationships: bool = False,
+                      as_json: bool = False) -> int:
+    """osiris dossier <ref> [--want-relationships] — the console-script door onto the
+    dossier MCP tool, called over the wire (same object_ref/want_relationships params,
+    no duplicated resolve/relationship logic)."""
+    from src import cli_render as render
+    from src.orchestrator.mcp_client import call_mcp_tool
+
+    url = await _mcp_url()
+    result = await call_mcp_tool(
+        url, "dossier", {"object_ref": object_ref, "want_relationships": want_relationships})
+    if isinstance(result, str):
+        print(f"osiris dossier: {result} — is osiris-mcp running? "
+              "(systemctl --user status osiris-mcp)", file=sys.stderr)
+        return 1
+    render.emit(result, as_json=as_json, title=f"dossier · {object_ref}")
+    return 1 if isinstance(result, dict) and result.get("error") else 0
+
+
+async def cmd_object_events(object_ref: str, *, event_type: str | None = None,
+                            as_json: bool = False) -> int:
+    """osiris object-events <ref> [--event-type T] — the console-script door onto the
+    object_events MCP tool, called over the wire (same object_ref/event_type params)."""
+    from src import cli_render as render
+    from src.orchestrator.mcp_client import call_mcp_tool
+
+    url = await _mcp_url()
+    result = await call_mcp_tool(
+        url, "object_events", {"object_ref": object_ref, "event_type": event_type})
+    if isinstance(result, str):
+        print(f"osiris object-events: {result} — is osiris-mcp running? "
+              "(systemctl --user status osiris-mcp)", file=sys.stderr)
+        return 1
+    render.emit(result, as_json=as_json, title=f"object-events · {object_ref}")
+    return 1 if isinstance(result, dict) and result.get("error") else 0
+
+
+async def cmd_succession_chain(ref: str, *, max_hops: int = 10,
+                               as_json: bool = False) -> int:
+    """osiris succession-chain <ref> [--max-hops N] — the console-script door onto the
+    succession_chain MCP tool, called over the wire (same ref/max_hops params)."""
+    from src import cli_render as render
+    from src.orchestrator.mcp_client import call_mcp_tool
+
+    url = await _mcp_url()
+    result = await call_mcp_tool(url, "succession_chain", {"ref": ref, "max_hops": max_hops})
+    if isinstance(result, str):
+        print(f"osiris succession-chain: {result} — is osiris-mcp running? "
+              "(systemctl --user status osiris-mcp)", file=sys.stderr)
+        return 1
+    render.emit(result, as_json=as_json, title=f"succession-chain · {ref}")
+    return 1 if isinstance(result, dict) and result.get("error") else 0
+
+
+async def cmd_candidates(*, project: str | None = None, limit: int = 50,
+                         as_json: bool = False) -> int:
+    """osiris candidates [--project P] [--limit N] — the console-script door onto the
+    candidates MCP tool, called over the wire (same project/limit params). Omitting
+    --project matches the orchestrator's own fleet-wide default: a COUNT you may look
+    at, not a pile a bare terminal can act on."""
+    from src import cli_render as render
+    from src.orchestrator.mcp_client import call_mcp_tool
+
+    url = await _mcp_url()
+    result = await call_mcp_tool(url, "candidates", {"project": project, "limit": limit})
+    if isinstance(result, str):
+        print(f"osiris candidates: {result} — is osiris-mcp running? "
+              "(systemctl --user status osiris-mcp)", file=sys.stderr)
+        return 1
+    render.emit(result, as_json=as_json, title="candidates")
+    return 1 if isinstance(result, dict) and result.get("error") else 0
+
+
+async def cmd_composition(
+    action: str, name: str | None = None, *, spec: str | None = None, kind: str = "lens",
+    room: str | None = None, subject: str | None = None, fields: list[str] | None = None,
+    take: int | None = None, depth: int | None = None, offset: int | None = None,
+    actor: str = _CONSOLE_ACTOR, as_json: bool = False, pool: asyncpg.Pool | None = None,
+) -> int:
+    """osiris composition <save|run|list|run-spec> [name] ... — Thoth's dispatch (mail
+    10441) named "list|run|run-spec|author"; the composition MCP tool's own action
+    table (COMPOSITION_INPUT_SCHEMA) only ever declared save/run/list — flagged on
+    thread 163c6832 before building "author"/"run-spec" as inventions. Thoth's
+    correction (mail 10448): "author" was his own error for `save`; `run-spec` IS
+    legitimate as a FOURTH, CLI-only mirror straight onto compositions.run_spec — a
+    plain orchestrator function with no MCP tool of its own, the SAME one
+    `osiris lint`/`osiris audit`'s own CLI doors already call directly (no duplicated
+    implementation, same class as lint/audit's own NO_MCP_EQUIVALENT entries).
+
+    save/run/list go over the wire (call_mcp_tool), the same composition MCP tool a
+    session already reaches. run-spec evaluates an EPHEMERAL spec with its own pool —
+    never saved, same "no save" semantics run_spec's own docstring states — since no
+    MCP tool wraps it to call over the wire. `--spec` is a JSON string (same
+    convention as `osiris settings set`'s own --value); required for save and
+    run-spec."""
+    import json as _json
+
+    from src import cli_render as render
+
+    parsed_spec: dict[str, Any] | None = None
+    if spec is not None:
+        try:
+            parsed_spec = _json.loads(spec)
+        except _json.JSONDecodeError:
+            print("osiris composition: --spec must be valid JSON", file=sys.stderr)
+            return 1
+
+    if action == "run-spec":
+        if parsed_spec is None:
+            print("osiris composition run-spec: --spec is required", file=sys.stderr)
+            return 1
+        from src.orchestrator.compositions import resolve_ref, run_spec
+
+        owns_pool = pool is None
+        if pool is None:
+            from src.config.dev_env import apply_dev_fallback
+            from src.config.settings import get_settings
+            from src.db.pool import create_pool
+
+            apply_dev_fallback()
+            settings = get_settings()
+            try:
+                pool = await create_pool(
+                    settings.database_url, min_size=1, max_size=2,
+                    application_name="osiris-cli:composition")
+            except Exception as exc:  # noqa: BLE001 - the CLI boundary: report, no raw traceback
+                print(f"osiris composition: could not reach postgres at "
+                      f"{settings.database_url} — {exc}. Set DATABASE_URL, or start the "
+                      "dev instance.", file=sys.stderr)
+                return 1
+        try:
+            subj_id = await resolve_ref(pool, subject) if subject else None
+            out = await run_spec(
+                pool, parsed_spec, subj_id, name or "(spec)", actor,
+                fields=fields, take=take, depth=depth, offset=offset)
+        finally:
+            if owns_pool:
+                await pool.close()
+        render.emit(out, as_json=as_json, title="composition run-spec")
+        return 1 if isinstance(out, dict) and out.get("error") else 0
+
+    from src.orchestrator.mcp_client import call_mcp_tool
+
+    url = await _mcp_url()
+    result = await call_mcp_tool(url, "composition", {
+        "action": action, "name": name, "spec": parsed_spec, "kind": kind, "room": room,
+        "subject": subject, "fields": fields, "take": take, "depth": depth, "offset": offset,
+    })
+    if isinstance(result, str):
+        print(f"osiris composition: {result} — is osiris-mcp running? "
+              "(systemctl --user status osiris-mcp)", file=sys.stderr)
+        return 1
+    render.emit(result, as_json=as_json, title=f"composition {action}")
+    return 1 if isinstance(result, dict) and result.get("error") else 0
+
+
+async def cmd_retire_assertion(
+    ref: str, name: str, superseded_id: int, value: str, because: str, *, actor: str,
+    as_json: bool = False, pool: asyncpg.Pool | None = None,
+) -> int:
+    """osiris retire-assertion <ref> <name> <superseded_id> <value> <because> --actor W —
+    the console-script door onto orchestrator.retirement.retire_assertion, the SAME
+    function the retire_assertion MCP tool wraps (no duplicated guard: the blank-because,
+    blank-name, unresolved-ref, and superseded_id-mismatch refusals are exactly
+    retire_assertion's own, all before any write)."""
+    from src.actions.core import Actions
+    from src.orchestrator.retirement import retire_assertion as _retire_assertion
+
+    owns_pool = pool is None
+    if pool is None:
+        from src.config.dev_env import apply_dev_fallback
+        from src.config.settings import get_settings
+        from src.db.pool import create_pool
+
+        apply_dev_fallback()
+        settings = get_settings()
+        try:
+            pool = await create_pool(
+                settings.database_url, min_size=1, max_size=4,
+                application_name="osiris-cli:retire-assertion")
+        except Exception as exc:  # noqa: BLE001 - the CLI boundary: report, no raw traceback
+            print(f"osiris retire-assertion: could not reach postgres at "
+                  f"{settings.database_url} — {exc}. Set DATABASE_URL, or start the dev "
+                  "instance.", file=sys.stderr)
+            return 1
+    try:
+        out = await _retire_assertion(
+            Actions(pool), ref=ref, name=name, superseded_id=superseded_id, value=value,
+            because=because, actor=actor)
+    finally:
+        if owns_pool:
+            await pool.close()
+    if "error" in out:
+        print(f"osiris retire-assertion: refused — {out['error']}", file=sys.stderr)
+        return 1
+    from src import cli_render as render
+    render.emit(out, as_json=as_json, title="retire-assertion")
+    return 0
+
+
+async def cmd_retire_link(
+    from_ref: str, to_ref: str, link_type: str, because: str, *, actor: str,
+    as_json: bool = False, pool: asyncpg.Pool | None = None,
+) -> int:
+    """osiris retire-link <from_ref> <to_ref> <link_type> <because> --actor W — the
+    console-script door onto orchestrator.retirement.retire_link, the SAME function the
+    retire_link MCP tool wraps (no duplicated guard: the blank-because, blank-link_type,
+    unresolved-ref, and no-active-link refusals are exactly retire_link's own, all
+    before any write)."""
+    from src.actions.core import Actions
+    from src.orchestrator.retirement import retire_link as _retire_link
+
+    owns_pool = pool is None
+    if pool is None:
+        from src.config.dev_env import apply_dev_fallback
+        from src.config.settings import get_settings
+        from src.db.pool import create_pool
+
+        apply_dev_fallback()
+        settings = get_settings()
+        try:
+            pool = await create_pool(
+                settings.database_url, min_size=1, max_size=4,
+                application_name="osiris-cli:retire-link")
+        except Exception as exc:  # noqa: BLE001 - the CLI boundary: report, no raw traceback
+            print(f"osiris retire-link: could not reach postgres at "
+                  f"{settings.database_url} — {exc}. Set DATABASE_URL, or start the dev "
+                  "instance.", file=sys.stderr)
+            return 1
+    try:
+        out = await _retire_link(
+            Actions(pool), from_ref=from_ref, to_ref=to_ref, link_type=link_type,
+            because=because, actor=actor)
+    finally:
+        if owns_pool:
+            await pool.close()
+    if "error" in out:
+        print(f"osiris retire-link: refused — {out['error']}", file=sys.stderr)
+        return 1
+    from src import cli_render as render
+    render.emit(out, as_json=as_json, title="retire-link")
+    return 0
+
+
+async def cmd_cite(
+    ref: str, agent: str, line_idx: int, because: str, *, actor: str,
+    as_json: bool = False, pool: asyncpg.Pool | None = None,
+) -> int:
+    """osiris cite <ref> <agent> <line_idx> <because> --actor W — the console-script door
+    onto capture.mint_transcript_citation, the SAME function the cite_transcript MCP tool
+    wraps. Thoth's dispatch (mail 10441) named this door "cite" rather than
+    "cite-transcript" — real target declared in CLI_TO_MCP_NAME. Resolves `ref` via the
+    shared resolve_ref the MCP tool itself uses before minting, so an unresolved ref
+    refuses before any write, same as the MCP tool's own {"error": ...} shape."""
+    from src.actions.core import Actions
+    from src.orchestrator.capture import mint_transcript_citation
+    from src.orchestrator.compositions import resolve_ref
+
+    owns_pool = pool is None
+    if pool is None:
+        from src.config.dev_env import apply_dev_fallback
+        from src.config.settings import get_settings
+        from src.db.pool import create_pool
+
+        apply_dev_fallback()
+        settings = get_settings()
+        try:
+            pool = await create_pool(
+                settings.database_url, min_size=1, max_size=4,
+                application_name="osiris-cli:cite")
+        except Exception as exc:  # noqa: BLE001 - the CLI boundary: report, no raw traceback
+            print(f"osiris cite: could not reach postgres at {settings.database_url} — "
+                  f"{exc}. Set DATABASE_URL, or start the dev instance.", file=sys.stderr)
+            return 1
+    try:
+        from_id = await resolve_ref(pool, ref)
+        if from_id is None:
+            print(f"osiris cite: refused — {ref!r} does not resolve to any object — a "
+                  "citation needs a real citing Decision/Thread/Evaluation", file=sys.stderr)
+            return 1
+        try:
+            out = await mint_transcript_citation(
+                Actions(pool), from_id, agent, line_idx, because, source=actor)
+        except ValueError as e:
+            print(f"osiris cite: refused — {e}", file=sys.stderr)
+            return 1
+    finally:
+        if owns_pool:
+            await pool.close()
+    from src import cli_render as render
+    render.emit(out, as_json=as_json, title="cite")
+    return 0
+
+
+async def cmd_citation(
+    ref: str, agent: str, *, as_json: bool = False, pool: asyncpg.Pool | None = None,
+) -> int:
+    """osiris citation <ref> <agent> — the console-script door onto
+    capture.read_transcript_citation, the SAME function the read_citation MCP tool
+    wraps. Thoth's dispatch (mail 10441) named this door "citation" rather than
+    "read-citation" — real target declared in CLI_TO_MCP_NAME. Pure read: never
+    writes."""
+    from src.orchestrator.capture import read_transcript_citation
+    from src.orchestrator.compositions import resolve_ref
+
+    owns_pool = pool is None
+    if pool is None:
+        from src.config.dev_env import apply_dev_fallback
+        from src.config.settings import get_settings
+        from src.db.pool import create_pool
+
+        apply_dev_fallback()
+        settings = get_settings()
+        try:
+            pool = await create_pool(
+                settings.database_url, min_size=1, max_size=2,
+                application_name="osiris-cli:citation")
+        except Exception as exc:  # noqa: BLE001 - the CLI boundary: report, no raw traceback
+            print(f"osiris citation: could not reach postgres at {settings.database_url} "
+                  f"— {exc}. Set DATABASE_URL, or start the dev instance.", file=sys.stderr)
+            return 1
+    try:
+        from_id = await resolve_ref(pool, ref)
+        if from_id is None:
+            print(f"osiris citation: refused — {ref!r} does not resolve to any object",
+                  file=sys.stderr)
+            return 1
+        try:
+            out = await read_transcript_citation(pool, from_id, agent)
+        except ValueError as e:
+            print(f"osiris citation: refused — {e}", file=sys.stderr)
+            return 1
+    finally:
+        if owns_pool:
+            await pool.close()
+    from src import cli_render as render
+    render.emit(out, as_json=as_json, title="citation")
+    return 0
+
+
 # --- fleet -----------------------------------------------------------------------------------
 
 async def cmd_fleet(*, full: bool, as_json: bool = False) -> int:
@@ -6051,7 +6399,8 @@ COMMANDS, GROUPED BY WHAT YOU'RE TRYING TO DO:
   end one               stop
   see the fleet         fleet, roster, backlog, team, status, boot-status, smoke, lint,
                         audit
-  read the record       desk, show, threads, inbox, search
+  read the record       desk, show, threads, inbox, search, dossier, object-events,
+                        succession-chain, candidates, composition, citation
   write to the record   send, decide, thread, annotate-thread, amend-decision,
                         charter-for, amend-practice, merge, unmerge, fold-project,
                         rebind-seat, correct-pin-value, heal-seat-anchor,
@@ -6061,7 +6410,8 @@ COMMANDS, GROUPED BY WHAT YOU'RE TRYING TO DO:
                         rename-seat, set-seat-attended, reissue-office,
                         establish-office, resync-seat-house, reconcile-seat-identity,
                         create-project, rename-project, retire-project, fork-project,
-                        set-project-tag, proposal, settings
+                        set-project-tag, proposal, settings, retire-assertion,
+                        retire-link, cite
   operate               deploy, migrate, seed, bootstrap, retention, rematerialize,
                         fleet-reconcile, fleet-prune, backfill
 
@@ -6322,6 +6672,146 @@ def _build_parser() -> argparse.ArgumentParser:
     p_show.add_argument("ref", help="UUID, 8-char short id, or summary substring")
     p_show.add_argument("--json", action="store_true", dest="as_json",
                         help="machine-readable: one compact JSON line, for a script or an agent")
+
+    p_dossier = sub.add_parser("dossier", description=_d(
+        "the full entity dossier for one object — the same dossier() MCP tool, called "
+        "over the wire"),
+        epilog="example: osiris dossier 5f234a1c\n"
+               "example: osiris dossier 5f234a1c --want-relationships")
+    p_dossier.add_argument("object_ref", help="UUID, canonical, or name")
+    p_dossier.add_argument("--want-relationships", action="store_true",
+                           dest="want_relationships",
+                           help="also include the object's own relationship edges")
+    p_dossier.add_argument("--json", action="store_true", dest="as_json",
+                           help="machine-readable: one compact JSON line, for a script or an agent")
+
+    p_object_events = sub.add_parser("object-events", description=_d(
+        "the append-only event history for one object — the same object_events() MCP "
+        "tool, called over the wire"),
+        epilog="example: osiris object-events 5f234a1c\n"
+               "example: osiris object-events 5f234a1c --event-type status_changed")
+    p_object_events.add_argument("object_ref", help="UUID, canonical, or name")
+    p_object_events.add_argument("--event-type", default=None, dest="event_type",
+                                 help="narrow to one event type (default: every type)")
+    p_object_events.add_argument("--json", action="store_true", dest="as_json",
+                                 help="machine-readable: one compact JSON line")
+
+    p_succession_chain = sub.add_parser("succession-chain", description=_d(
+        "an agent lineage's own succession chain — the same succession_chain() MCP "
+        "tool, called over the wire"),
+        epilog="example: osiris succession-chain ad1a1cb0\n"
+               "example: osiris succession-chain ad1a1cb0 --max-hops 5")
+    p_succession_chain.add_argument("ref", help="UUID, canonical, handle, or lineage prefix")
+    p_succession_chain.add_argument("--max-hops", type=int, default=10, dest="max_hops",
+                                    help="cap on hops walked (default 10)")
+    p_succession_chain.add_argument("--json", action="store_true", dest="as_json",
+                                    help="machine-readable: one compact JSON line")
+
+    p_candidates = sub.add_parser("candidates", description=_d(
+        "identity-merge candidates for a project — the same candidates() MCP tool, "
+        "called over the wire. Omitting --project matches the fleet-wide default: a "
+        "count you may look at, not a pile a bare terminal can act on"),
+        epilog="example: osiris candidates --project osiris\n"
+               "example: osiris candidates --limit 10")
+    p_candidates.add_argument("--project", default=None,
+                              help="scope to one project (default: fleet-wide)")
+    p_candidates.add_argument("--limit", type=int, default=50,
+                              help="max candidates returned (default 50)")
+    p_candidates.add_argument("--json", action="store_true", dest="as_json",
+                              help="machine-readable: one compact JSON line")
+
+    p_composition = sub.add_parser("composition", description=_d(
+        "the composition MCP tool's own save/run/list actions (called over the wire), "
+        "plus a fourth CLI-only mirror onto compositions.run_spec (an ephemeral, "
+        "never-saved spec — see cmd_composition's own docstring for why run-spec has "
+        "no MCP counterpart; Thoth's dispatch named this door, mail 10441/10448)"),
+        epilog="example: osiris composition list\n"
+               "example: osiris composition run briefing\n"
+               "example: osiris composition save my-lens "
+               "--spec '{\"kind\":\"search\",\"query\":\"x\"}'\n"
+               "example: osiris composition run-spec "
+               "--spec '{\"op\":\"function\",\"name\":\"lint\"}'")
+    p_composition.add_argument("action", choices=["save", "run", "list", "run-spec"],
+                               help="save | run | list | run-spec")
+    p_composition.add_argument("name", nargs="?", default=None,
+                               help="composition name (required for save/run, unused for "
+                                    "list/run-spec)")
+    p_composition.add_argument("--spec", default=None,
+                               help="a JSON object, required for save and run-spec (same "
+                                    "convention as `osiris settings set`'s own --value)")
+    p_composition.add_argument("--kind", default="lens", help="'lens' or 'watch' (default lens)")
+    p_composition.add_argument("--room", default=None, help="scope to a stance/room")
+    p_composition.add_argument("--subject", default=None,
+                               help="run a composition against this subject object")
+    p_composition.add_argument("--fields", nargs="*", default=None,
+                               help="field subset to run/save/run-spec with")
+    p_composition.add_argument("--take", type=int, default=None)
+    p_composition.add_argument("--depth", type=int, default=None)
+    p_composition.add_argument("--offset", type=int, default=None)
+    p_composition.add_argument("--actor", default=_CONSOLE_ACTOR,
+                               help="run-spec only: the reflection ACL's caller identity — "
+                                    f"defaults to {_CONSOLE_ACTOR!r}")
+    p_composition.add_argument("--json", action="store_true", dest="as_json",
+                               help="machine-readable: one compact JSON line")
+
+    p_retire_assertion = sub.add_parser("retire-assertion", description=_d(
+        "retire one superseded property value on an object — the console door onto "
+        "orchestrator.retirement.retire_assertion, the same function the "
+        "retire_assertion MCP tool wraps"),
+        epilog="example: osiris retire-assertion 5f234a1c memory_max 42 3G "
+               "'stale, replaced by settings registry'")
+    p_retire_assertion.add_argument("ref", help="UUID, canonical, or name of the object")
+    p_retire_assertion.add_argument("name", help="the property name being retired")
+    p_retire_assertion.add_argument("superseded_id", type=int,
+                                    help="the assertion row id being superseded")
+    p_retire_assertion.add_argument("value", help="the stale value, for the record")
+    p_retire_assertion.add_argument("because", help="why this is retired now")
+    p_retire_assertion.add_argument("--actor", default=_CONSOLE_ACTOR,
+                                    help="who is performing this retirement — defaults to "
+                                         f"{_CONSOLE_ACTOR!r}")
+    p_retire_assertion.add_argument("--json", action="store_true", dest="as_json",
+                                    help="machine-readable: one compact JSON line")
+
+    p_retire_link = sub.add_parser("retire-link", description=_d(
+        "retire one no-longer-active link between two objects — the console door onto "
+        "orchestrator.retirement.retire_link, the same function the retire_link MCP "
+        "tool wraps"),
+        epilog="example: osiris retire-link 5f234a1c 7a1b2c3d governs "
+               "'seat reassigned, charter moved'")
+    p_retire_link.add_argument("from_ref", help="UUID, canonical, or name of the source object")
+    p_retire_link.add_argument("to_ref", help="UUID, canonical, or name of the target object")
+    p_retire_link.add_argument("link_type", help="the link type being retired")
+    p_retire_link.add_argument("because", help="why this link is retired now")
+    p_retire_link.add_argument("--actor", default=_CONSOLE_ACTOR,
+                               help="who is performing this retirement — defaults to "
+                                    f"{_CONSOLE_ACTOR!r}")
+    p_retire_link.add_argument("--json", action="store_true", dest="as_json",
+                               help="machine-readable: one compact JSON line")
+
+    p_cite = sub.add_parser("cite", description=_d(
+        "mint a transcript citation on a Decision/Thread/Evaluation — the console door "
+        "onto capture.mint_transcript_citation, the same function the cite_transcript "
+        "MCP tool wraps"),
+        epilog="example: osiris cite 5f234a1c Khnum 142 'this line proves the claim'")
+    p_cite.add_argument("ref", help="UUID, canonical, or name of the citing object")
+    p_cite.add_argument("agent", help="the agent whose transcript is being cited")
+    p_cite.add_argument("line_idx", type=int, help="the transcript line index")
+    p_cite.add_argument("because", help="why this line is being cited")
+    p_cite.add_argument("--actor", default=_CONSOLE_ACTOR,
+                        help="who is performing this citation — defaults to "
+                             f"{_CONSOLE_ACTOR!r}")
+    p_cite.add_argument("--json", action="store_true", dest="as_json",
+                        help="machine-readable: one compact JSON line, for a script or an agent")
+
+    p_citation = sub.add_parser("citation", description=_d(
+        "read back a transcript citation on a Decision/Thread/Evaluation — the console "
+        "door onto capture.read_transcript_citation, the same function the "
+        "read_citation MCP tool wraps"),
+        epilog="example: osiris citation 5f234a1c Khnum")
+    p_citation.add_argument("ref", help="UUID, canonical, or name of the citing object")
+    p_citation.add_argument("agent", help="the agent whose transcript was cited")
+    p_citation.add_argument("--json", action="store_true", dest="as_json",
+                            help="machine-readable: one compact JSON line")
 
     p_migrate = sub.add_parser("migrate", description=_d(
         "env-correct `alembic upgrade head` (--check "
@@ -7301,6 +7791,38 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(cmd_desk(as_json=args.as_json))
     if args.command == "show":
         return asyncio.run(cmd_show(args.ref, as_json=args.as_json))
+    if args.command == "dossier":
+        return asyncio.run(cmd_dossier(
+            args.object_ref, want_relationships=args.want_relationships,
+            as_json=args.as_json))
+    if args.command == "object-events":
+        return asyncio.run(cmd_object_events(
+            args.object_ref, event_type=args.event_type, as_json=args.as_json))
+    if args.command == "succession-chain":
+        return asyncio.run(cmd_succession_chain(
+            args.ref, max_hops=args.max_hops, as_json=args.as_json))
+    if args.command == "candidates":
+        return asyncio.run(cmd_candidates(
+            project=args.project, limit=args.limit, as_json=args.as_json))
+    if args.command == "composition":
+        return asyncio.run(cmd_composition(
+            args.action, args.name, spec=args.spec, kind=args.kind, room=args.room,
+            subject=args.subject, fields=args.fields, take=args.take, depth=args.depth,
+            offset=args.offset, actor=args.actor, as_json=args.as_json))
+    if args.command == "retire-assertion":
+        return asyncio.run(cmd_retire_assertion(
+            args.ref, args.name, args.superseded_id, args.value, args.because,
+            actor=args.actor, as_json=args.as_json))
+    if args.command == "retire-link":
+        return asyncio.run(cmd_retire_link(
+            args.from_ref, args.to_ref, args.link_type, args.because,
+            actor=args.actor, as_json=args.as_json))
+    if args.command == "cite":
+        return asyncio.run(cmd_cite(
+            args.ref, args.agent, args.line_idx, args.because,
+            actor=args.actor, as_json=args.as_json))
+    if args.command == "citation":
+        return asyncio.run(cmd_citation(args.ref, args.agent, as_json=args.as_json))
     if args.command == "migrate":
         return asyncio.run(cmd_migrate(check=args.check))
     if args.command == "deploy":
