@@ -259,6 +259,44 @@ async def test_dossier_marks_name_disagreement_without_the_display_field_picking
     assert isinstance(d["name"], str)
 
 
+async def test_dossier_marks_a_genuine_credence_dispute(actions: Actions) -> None:
+    """PROVENANCE PIECE 3(b) (thread b4477e9e): `disputed` is a SEPARATE signal from
+    `agreement` — a spawned ancestor genuinely disagreeing with its own subtree's origin
+    surfaces here too, sourced from the SAME credence.resolve_credence oracle
+    credence_props runs elsewhere, never re-derived by this route."""
+    from datetime import UTC, datetime
+
+    from src.parsers.base import EvidenceClass
+
+    obj = await actions.create_or_find_object("SoftwareProject", "repo:dossier-dispute", "test")
+    a = await actions.create_or_find_object("Agent", "agent:dd-a", "test")
+    b = await actions.create_or_find_object("Agent", "agent:dd-b", "test")
+    now = datetime.now(UTC)
+    await actions.create_link(b, a, "spawned_by", "test", now, 0.6,
+                              evidence_class=EvidenceClass.DIRECT_OBSERVATION.value)
+    await actions.assert_property(a, "backed_by_observation", False, "test", now, 0.6,
+                                  evidence_class=EvidenceClass.DIRECT_OBSERVATION.value)
+    await actions.assert_property(obj, "verdict", "the migration is safe", "agent:dd-a", now,
+                                  0.9, evidence_class=EvidenceClass.SELF_DECLARED.value)
+    await actions.assert_property(obj, "verdict", "the migration is unsafe", "agent:dd-b", now,
+                                  0.6, evidence_class=EvidenceClass.DIRECT_OBSERVATION.value)
+    d = await entity_dossier(actions.pool, obj)
+    verdict = next(p for p in d["properties"] if p["name"] == "verdict")
+    assert verdict["disputed"] is True
+    assert verdict["agreement"] == "contradicting"
+
+
+async def test_dossier_single_source_property_is_not_disputed(actions: Actions) -> None:
+    from datetime import UTC, datetime
+
+    obj = await actions.create_or_find_object("SoftwareProject", "repo:dossier-nodispute", "test")
+    await actions.assert_property(obj, "status", "green", "agent:solo", datetime.now(UTC), 0.9)
+    d = await entity_dossier(actions.pool, obj)
+    status = next(p for p in d["properties"] if p["name"] == "status")
+    assert status["disputed"] is False
+    assert status["distinct_upstreams"] == 1
+
+
 async def test_dossier_tag_stays_excluded_from_the_agreement_view(actions: Actions) -> None:
     """`tag` keeps its own, separate, still-correct exclusion (dossier.py's own comment):
     additive/multi-valued by design, no winner or disagreement concept applies to it the

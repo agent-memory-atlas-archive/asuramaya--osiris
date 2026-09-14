@@ -158,20 +158,23 @@ async def entity_dossier(
     # (agreement asks "did they say the same thing"; distinct_upstreams asks "even
     # where they disagree or agree, how many of them could plausibly trace to the
     # same upstream read, rather than being genuinely separate witnesses").
-    all_srcs = {v["source"] for entry in properties.values() for v in entry["values"]}
-    ups = await credence.upstream_sets(Actions(pool), object_id, list(all_srcs))
-    looked = await credence._looked_map(
-        Actions(pool), {s for s in all_srcs if s.startswith("agent:")})
-    for entry in properties.values():
+    # PROVENANCE PIECE 3(b) (thread b4477e9e): `disputed` joins `distinct_upstreams` as a
+    # second independence signal, both from the SAME shared helper `/objects/{id}`'s own
+    # plain browse view now calls too (credence.property_signals) — never re-derived here.
+    sources_by_name = {
+        pname: {v["source"] for v in entry["values"]} for pname, entry in properties.items()
+    }
+    signals = await credence.property_signals(Actions(pool), object_id, sources_by_name)
+    for pname, entry in properties.items():
         distinct = {v["value"] for v in entry["values"]}
         entry["agreement"] = (
             "single" if len(entry["values"]) == 1 else
             "agreeing" if len(distinct) == 1 else
             "contradicting"
         )
-        prop_srcs = {v["source"] for v in entry["values"]}
-        entry["distinct_upstreams"] = credence.distinct_upstream_count(
-            {s: ups.get(s, frozenset()) for s in prop_srcs}, looked)
+        entry["distinct_upstreams"] = signals[pname]["distinct_upstreams"]
+        entry["disputed"] = signals[pname]["disputed"]
+        entry["upstream_ids"] = signals[pname]["upstream_ids"]
 
     # relationships, both directions, neighbor labelled and typed. Repeated edges
     # (same direction, type, neighbor) are collapsed: a duplicated link carries no

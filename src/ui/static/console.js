@@ -966,6 +966,48 @@ async function inspect(id) {
   right.innerHTML = Osiris.objectDetail(obj, '');
   var relsEl = right.querySelector('[data-rels]');
   if (relsEl) await Osiris.loadRels(relsEl, id, inspectOnly, openAsSet);
+  bindUpstreamExpansions(right);
+}
+// PROVENANCE PIECE 3(b) (thread b4477e9e): "who else read this upstream" — a property
+// row's own upstream_ids[0] drives one call to the upstream_readers Function (via the
+// existing generic composition door, not a bespoke route) so the reader sees every OTHER
+// object whose writer also plausibly traces to the same upstream read, without leaving
+// the inspector. Toggles closed on a second click rather than re-fetching.
+function bindUpstreamExpansions(scope) {
+  scope.querySelectorAll('.o-upstream-link').forEach(function(link) {
+    link.onclick = async function() {
+      // propRow emits k/val/pv/signals/expansion as flat grid children in order — the
+      // expansion div this link controls is always its own parent's next sibling.
+      var signalsDiv = link.parentElement;
+      var exp = signalsDiv && signalsDiv.nextElementSibling;
+      if (!exp || !exp.classList.contains('o-upstream-expansion')) return;
+      if (exp.style.display !== 'none') { exp.style.display = 'none'; return; }
+      exp.style.display = 'block';
+      exp.innerHTML = '<div class="o-faint">loading…</div>';
+      try {
+        var res = await fetch('/compositions/upstream-readers/run', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ subject: link.dataset.upstream }),
+        }).then(function(r) { return r.json(); });
+        var items = (res && res.items) || [];
+        if (!items.length) { exp.innerHTML = '<div class="o-faint">No other reader found.</div>'; return; }
+        exp.innerHTML = '<div class="o-faint" style="margin:4px 0">Also traces to this upstream:</div>' +
+          items.map(function(g) {
+            var facts = (g.facts || []).map(function(f) {
+              return esc(f.name) + '=' + esc(String(f.value)) + ' (' + esc(f.source_id) + ')';
+            }).join(', ');
+            return '<div class="o-rel" style="padding-left:8px"><a data-pick="' + esc(g.id) +
+              '" style="cursor:pointer">' + esc(g.name) + '</a> — <span class="o-faint">' +
+              facts + '</span></div>';
+          }).join('');
+        exp.querySelectorAll('[data-pick]').forEach(function(a) {
+          a.onclick = function() { inspectOnly(a.dataset.pick); };
+        });
+      } catch (e) {
+        exp.innerHTML = '<div class="o-faint">Could not load.</div>';
+      }
+    };
+  });
 }
 function inspectOnly(id) {
   FOCUS = id;

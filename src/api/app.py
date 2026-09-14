@@ -777,6 +777,8 @@ def create_app(pool: asyncpg.Pool | None = None) -> FastAPI:
     async def get_object(
         object_id: uuid.UUID, p: asyncpg.Pool = Depends(get_pool)
     ) -> dict[str, Any]:
+        from src.orchestrator import credence
+
         obj = await p.fetchrow(
             "SELECT id, type, canonical, status, merged_into FROM objects WHERE id=$1", object_id
         )
@@ -789,6 +791,27 @@ def create_app(pool: asyncpg.Pool | None = None) -> FastAPI:
         )
         label_props = (await fetch_label_props(p, [object_id])).get(object_id, {})
         name = resolve_label(obj["type"], label_props, obj["canonical"]).label
+        # PROVENANCE PIECE 3(b) (thread b4477e9e): the browse object view is a DIFFERENT
+        # route than /dossier and bypassed credence entirely before this — same
+        # agreement/distinct_upstreams/disputed shape dossier.py's entity_dossier already
+        # carries, from the SAME shared helper, so a reader sees the independence signal
+        # here too, not only on the separate dossier panel most sessions never open.
+        by_name: dict[str, list[Any]] = {}
+        for r in props:
+            by_name.setdefault(r["name"], []).append(r)
+        sources_by_name = {n: {r["source_id"] for r in rows} for n, rows in by_name.items()}
+        signals = await credence.property_signals(Actions(p), object_id, sources_by_name)
+        # dossier.py's own SQL forces text extraction (`value #>> '{}'`) before comparing;
+        # this route returns the raw jsonb value (a dict/list for a non-scalar property is
+        # unhashable), so agreement compares a stable json.dumps form instead of the value.
+        agreement_by_name = {
+            n: (
+                "single" if len(rows) == 1 else
+                "agreeing" if len({_json.dumps(r["value"], sort_keys=True) for r in rows}) == 1
+                else "contradicting"
+            )
+            for n, rows in by_name.items()
+        }
         return {
             **dict(obj),
             "name": name,
@@ -800,6 +823,10 @@ def create_app(pool: asyncpg.Pool | None = None) -> FastAPI:
                     "how": _HOW_LABELS.get(r["evidence_class"] or "", r["evidence_class"]),
                     "source_label": _SOURCE_LABELS.get(r["source_id"], r["source_id"]),
                     "observed": r["observed_at"].isoformat() if r["observed_at"] else None,
+                    "agreement": agreement_by_name[r["name"]],
+                    "distinct_upstreams": signals[r["name"]]["distinct_upstreams"],
+                    "disputed": signals[r["name"]]["disputed"],
+                    "upstream_ids": signals[r["name"]]["upstream_ids"],
                 }
                 for r in props
             ],

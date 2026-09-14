@@ -63,6 +63,25 @@ const Osiris = (() => {
   // a graded property row: value + WHERE IT CAME FROM (source · how · confidence). A long
   // value (a commit rationale, a doc body) is CLAMPED to a few lines — click to expand —
   // so the inspector stays scannable instead of a 400-word wall in a narrow column.
+  // PROVENANCE PIECE 3(b) (thread b4477e9e): agreement/distinct_upstreams/disputed ride
+  // beside the existing grade line — absent (an old cached fetch, or a route that hasn't
+  // picked them up) renders nothing extra, never an error; agreement === "single" is the
+  // common case and stays silent (nothing to mark). `upstream_ids` (may be empty) drives
+  // the "who else read this" click-through against the upstream_readers Function.
+  function provenanceSignals(p) {
+    const bits = [];
+    if (p.agreement === "contradicting") bits.push('<span class="o-faint" style="color:#e5534b" title="sources disagree on this value">contradicting</span>');
+    else if (p.agreement === "agreeing") bits.push('<span class="o-faint" title="multiple sources, same value">agreeing</span>');
+    if (p.disputed) bits.push('<span class="o-faint" style="color:#e5534b" title="a spawned/succeeded ancestor genuinely disagreed, per the independence oracle">disputed</span>');
+    if (typeof p.distinct_upstreams === "number") {
+      bits.push(`<span class="o-faint" title="independence-oracle collapse: this many DISTINCT upstream witnesses, not just source count">${p.distinct_upstreams} upstream${p.distinct_upstreams === 1 ? "" : "s"}</span>`);
+    }
+    if (p.upstream_ids && p.upstream_ids.length) {
+      bits.push(`<span class="o-upstream-link" data-upstream="${esc(p.upstream_ids[0])}" style="cursor:pointer;text-decoration:underline" title="who else read this upstream?">who else read this →</span>`);
+    }
+    return bits.length ? `<div class="o-pv" style="margin-top:2px">${bits.join(" · ")}</div>` : "";
+  }
+
   function propRow(p) {
     const v = String(p.value);
     const cls = v.length > 200 ? "o-v clamp" : "o-v";
@@ -70,7 +89,9 @@ const Osiris = (() => {
       ? `<div class="${cls}" onclick="this.classList.toggle('clamp')" title="click to expand">${esc(v)}</div>`
       : `<div class="o-v">${esc(v)}</div>`;
     return `<div class="o-k">${esc(p.name)}</div>${val}
-      <div class="o-pv">${esc(p.source_label || p.source_id || "—")} · ${esc(p.how || "—")} · ${pct(p.confidence)}</div>`;
+      <div class="o-pv">${esc(p.source_label || p.source_id || "—")} · ${esc(p.how || "—")} · ${pct(p.confidence)}</div>
+      ${provenanceSignals(p)}
+      <div class="o-upstream-expansion" data-for="${esc(p.name)}" style="display:none;grid-column:1/4"></div>`;
   }
 
   // the object detail (the one noun) — type chip, title, provenance box, graded facts, slots for rels.

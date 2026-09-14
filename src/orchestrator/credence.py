@@ -335,6 +335,37 @@ def distinct_upstream_count(
     return len({find(s) for s in sources})
 
 
+async def property_signals(
+    actions: Actions, object_id: Any, sources_by_name: Mapping[str, set[str]],
+) -> dict[str, dict[str, Any]]:
+    """PROVENANCE PIECE 3(b) (thread b4477e9e, ruling bb3e4422)'s own shared leg: for
+    every property NAME on `object_id`, the three independence signals a caller (dossier.py's
+    `entity_dossier`, the plain `/objects/{id}` browse view) attaches beside its own
+    `agreement` field — `distinct_upstreams` (the connected-components collapse over that
+    property's own sources' possible_upstream targets, `upstream_sets` + `distinct_
+    upstream_count`), `disputed` (whether `resolve_credence` surfaced a genuine
+    disagreement on this exact (object_id, name), from the SAME independence oracle
+    `credence_props` runs elsewhere — never re-derived, only re-shaped per property name),
+    and `upstream_ids` (the UNION of the property's own sources' possible_upstream target
+    ids, sorted — the UI's own "who else read this upstream" expansion drives off these,
+    running `upstream_readers` (compositions.py) against one of them; the count alone
+    can't power a click-through). One `upstream_sets`/`credence_props` pass per object
+    regardless of how many property names it carries, reused across all of them."""
+    all_srcs = {s for srcs in sources_by_name.values() for s in srcs}
+    ups = await upstream_sets(actions, object_id, list(all_srcs))
+    looked = await _looked_map(actions, {s for s in all_srcs if s.startswith("agent:")})
+    disputed_names = {d.name for d in (await credence_props(actions, [object_id])).disputes}
+    return {
+        name: {
+            "distinct_upstreams": distinct_upstream_count(
+                {s: ups.get(s, frozenset()) for s in srcs}, looked),
+            "disputed": name in disputed_names,
+            "upstream_ids": sorted({u for s in srcs for u in ups.get(s, frozenset())}),
+        }
+        for name, srcs in sources_by_name.items()
+    }
+
+
 async def credence_props(actions: Actions, oids: Sequence[Any]) -> CredenceResult:
     """The lineage-aware resolution over `oids` — winning_props with the upstream credence
     discipline layered on. Fetches the latest per-source assertions, the spawned_by forest, and

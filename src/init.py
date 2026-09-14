@@ -54,6 +54,9 @@ ROOM_COMPOSITIONS: dict[str, tuple[str, ...]] = {
         "family-drift", "portfolio", "pulse-digest", "projects", "project", "fleet",
         # rungs 2+3 (campaign 5c57f54d): the graph auditing itself + the provenance lens.
         "graph-lint", "lap",
+        # PROVENANCE PIECE 3(b) (thread b4477e9e): the upstream-centric read, same room
+        # as lap — a provenance lens, not an entity/casework one.
+        "upstream-readers",
         # the collapsed-echo pile, listable (ruling 758ded94) — the triage queue's lens.
         "echoes",
         # the ONE WALL LAW (ruling 923c380f): the graded unresolved view, operator-eyed.
