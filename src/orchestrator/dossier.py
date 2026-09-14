@@ -144,16 +144,24 @@ async def entity_dossier(
             "evidence_class": r["evidence_class"],
             "confidence": r["confidence"],
         })
-    # PROVENANCE PIECE 1 (thread da545039f2ba): possible_upstream edges for every
-    # agent source that has touched THIS object, fetched once and sliced per-property
-    # below — a second, orthogonal independence signal beside `agreement`'s own raw
-    # value-count (agreement asks "did they say the same thing"; distinct_upstreams
-    # asks "even where they disagree or agree, how many of them could plausibly trace
-    # to the same upstream read, rather than being genuinely separate witnesses").
-    all_agent_srcs = {v["source"] for entry in properties.values() for v in entry["values"]
-                      if v["source"].startswith("agent:")}
-    ups = await credence.upstream_sets(Actions(pool), object_id, list(all_agent_srcs))
-    looked = await credence._looked_map(Actions(pool), all_agent_srcs)
+    # PROVENANCE PIECE 1 (thread da545039f2ba), FACT-SCOPED (Thoth's own follow-up,
+    # mail 10405): possible_upstream edges for EVERY source that has touched THIS
+    # object — agent or not — fetched once and sliced per-property below. Piece 2's
+    # own mined facts are sourced to the literal "session-miner" constant, never
+    # agent:-prefixed (ingest/sessions.py emit_yield, ruling ceae1604) — an earlier
+    # cut of this scoped to agent:-prefixed sources only, which meant a mined fact
+    # and an agent's own restatement of the same read could never collapse even
+    # though their possible_upstream edges genuinely agreed. `upstream_sets` already
+    # scopes its query to THIS object_id (from_id=$1), so widening the source set
+    # here never reaches into an unrelated object's own mined facts. A second,
+    # orthogonal independence signal beside `agreement`'s own raw value-count
+    # (agreement asks "did they say the same thing"; distinct_upstreams asks "even
+    # where they disagree or agree, how many of them could plausibly trace to the
+    # same upstream read, rather than being genuinely separate witnesses").
+    all_srcs = {v["source"] for entry in properties.values() for v in entry["values"]}
+    ups = await credence.upstream_sets(Actions(pool), object_id, list(all_srcs))
+    looked = await credence._looked_map(
+        Actions(pool), {s for s in all_srcs if s.startswith("agent:")})
     for entry in properties.values():
         distinct = {v["value"] for v in entry["values"]}
         entry["agreement"] = (

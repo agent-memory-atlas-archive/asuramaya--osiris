@@ -201,6 +201,32 @@ async def test_a_seat_that_read_x_and_observed_is_not_deflated(actions: Actions)
     assert status["distinct_upstreams"] == 2  # seat-c's own observation act is never deflated
 
 
+async def test_a_mined_fact_and_an_agents_restatement_collapse_to_one_witness(
+    actions: Actions,
+) -> None:
+    """FACT-SCOPED FOLLOW-UP (Thoth's own mail 10405): piece 2's mined facts are
+    sourced to the literal "session-miner" constant, never agent:-prefixed
+    (ingest/sessions.py emit_yield, ruling ceae1604) — the ORIGINAL cut of this
+    metric filtered to agent:-prefixed sources only, so a mined fact could never
+    collapse with an agent's own restatement of the same upstream read even when
+    their possible_upstream edges genuinely agreed. That gap is closed: distinct_
+    upstreams now walks EVERY source on the object, regardless of source id."""
+    o = await actions.create_or_find_object("SoftwareProject", "repo:pv-demo-9", "test")
+    msg_x = await actions.create_or_find_object("Message", "message:779", "agent:sender")
+    for src in ("session-miner", "agent:seat-e"):
+        await actions.create_link(o, msg_x, "possible_upstream", src, NOW, 1.0,
+                                  properties={"door": "session-miner:tool_result:message"
+                                              if src == "session-miner" else "inbox-lease",
+                                              "read_at": NOW.isoformat()})
+    await actions.assert_property(o, "status", "green", "session-miner", NOW, 0.6,
+                                  evidence_class=EvidenceClass.DERIVED.value)
+    await actions.assert_property(o, "status", "green", "agent:seat-e", NOW, 0.9,
+                                  evidence_class=_EC)
+    dossier = await entity_dossier(actions.pool, o)
+    status = next(p for p in dossier["properties"] if p["name"] == "status")
+    assert status["distinct_upstreams"] == 1
+
+
 # --- end-to-end through the MCP door -------------------------------------------------
 
 class _Ctx:
