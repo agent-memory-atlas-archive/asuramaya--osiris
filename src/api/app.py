@@ -794,21 +794,37 @@ def create_app(pool: asyncpg.Pool | None = None) -> FastAPI:
         return Response(content=data, media_type="application/octet-stream")
 
     @app.get("/graph/stream/deltas")
-    async def graph_stream_deltas(request: Request) -> StreamingResponse:
+    async def graph_stream_deltas(
+        request: Request, since: int | None = Query(None),
+    ) -> StreamingResponse:
         """SSE: pushes graph deltas (moved/added/retired, keyed by object id -- see the
         module docstring for why not array index) since the last poll, over the SAME
-        poll-and-diff loop /cases/{id}/stream and /console/stream already use. A fresh
-        connection starts from cursor 0 (a full backlog on first connect is deliberate --
-        a client is expected to have just fetched /graph/stream and wants everything
-        that changed since, not since some arbitrary "now")."""
-        from src.orchestrator.graph_stream import deltas_since
+        poll-and-diff loop /cases/{id}/stream and /console/stream already use.
+
+        THE DELTA CURSOR FIX (thread fa3a4d42, Thoth mail 10664): a fresh connection
+        NEVER starts from cursor 0 any more -- that scanned the whole outbox (5.3M+
+        rows and growing) on every page load, reconnect, or deploy restart, measured
+        pinning the console at 84-87% CPU for minutes. The starting cursor is, in
+        order: the `since` query param (a client passes /graph/stream's own response
+        header `watermark`, since it just fetched the full snapshot and wants only
+        what changed after it), else the standard SSE `Last-Event-ID` reconnect
+        header (each event below carries `id: <cursor>`, so a browser's native
+        EventSource auto-reconnect resumes exactly where it left off with zero client
+        code), else -- and only then -- `outbox_watermark(pool)`: "now", not the
+        backlog. A client that genuinely wants the full backlog fetches /graph/stream
+        first, exactly like before; this endpoint itself never replays it."""
+        from src.orchestrator.graph_stream import deltas_since, resolve_deltas_start_cursor
+
+        cursor = await resolve_deltas_start_cursor(
+            request.app.state.pool, since=since,
+            last_event_id=request.headers.get("last-event-id"))
 
         async def gen() -> AsyncIterator[str]:
-            cursor = 0
+            nonlocal cursor
             while not await request.is_disconnected():
                 deltas, cursor = await deltas_since(request.app.state.pool, cursor)
                 if deltas:
-                    yield f"data: {_json.dumps(deltas)}\n\n"
+                    yield f"id: {cursor}\ndata: {_json.dumps(deltas)}\n\n"
                 else:
                     yield ": keep-alive\n\n"
                 await asyncio.sleep(1.0)

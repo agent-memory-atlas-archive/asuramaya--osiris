@@ -18,6 +18,8 @@ from src.orchestrator.graph_stream import (
     deltas_since,
     encode_snapshot,
     fetch_snapshot,
+    outbox_watermark,
+    resolve_deltas_start_cursor,
 )
 
 HELPERS = Path(__file__).parent.parent / "helpers"
@@ -137,6 +139,17 @@ async def test_fetch_snapshot_excludes_unplaced_objects(actions: Actions) -> Non
     assert str(oid) not in out["object_ids"]
 
 
+async def test_fetch_snapshot_watermark_matches_the_live_outbox_tip(
+    actions: Actions,
+) -> None:
+    """THE DELTA CURSOR FIX (thread fa3a4d42): the header's own watermark is what a
+    client passes to /graph/stream/deltas?since= to pick up only what changed after
+    this exact snapshot -- it must agree with outbox_watermark's own live read."""
+    await actions.create_or_find_object("Thread", "thread:gs-watermark", "test")
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    assert out["watermark"] == await outbox_watermark(actions.pool)
+
+
 # --- DB-backed: deltas_since ------------------------------------------------------------
 
 
@@ -149,11 +162,41 @@ async def test_deltas_since_reports_a_newly_created_object(actions: Actions) -> 
     assert any(d["id"] == str(oid) for d in deltas)
 
 
-async def test_deltas_since_is_empty_when_nothing_changed(actions: Actions) -> None:
-    await actions.create_or_find_object("Thread", "thread:gs-quiet", "test")
+async def test_deltas_since_coalesces_to_the_latest_event_per_object_and_covers_the_rest(
+    actions: Actions,
+) -> None:
+    """THE DELTA CURSOR FIX (thread fa3a4d42): two events for the SAME object within
+    one page collapse into ONE delta (a live-state view only cares about the current
+    value), and the cursor advances past BOTH -- a later call must not re-surface the
+    coalesced-away first event."""
+    oid = await actions.create_or_find_object("Thread", "thread:gs-coalesce", "test")
     _, cursor = await deltas_since(actions.pool, 0)
+    await actions.assert_property(oid, "graph_x", 1.0, "test", datetime.now(UTC), 1.0)
+    await actions.assert_property(oid, "graph_x", 2.0, "test", datetime.now(UTC), 1.0)
+
     deltas, cursor2 = await deltas_since(actions.pool, cursor)
-    assert deltas == []
+    matches = [d for d in deltas if d["id"] == str(oid)]
+    assert len(matches) == 1
+
+    deltas3, cursor3 = await deltas_since(actions.pool, cursor2)
+    assert deltas3 == []
+    assert cursor3 == cursor2
+
+
+async def test_deltas_since_is_empty_when_nothing_changed(actions: Actions) -> None:
+    """Never assumes the hermetic test DB's own outbox backlog fits in one page --
+    the paging fix (thread fa3a4d42) means a real backlog beyond `limit` is expected
+    to take several calls to drain, not one."""
+    await actions.create_or_find_object("Thread", "thread:gs-quiet", "test")
+    cursor = 0
+    for _ in range(200):
+        deltas, cursor = await deltas_since(actions.pool, cursor)
+        if not deltas:
+            break
+    else:
+        raise AssertionError("deltas_since never drained to quiescence")
+    deltas2, cursor2 = await deltas_since(actions.pool, cursor)
+    assert deltas2 == []
     assert cursor2 == cursor
 
 
@@ -171,3 +214,42 @@ async def test_graph_stream_endpoint_returns_decodable_bytes(
     assert r.headers["content-type"] == "application/octet-stream"
     out = decode_snapshot(r.content)
     assert str(oid) in out["object_ids"]
+
+
+# --- resolve_deltas_start_cursor: the fix's own decision, pulled out for direct testing -
+
+# thread fa3a4d42 -- a fresh connection never starts from cursor 0 any more.
+
+
+async def test_resolve_cursor_prefers_since_over_everything(actions: Actions) -> None:
+    await actions.create_or_find_object("Thread", "thread:gs-cursor-since", "test")
+    cursor = await resolve_deltas_start_cursor(
+        actions.pool, since=42, last_event_id="999")
+    assert cursor == 42
+
+
+async def test_resolve_cursor_falls_back_to_last_event_id(actions: Actions) -> None:
+    cursor = await resolve_deltas_start_cursor(
+        actions.pool, since=None, last_event_id="17")
+    assert cursor == 17
+
+
+async def test_resolve_cursor_defaults_to_the_live_watermark_never_zero(
+    actions: Actions,
+) -> None:
+    """The exact regression this fix closes: no `since`, no Last-Event-ID must resolve
+    to the CURRENT outbox tip, never cursor 0 (a full backlog replay)."""
+    await actions.create_or_find_object("Thread", "thread:gs-cursor-default", "test")
+    cursor = await resolve_deltas_start_cursor(
+        actions.pool, since=None, last_event_id=None)
+    assert cursor == await outbox_watermark(actions.pool)
+    assert cursor > 0
+
+
+async def test_resolve_cursor_falls_back_to_watermark_on_a_malformed_last_event_id(
+    actions: Actions,
+) -> None:
+    await actions.create_or_find_object("Thread", "thread:gs-cursor-malformed", "test")
+    cursor = await resolve_deltas_start_cursor(
+        actions.pool, since=None, last_event_id="not-a-number")
+    assert cursor == await outbox_watermark(actions.pool)

@@ -74,7 +74,7 @@ def encode_snapshot(
     type_code: list[int], project_code: list[int], weight: list[float],
     status_flag: list[int], edge_src: list[int], edge_dst: list[int],
     edge_type_code: list[int], types: list[str], projects: list[str],
-    edge_types: list[str], link_type_class: list[str],
+    edge_types: list[str], link_type_class: list[str], watermark: int = 0,
 ) -> bytes:
     """Pure function, no DB: builds the exact wire bytes from already-resolved
     columns -- the DB-facing half (`fetch_snapshot`) is the only caller that ever
@@ -111,7 +111,7 @@ def encode_snapshot(
         "schema_version": SCHEMA_VERSION, "count": count, "edge_count": edge_count,
         "types": types, "projects": projects, "edge_types": edge_types,
         "link_type_class": link_type_class, "object_ids": object_ids,
-        "arrays": offsets,
+        "watermark": watermark, "arrays": offsets,
     }
     header_bytes = json.dumps(header).encode()
     return struct.pack("<I", len(header_bytes)) + header_bytes + bytes(body)
@@ -127,7 +127,7 @@ def decode_snapshot(data: bytes) -> dict[str, Any]:
     out: dict[str, Any] = {
         k: header[k] for k in
         ("schema_version", "count", "edge_count", "types", "projects", "edge_types",
-         "link_type_class", "object_ids")
+         "link_type_class", "object_ids", "watermark")
     }
     for name, meta in header["arrays"].items():
         code = str(meta["dtype"])
@@ -142,7 +142,16 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
     status, plus every live edge between two objects both in that set -- encoded via
     `encode_snapshot`. Row order is `o.created_at ASC, o.id ASC` (stable within one
     call) but is NOT persisted as a registry anywhere -- see the module docstring for
-    why deltas key on object id rather than this order."""
+    why deltas key on object id rather than this order.
+
+    THE DELTA CURSOR FIX (thread fa3a4d42, Thoth mail 10664): the header carries the
+    OUTBOX WATERMARK this snapshot was built at, read FIRST -- before the position/
+    edge queries below -- so an event landing mid-snapshot is still covered by the
+    main query (its row is simply included) rather than falling into the gap between
+    "already in the snapshot" and "cursor starts after it." The one-sided risk this
+    ordering accepts is a rare harmless replay (the client re-applies a delta whose
+    effect the snapshot already carried), never a silent drop."""
+    watermark = int(await pool.fetchval("SELECT COALESCE(max(id), 0) FROM outbox"))
     rows = await pool.fetch(
         "SELECT o.id, o.type, "
         "  (SELECT (a.value #>> '{}')::float8 FROM current_assertions a "
@@ -220,35 +229,83 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
         project_code=project_codes, weight=weights, status_flag=statuses,
         edge_src=edge_src, edge_dst=edge_dst, edge_type_code=edge_type_codes,
         types=types, projects=projects, edge_types=edge_types,
-        link_type_class=link_type_class,
+        link_type_class=link_type_class, watermark=watermark,
     )
 
 
-async def deltas_since(pool: asyncpg.Pool, cursor: int) -> tuple[list[dict[str, Any]], int]:
-    """Poll the outbox table for graph-relevant events past `cursor` (an outbox id,
-    0 on a fresh connection) -- the SAME poll-and-diff idiom /cases/{id}/stream,
-    /console/stream and /pane/{id}/stream already use (app.py), never a new push
-    mechanism. Returns `(deltas, new_cursor)`; an empty list with an unchanged cursor
-    means nothing graph-relevant happened since the last poll. Each delta is keyed by
-    object id (a string) -- see the module docstring for why, not array index."""
+async def outbox_watermark(pool: asyncpg.Pool) -> int:
+    """The current tip of the outbox, right now -- the same read `fetch_snapshot` uses
+    to stamp a snapshot's own watermark, exposed separately for a client that connects
+    to `/graph/stream/deltas` with no cursor of its own (thread fa3a4d42): resolve to
+    THIS, never 0, so a fresh connection with no prior snapshot starts listening from
+    now instead of replaying the whole outbox."""
+    return int(await pool.fetchval("SELECT COALESCE(max(id), 0) FROM outbox"))
+
+
+async def resolve_deltas_start_cursor(
+    pool: asyncpg.Pool, *, since: int | None, last_event_id: str | None,
+) -> int:
+    """THE DELTA CURSOR FIX (thread fa3a4d42, Thoth mail 10664): where a fresh
+    `/graph/stream/deltas` connection starts, in order -- `since` (a client passing
+    /graph/stream's own watermark), then the standard SSE `Last-Event-ID` reconnect
+    header, then -- and only then -- `outbox_watermark`: "now", never the backlog.
+    Pulled out of the route itself so this decision is directly unit-testable without
+    standing up a real SSE connection."""
+    if since is not None:
+        return since
+    if last_event_id is not None:
+        try:
+            return int(last_event_id)
+        except ValueError:
+            pass
+    return await outbox_watermark(pool)
+
+
+_DELTAS_PAGE_LIMIT = 500
+
+
+async def deltas_since(
+    pool: asyncpg.Pool, cursor: int, *, limit: int = _DELTAS_PAGE_LIMIT,
+) -> tuple[list[dict[str, Any]], int]:
+    """Poll the outbox table for graph-relevant events past `cursor` (an outbox id) --
+    the SAME poll-and-diff idiom /cases/{id}/stream, /console/stream and /pane/{id}/
+    stream already use (app.py), never a new push mechanism. Returns
+    `(deltas, new_cursor)`; an empty list with an unchanged cursor means nothing
+    graph-relevant happened since the last poll. Each delta is keyed by object id (a
+    string) -- see the module docstring for why, not array index.
+
+    THE DELTA CURSOR FIX (thread fa3a4d42, Thoth mail 10664): one page at a time
+    (`limit`, never the whole backlog), coalesced to the LATEST event per object
+    within that page (a live-state view only cares about an object's current
+    position/status, not every intermediate event it passed through), positions
+    resolved for the whole page with plain joins instead of two correlated subqueries
+    PER ROW. `new_cursor` advances to the highest outbox id actually SEEN in the page
+    -- including rows coalesced away -- so nothing already read is ever re-scanned,
+    even though only the survivor per object is reported."""
     rows = await pool.fetch(
-        "SELECT o.id AS outbox_id, o.object_id, o.event_type, "
-        "  (SELECT (a.value #>> '{}')::float8 FROM current_assertions a "
-        "   WHERE a.object_id=o.object_id AND a.name='graph_x') AS x, "
-        "  (SELECT (a.value #>> '{}')::float8 FROM current_assertions a "
-        "   WHERE a.object_id=o.object_id AND a.name='graph_y') AS y "
-        "FROM outbox o "
-        "WHERE o.id > $1 AND o.event_type IN "
-        "  ('object_created','property_added','object_merged') "
-        "  AND o.object_id IS NOT NULL "
-        "ORDER BY o.id ASC",
-        cursor)
+        "WITH raw AS ("
+        "  SELECT o.id AS outbox_id, o.object_id, o.event_type "
+        "  FROM outbox o "
+        "  WHERE o.id > $1 AND o.event_type IN "
+        "    ('object_created','property_added','object_merged') "
+        "    AND o.object_id IS NOT NULL "
+        "  ORDER BY o.id ASC "
+        "  LIMIT $2"
+        ") "
+        "SELECT DISTINCT ON (r.object_id) "
+        "  r.object_id, r.outbox_id, r.event_type, "
+        "  (gx.value #>> '{}')::float8 AS x, (gy.value #>> '{}')::float8 AS y, "
+        "  max(r.outbox_id) OVER () AS page_max "
+        "FROM raw r "
+        "LEFT JOIN current_assertions gx ON gx.object_id=r.object_id AND gx.name='graph_x' "
+        "LEFT JOIN current_assertions gy ON gy.object_id=r.object_id AND gy.name='graph_y' "
+        "ORDER BY r.object_id, r.outbox_id DESC",
+        cursor, limit)
     if not rows:
         return [], cursor
+    new_cursor = max(int(r["page_max"]) for r in rows)
     deltas: list[dict[str, Any]] = []
-    new_cursor = cursor
     for r in rows:
-        new_cursor = max(new_cursor, r["outbox_id"])
         op = "retired" if r["event_type"] == "object_merged" else "moved"
         delta: dict[str, Any] = {"op": op, "id": str(r["object_id"])}
         if r["x"] is not None and r["y"] is not None:
