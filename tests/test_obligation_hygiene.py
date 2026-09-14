@@ -285,7 +285,7 @@ async def test_quote_summary_names_the_age_and_the_dispute() -> None:
 
     plain = _quote_summary({"summary": "a headline", "summary_age_days": 12,
                             "contested": False})
-    assert plain == "'a headline', unchanged for 12 day(s)"
+    assert plain == "'a headline', unchanged for 12 day(s) — no recorded answer"
     disputed = _quote_summary({"summary": "a false headline", "summary_age_days": 12,
                                "contested": True})
     assert "CONTESTED" in disputed and "unchanged for 12 day(s)" in disputed
@@ -297,43 +297,35 @@ async def test_quote_summary_names_the_age_and_the_dispute() -> None:
 # itself ═══
 
 async def test_quote_summary_names_an_already_answered_row() -> None:
+    """Thread 367cfafd (superseding the sim-tiered read): the edge alone decides the
+    wording now — no similarity score involved."""
     from src.orchestrator.obligation_hygiene import _quote_summary
 
     plain = _quote_summary({"summary": "a headline", "summary_age_days": 12,
                             "contested": False, "answered_by": []})
     assert "ALREADY ANSWERED" not in plain
+    assert "no recorded answer" in plain
     answered = _quote_summary({
         "summary": "a headline", "summary_age_days": 12, "contested": False,
-        "answered_by": [{"id": "abc12345", "summary": "found and fixed it already",
-                         "sim": 0.9}]})
+        "answered_by": [{"id": "abc12345", "summary": "found and fixed it already"}]})
     assert "ALREADY ANSWERED" in answered
     assert "abc12345" in answered and "found and fixed it already" in answered
 
 
-async def test_quote_summary_downgrades_a_weak_match_to_possibly_answered() -> None:
-    """thread 3a9d9a5d89fa, Ra XL's own two false matches: a citation below the
-    similarity threshold is never dropped, but never claims "ALREADY ANSWERED" either
-    — the reader still checks, just without a false sense the question is closed."""
-    from src.orchestrator.obligation_hygiene import _quote_summary
-
-    weak = _quote_summary({
-        "summary": "a headline", "summary_age_days": 12, "contested": False,
-        "answered_by": [{"id": "def67890", "summary": "an unrelated finding", "sim": 0.1}]})
-    assert "ALREADY ANSWERED" not in weak
-    assert "possibly answered" in weak
-    assert "def67890" in weak and "an unrelated finding" in weak
-
-
-async def test_quote_summary_carries_both_confidence_tiers_at_once() -> None:
+async def test_quote_summary_names_every_answering_decision_plainly() -> None:
+    """Thread 367cfafd: the old strong/weak confidence tiers are gone — every live
+    `answers` edge is a deliberate act (never a text guess), so every one is named the
+    same way, plainly, with no downgrade."""
     from src.orchestrator.obligation_hygiene import _quote_summary
 
     both = _quote_summary({
         "summary": "a headline", "summary_age_days": 12, "contested": False,
         "answered_by": [
-            {"id": "strong01", "summary": "a confident match", "sim": 0.9},
-            {"id": "weak0001", "summary": "a shaky match", "sim": 0.1}]})
-    assert "ALREADY ANSWERED by 1 decision(s): strong01" in both
-    assert "possibly answered by 1 decision(s), unconfirmed: weak0001" in both
+            {"id": "strong01", "summary": "a confident match"},
+            {"id": "weak0001", "summary": "a second citation"}]})
+    assert "ALREADY ANSWERED by 2 decision(s): strong01" in both
+    assert "weak0001" in both
+    assert "possibly answered" not in both
 
 
 async def test_hygiene_dry_run_surfaces_an_answering_decision_on_the_nudge(
@@ -357,10 +349,6 @@ async def test_hygiene_dry_run_surfaces_an_answering_decision_on_the_nudge(
     entry = row["answered_by"][0]
     assert entry["id"] == str(d)[:8]
     assert entry["summary"] == "re-measured hyg-answered-1: it's fine now"
-    # `_score_answer_similarity`'s own live pg_trgm score — a real float, not asserted
-    # to an exact value (that's the measurement this thread's own follow-up is about),
-    # only that the scoring pass actually ran and attached something.
-    assert isinstance(entry["sim"], float)
 
 
 async def test_hygiene_dry_run_never_answers_for_a_row_with_no_bears_on_edge(

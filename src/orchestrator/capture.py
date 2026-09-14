@@ -5046,24 +5046,46 @@ async def mint_bears_on(
 async def thread_answering_decisions(
     pool: asyncpg.Pool, thread_ids: list[uuid.UUID],
 ) -> dict[uuid.UUID, list[dict[str, str]]]:
-    """Live `answers` edges (`mint_bears_on`'s own edge) landing on each of `thread_ids` —
-    the SHARED read-back, extracted here so `recall()`'s own single-object `bears_on_from`
-    and `obligation_hygiene`'s own nudge (898840dc/e123b9fa, "the stale nudge quotes it")
+    """Every Decision genuinely answering each of `thread_ids` — the SHARED read-back,
+    extracted here so `recall()`'s own single-object `bears_on_from` and
+    `obligation_hygiene`'s own nudge (898840dc/e123b9fa, "the stale nudge quotes it")
     read the identical query instead of two copies free to drift. Batched (one query, not
     N) since the hygiene sweep's own caller runs over every open obligation Thread at once.
-    Live edges only (valid_until IS NULL) — an unmerge/retraction must not go on citing a
-    row. A thread with none is simply absent from the returned dict, never a present-but-
-    empty list, so `dict.get(tid, [])` reads correctly either way."""
+
+    TWO EDGE TYPES, BOTH A REAL RESOLVE, NEITHER TEXT-DERIVED (thread 367cfafd, Imhotep's
+    finding 18028547, operator's word 2026-09-14): `answers` (`mint_bears_on`'s edge, and
+    `record_decision(resolves=)`'s own same-transaction mint — Decision -> Thread) UNIONED
+    with `resolved_by` edges whose target is a Decision (`resolve_thread(artifact=<decision>)`
+    — Thread -> Decision, the OTHER door that closes a thread with a decision pointer,
+    which used to be invisible here). Read-side widening, never a second minting path —
+    `resolved_by` already existed for every such closure, live and historical alike, so
+    widening the READ closes the gap with no backfill needed and no risk to
+    `thread_closure_status`'s own separate mutual-exclusivity assumption about the two
+    edge types (0055, Thoth DM 6230/6234, decision 36cbec2f) — that view stays untouched.
+
+    Live edges only (valid_until IS NULL) — an unmerge/retraction/heal must not go on
+    citing a row. A thread with none is simply absent from the returned dict, never a
+    present-but-empty list, so `dict.get(tid, [])` reads correctly either way. A pair
+    carrying BOTH edge types (rare — a decision resolved it AND was separately cited as
+    the closing artifact) counts once, never twice."""
     if not thread_ids:
         return {}
     rows = await pool.fetch(
-        "SELECT l.to_id AS thread_id, d.id, "
-        " (SELECT a.value #>> '{}' FROM current_assertions a WHERE a.object_id=d.id "
-        "  AND a.name='summary' ORDER BY a.confidence DESC, a.observed_at DESC LIMIT 1) "
-        "  AS summary "
-        "FROM links l JOIN objects d ON d.id=l.from_id AND d.type='Decision' "
-        "WHERE l.to_id = ANY($1) AND l.type='answers' AND l.valid_until IS NULL "
-        "ORDER BY l.to_id, d.created_at", thread_ids)
+        "SELECT DISTINCT thread_id, id, summary, created_at FROM ("
+        "  SELECT l.to_id AS thread_id, d.id, d.created_at, "
+        "   (SELECT a.value #>> '{}' FROM current_assertions a WHERE a.object_id=d.id "
+        "    AND a.name='summary' ORDER BY a.confidence DESC, a.observed_at DESC LIMIT 1) "
+        "    AS summary "
+        "  FROM links l JOIN objects d ON d.id=l.from_id AND d.type='Decision' "
+        "  WHERE l.to_id = ANY($1) AND l.type='answers' AND l.valid_until IS NULL "
+        "  UNION ALL "
+        "  SELECT l.from_id AS thread_id, d.id, d.created_at, "
+        "   (SELECT a.value #>> '{}' FROM current_assertions a WHERE a.object_id=d.id "
+        "    AND a.name='summary' ORDER BY a.confidence DESC, a.observed_at DESC LIMIT 1) "
+        "    AS summary "
+        "  FROM links l JOIN objects d ON d.id=l.to_id AND d.type='Decision' "
+        "  WHERE l.from_id = ANY($1) AND l.type='resolved_by' AND l.valid_until IS NULL "
+        ") both_doors ORDER BY thread_id, created_at", thread_ids)
     out: dict[uuid.UUID, list[dict[str, str]]] = {}
     for r in rows:
         out.setdefault(r["thread_id"], []).append(
