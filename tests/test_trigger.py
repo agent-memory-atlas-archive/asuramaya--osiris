@@ -1329,6 +1329,39 @@ async def test_mid_turn_means_the_transcript_is_moving_NOT_the_heartbeat(
     assert rep3["resumed"] == 0 and len(spawned) == 2 and rep3["owner_live"] == 1
 
 
+def test_turn_fresh_sync_a_daemon_resume_line_is_not_a_turn(tmp_path: Path) -> None:
+    """LIVE SPECIMEN (2026-09-13 17:26 CDT reboot, thread bc6a5d455da2/96233565): the
+    daemon resumed every backgrounded body within five minutes, and each resume appears to
+    append a fresh-timestamped housekeeping line (a `type: system` entry, no different in
+    shape from a turn_duration/stop_hook_summary line a real turn also leaves behind) to
+    the transcript — NOT a conversational turn. `_turn_fresh_sync` used to check only that
+    SOME line in the tail carried a recent timestamp, with no regard for what kind of line
+    it was, so this read as 'genuinely mid-turn' and held the addressee's mail for as long
+    as nothing else touched the file (five DMs sat 13 minutes after the live reboot before
+    Thoth woke them by hand). A `type: system` line with a fresh timestamp must NOT count
+    as a turn in flight; a real `type: assistant`/`user` line must — the Aegis mtime-
+    toucher protection (reading content, never the inode) stays intact either way."""
+    sid = "abcd1234-0000-4000-8000-000000000000"
+    root = tmp_path / "projects"
+    proj = root / "-repo-demo"
+    proj.mkdir(parents=True)
+    t = proj / f"{sid}.jsonl"
+
+    # only a daemon-authored system/resume line in the tail, freshly timestamped
+    t.write_text(json.dumps({
+        "type": "system", "subtype": "turn_duration",
+        "timestamp": datetime.now(UTC).isoformat(),
+    }) + "\n")
+    assert trigger_module._turn_fresh_sync(root, sid, 900) is False
+
+    # a genuine assistant turn, freshly timestamped, in the same file
+    with t.open("a") as fh:
+        fh.write(json.dumps({
+            "type": "assistant", "timestamp": datetime.now(UTC).isoformat(),
+        }) + "\n")
+    assert trigger_module._turn_fresh_sync(root, sid, 900) is True
+
+
 async def test_a_dm_resume_is_never_looped(actions: Actions, tmp_path: Path) -> None:
     """One attempt per message: a dm-resume that didn't settle its mail is not retried —
     the DM falls back to pull (and the estate carries it across the next mint)."""
