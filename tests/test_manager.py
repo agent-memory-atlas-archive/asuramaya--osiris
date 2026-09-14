@@ -938,6 +938,75 @@ async def test_the_lease_gate_refuses_foreign_bodies_when_ratified(
 
 
 @requires_pty
+async def test_the_lease_gate_arms_live_off_the_settings_table(
+    pg_dsn: str, tmp_path: Path,
+) -> None:
+    """MANAGER OVERLAY (SECRETS ROTATE ACT + MANAGER OVERLAY, thread f4498ab304e4's own
+    follow-up, Thoth mail 10441): `daemon.lease_refuse.enabled` now arms/disarms the
+    SAME gate via `settings_with_overlay(self._pool)`, no env var and no manager
+    restart — the exact gap the wake-ladder's own registry comment named as a
+    follow-up ("a bigger, riskier first step than this pass's own scope"). Deliberately
+    NOT `monkeypatch.setenv("OSIRIS_LEASE_REFUSE", ...)` (that's the pre-existing,
+    still-working env path, proven by
+    test_the_lease_gate_refuses_foreign_bodies_when_ratified above) — this test's own
+    job is proving the NEW table-driven path works on its own, unarmed by env."""
+    from src.actions.core import Actions
+    from src.db.pool import create_pool
+    from src.orchestrator.mounts import save_mount
+    from src.orchestrator.seats import ensure_seat
+    from src.orchestrator.settings_service import write_setting
+
+    pool = await create_pool(pg_dsn)
+    manager = Manager(socket_path=tmp_path / "m.sock", receipts_dir=tmp_path / "receipts",
+                      pool=pool, runner=_make_runner())
+    await manager.start()
+    try:
+        office = tmp_path / "office-table-armed"
+        office.mkdir()
+        actions = Actions(pool)
+        seated = await ensure_seat(actions, house=None, handle="TableArmed",
+                                   anchor_cwd=str(office), source="test")
+        holder = await actions.create_or_find_object("Agent", "agent:tblarmd01", "test")
+        assert holder is not None
+        await pool.execute(
+            "INSERT INTO links (from_id, to_id, type, source_id, first_seen, confidence) "
+            "SELECT o.id, s.id, 'holds', 'test', now(), 0.9 FROM objects o, objects s "
+            "WHERE o.canonical='agent:tblarmd01' AND s.canonical=$1",
+            seated["seat_id"])
+        await save_mount(pool, job_dir="/x/jobs/tblarmd01", agent_id="agent:tblarmd01",
+                         project="tablearmed", cwd=str(office), model=None, session_key=None)
+        client = await _connect(tmp_path / "m.sock")
+        try:
+            # unarmed (default False, no table row yet): the same foreign spawn only warns
+            out0 = await client.send({"op": "pty_spawn", "name": "before-arm",
+                                      "argv": ["sh", "-c", "cat"], "cwd": str(office)})
+            assert out0.get("spawned") == "before-arm"
+
+            # arm via the settings TABLE, never the env
+            write_out = await write_setting(
+                pool, "daemon.lease_refuse.enabled", True, actor="operator",
+                because="test the table-driven overlay path")
+            assert "error" not in write_out
+
+            out1 = await client.send({"op": "pty_spawn", "name": "intruder",
+                                      "argv": ["sh", "-c", "cat"], "cwd": str(office)})
+            assert "ROOM LEASED" in out1.get("error", "")
+
+            # disarm via the table again: live off the very next spawn attempt
+            await write_setting(
+                pool, "daemon.lease_refuse.enabled", False, actor="operator",
+                because="test disarming the table-driven overlay path")
+            out2 = await client.send({"op": "pty_spawn", "name": "after-disarm",
+                                      "argv": ["sh", "-c", "cat"], "cwd": str(office)})
+            assert out2.get("spawned") == "after-disarm"
+        finally:
+            await client.close()
+    finally:
+        await manager.close()
+        await pool.close()
+
+
+@requires_pty
 async def test_the_lease_is_lineage_shared_for_the_residents_own_child(
     pg_dsn: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

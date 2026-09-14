@@ -641,8 +641,7 @@ function settingsFieldInput(item) {
   var id = 'setting-val-' + item.key;
   var v = item.value;
   if (item.type === 'secret_ref') {
-    return '<span class="o-faint">' + (v && v.set ? '(set)' : '(not set)') +
-      ' — rotate outside this panel</span>';
+    return '<span class="o-faint">' + (v && v.set ? '(set)' : '(not set)') + '</span>';
   }
   if (item.type === 'bool') {
     return '<input type="checkbox" id="' + id + '"' + (v ? ' checked' : '') + ' />';
@@ -685,7 +684,8 @@ function renderSettingsPanelHtml(items) {
         '</td><td style="vertical-align:top">' + settingsFieldInput(it) + live +
         '<div id="setting-err-' + esc(it.key) + '" class="o-faint" style="color:#e5534b"></div></td>' +
         '<td class="o-faint" style="vertical-align:top">' + esc(settingsEffectProse(it.effect)) + '</td>' +
-        '<td style="vertical-align:top">' + (it.type === 'secret_ref' ? '' :
+        '<td style="vertical-align:top">' + (it.type === 'secret_ref' ?
+          '<button class="iconbtn" onclick="rotateSecret(\'' + esc(it.key) + '\')">Rotate</button>' :
           '<button class="iconbtn" onclick="saveSetting(\'' + esc(it.key) + '\')">Save</button>') + '</td></tr>';
     }).join('');
     return '<h3 style="font-size:12px;text-transform:uppercase;letter-spacing:0.5px;color:var(--muted);margin:20px 0 8px">' +
@@ -732,6 +732,38 @@ async function saveSetting(key) {
     return;
   }
   setStatus(key + ' saved' + (res.note ? ' — ' + res.note : '') + '.');
+  renderSettingsPanel();
+}
+// THE SECRETS ROTATE ACT's own confirm-then-POST door (thread f4498ab304e4's follow-up,
+// Thoth mail 10441) — deliberately NOT saveSetting's own shape: a secret_ref field has
+// no visible <input> to read (settingsFieldInput never renders one for this type), so
+// the new value comes from its own prompt() here, and the confirm is UNCONDITIONAL
+// (never gated on item.consequence — a rotation always replaces the live credential,
+// no low-stakes case exists the way an ordinary knob has one). The write door is the
+// SAME /settings POST saveSetting already uses (settings_service.write_setting's own
+// secret_ref branch IS the rotate — no second endpoint to learn); res.note (which
+// daemon must restart) surfaces the identical way.
+async function rotateSecret(key) {
+  var item = (SETTINGS_LIST || []).filter(function(it) { return it.key === key; })[0];
+  if (!item) return;
+  var errEl = $('setting-err-' + key); if (errEl) errEl.textContent = '';
+  if (!confirm('Rotate ' + key + '? This replaces the live credential; the old value ' +
+      'cannot be recovered from this panel. Proceed?')) return;
+  var value = prompt('New value for ' + key + ':'); if (!value) return;
+  var because = '';
+  if (item.requires_because) {
+    because = prompt('Why this rotation? (required)'); if (!because) return;
+  }
+  var res = await fetch('/settings', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ key: key, value: value, because: because }),
+  }).then(function(r){ return r.json(); });
+  if (res.error) {
+    if (errEl) errEl.textContent = res.error;
+    setStatus('Rotate failed: ' + res.error);
+    return;
+  }
+  setStatus(key + ' rotated' + (res.note ? ' — ' + res.note : '') + '.');
   renderSettingsPanel();
 }
 

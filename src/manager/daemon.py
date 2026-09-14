@@ -580,10 +580,20 @@ class Manager:
         Returns (refusal, receipt_note): refusal set → the birth does not happen; note
         set → an override rode through and the receipt says so. Fail-open on any error —
         a broken gate must not brick every spawn; the advisory still fires behind it."""
-        if not get_settings().osiris_lease_refuse:
-            return None, None
         try:
             assert self._pool is not None  # caller guards; keep mypy honest
+            # MANAGER OVERLAY (SECRETS ROTATE ACT + MANAGER OVERLAY, thread
+            # f4498ab304e4's own follow-up, Thoth mail 10441): live off the settings
+            # table via settings_with_overlay, the same pattern every arq_worker.py
+            # tick function already uses — a rotate-free config toggle turning this
+            # gate on/off is now visible on the very next spawn attempt, never gated
+            # behind a manager restart. Folded into this try (not a separate check
+            # before it) so a DB hiccup fails open the same way the rest of this
+            # method already promises, not a special case.
+            from src.orchestrator.settings_service import settings_with_overlay
+
+            if not (await settings_with_overlay(self._pool)).osiris_lease_refuse:
+                return None, None
             room = await self._pool.fetchrow(
                 "SELECT s.canonical AS seat, hf.canonical AS holder "
                 "FROM current_assertions a "
