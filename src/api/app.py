@@ -564,12 +564,20 @@ def create_app(pool: asyncpg.Pool | None = None) -> FastAPI:
                     excl_ids.append(uuid.UUID(raw))
                 except ValueError:
                     continue
+        # NAVIGABLE SPACE piece 2 (thread 71c4ca0d): `degree` (live link count, both
+        # directions) drives the space view's own size-by-connectivity growth on top of a
+        # per-type base size — additive field, reuses _LIVE_LINK_COUNTS (the same shared
+        # CTE /graph/supernodes and /graph/clusters already join for their own orphan
+        # counts), never a second drifting degree query.
         rows = await p.fetch(
-            "SELECT o.id, o.type, o.canonical, gx.v AS x, gy.v AS y FROM objects o "
+            f"WITH lc AS {_LIVE_LINK_COUNTS} "
+            "SELECT o.id, o.type, o.canonical, gx.v AS x, gy.v AS y, COALESCE(lc.n, 0) AS degree "
+            "FROM objects o "
             "JOIN (SELECT object_id, (value #>> '{}')::float8 AS v FROM current_assertions "
             "      WHERE name='graph_x') gx ON gx.object_id = o.id "
             "JOIN (SELECT object_id, (value #>> '{}')::float8 AS v FROM current_assertions "
             "      WHERE name='graph_y') gy ON gy.object_id = o.id "
+            "LEFT JOIN lc ON lc.node = o.id "
             "WHERE o.status NOT IN ('archived','merged','retired') "
             "  AND gx.v BETWEEN $1 AND $2 AND gy.v BETWEEN $3 AND $4 "
             "  AND NOT (o.id = ANY($5::uuid[])) "
@@ -582,7 +590,7 @@ def create_app(pool: asyncpg.Pool | None = None) -> FastAPI:
             {"id": str(r["id"]), "type": r["type"],
              "label": resolve_label(r["type"], props_by_id.get(r["id"], {}),
                                     r["canonical"]).label,
-             "x": r["x"], "y": r["y"]}
+             "x": r["x"], "y": r["y"], "degree": int(r["degree"])}
             for r in rows
         ]
         edge_rows = await p.fetch(
@@ -825,6 +833,17 @@ def create_app(pool: asyncpg.Pool | None = None) -> FastAPI:
         )
         label_props = (await fetch_label_props(p, [object_id])).get(object_id, {})
         name = resolve_label(obj["type"], label_props, obj["canonical"]).label
+        # NAVIGABLE SPACE piece 2 (thread 71c4ca0d): the space view's search-pick fly-to
+        # needs a position for an arbitrary object id, and no endpoint returned one before
+        # this — additive only (two more scalar reads off the same graph_x/graph_y heartbeat
+        # every other graph endpoint already reads), never a new route.
+        pos = await p.fetchrow(
+            "SELECT (SELECT (value #>> '{}')::float8 FROM current_assertions "
+            "  WHERE object_id=$1 AND name='graph_x') AS x, "
+            "(SELECT (value #>> '{}')::float8 FROM current_assertions "
+            "  WHERE object_id=$1 AND name='graph_y') AS y",
+            object_id,
+        )
         # PROVENANCE PIECE 3(b) (thread b4477e9e): the browse object view is a DIFFERENT
         # route than /dossier and bypassed credence entirely before this — same
         # agreement/distinct_upstreams/disputed shape dossier.py's entity_dossier already
@@ -849,6 +868,8 @@ def create_app(pool: asyncpg.Pool | None = None) -> FastAPI:
         return {
             **dict(obj),
             "name": name,
+            "x": pos["x"],
+            "y": pos["y"],
             "properties": [
                 {
                     "name": r["name"], "value": r["value"], "source_id": r["source_id"],

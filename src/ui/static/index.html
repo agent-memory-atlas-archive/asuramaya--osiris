@@ -12,6 +12,35 @@
 <script src="/ui/vendor/cytoscape-fcose.js"></script>
 <script src="/ui/vendor/marked.min.js"></script>
 <style>
+  #canvas-wrap { position: absolute; inset: 0; }
+  #canvas-wrap canvas { display: block; }
+  #labels { position: absolute; inset: 0; z-index: 5; pointer-events: none; }
+  .lbl { position: absolute; font-size: 10px; color: #c9d1d9; background: rgba(13,18,25,0.75);
+         padding: 1px 4px; border-radius: 3px; transform: translate(-50%, -140%);
+         white-space: nowrap; pointer-events: none; }
+  .lbl.lit { color: #f0f6fc; background: rgba(35,55,80,0.9); font-weight: 600; }
+  #space-status-line { position: absolute; bottom: 10px; left: 14px; z-index: 10;
+                        font-size: 11px; color: var(--muted); }
+  .table-drawer { position: absolute; left: 0; right: 0; bottom: 0; z-index: 20;
+                  background: var(--panel); border-top: 1px solid var(--border2);
+                  display: flex; flex-direction: column; height: 34px;
+                  transition: height .15s ease; box-shadow: 0 -4px 14px rgba(0,0,0,0.35); }
+  .table-drawer.open { height: 42%; }
+  .table-drawer-handle { flex: 0 0 34px; display: flex; align-items: center; gap: 8px;
+                          padding: 0 14px; cursor: pointer; font-size: 11px; font-weight: 600;
+                          letter-spacing: .4px; text-transform: uppercase; color: var(--muted);
+                          user-select: none; border: 0; background: none; width: 100%;
+                          text-align: left; }
+  .table-drawer-handle:hover { color: var(--text); }
+  .table-drawer-chevron { transition: transform .15s ease; }
+  .table-drawer.open .table-drawer-chevron { transform: rotate(180deg); }
+  #browse-table { display: none; height: 100%; overflow: auto; padding: 12px 16px 24px; }
+  .table-drawer.open #browse-table { display: block; }
+  /* the browse drawer only ever makes sense alongside the space canvas — hidden whenever
+     a non-browse surface takes over #result via the pre-existing #stage.panel toggle. */
+  #stage.panel .table-drawer { display: none; }
+</style>
+<style>
   .pop { position: absolute; z-index: 30; background: var(--panel); border: 1px solid var(--border2); border-radius: 9px; padding: 14px; box-shadow: 0 16px 48px rgba(0,0,0,0.6); font-size: 12px; min-width: 220px; }
   .keyrow { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
 </style>
@@ -96,25 +125,31 @@
     <div class="grip l" data-grip="l" title="drag to resize · double-click to reset"></div>
     <div id="stage">
       <div id="cy">
+        <div id="canvas-wrap"></div>
+        <div id="labels"></div>
         <div class="graph-canvas-controls">
-          <button class="iconbtn" id="graph-mode-btn" onclick="toggleGraphMode()">Whole Graph</button>
-          <button class="iconbtn" id="graph-zoomout-btn" style="display:none" onclick="wholeGraphZoomOut()">Zoom Out</button>
           <span id="graph-level-badge" class="o-faint" style="align-self:center;font-size:11px;padding:0 4px"></span>
-          <button class="iconbtn" onclick="board.fit()">Fit</button>
-          <button class="iconbtn" id="graph-relayout-btn" onclick="board.layout(false)">Re-layout</button>
-          <button class="iconbtn" onclick="clearAll()">Clear</button>
-          <button class="iconbtn" id="graph-expand-btn" onclick="expandFocusOneHop()">Expand</button>
-          <button class="iconbtn" id="graph-collapse-btn" onclick="collapseFocusOneHop()">Collapse</button>
+          <button class="iconbtn" id="fit-btn">Fit</button>
+          <button class="iconbtn" id="up-btn">Clear focus</button>
         </div>
         <div class="graph-search-row">
-          <input id="graph-search" class="filter" placeholder="Find a node…" autocomplete="off"
-                 oninput="graphSearchInput(this.value)" onkeydown="graphSearchKey(event)" />
+          <input id="graph-search" class="filter" placeholder="Find a node…" autocomplete="off" />
           <div id="graph-search-dd" class="dd-list" style="display:none"></div>
         </div>
         <div id="graph-breadcrumbs" class="graph-breadcrumbs"></div>
+        <div id="space-status-line">loading…</div>
+      </div>
+      <div class="table-drawer" id="browse-drawer">
+        <button class="table-drawer-handle" id="browse-drawer-handle" onclick="toggleTableDrawer()">
+          <span class="table-drawer-chevron">&#9650;</span>
+          <span>Table</span>
+          <span id="browse-drawer-count" class="o-faint" style="font-weight:400;text-transform:none;letter-spacing:0"></span>
+        </button>
+        <div id="browse-table"></div>
       </div>
       <div id="result"></div>
-      <div class="stage-viewsw-footer"><div id="viewsw" class="viewsw-tabs"></div></div>
+      <div id="viewsw" class="viewsw-tabs" style="display:none"></div>
+      <div id="cy-legacy" style="display:none"></div>
     </div>
     <div class="grip r" data-grip="r" title="drag to resize · double-click to reset"></div>
     <aside id="right" class="rail"><div class="insp-empty" id="insp"><div style="font-weight:700;font-size:13px;letter-spacing:0.5px;text-transform:uppercase;color:var(--text);margin-bottom:8px">Provenance Inspector</div>Select any entity to inspect its evidence grade and relationships.</div></aside>
@@ -130,5 +165,21 @@
 <div id="peek" class="peek-overlay"></div>
 <script src="/ui/osiris.js"></script>
 <script src="/ui/console.js"></script>
+<script type="module">
+  // NAVIGABLE SPACE, INTEGRATION (decision "NAVIGABLE SPACE, INTEGRATION SHAPE", mail 10550):
+  // mounts the three.js renderer into #cy in place of the old cytoscape whole-graph/
+  // neighborhood content it replaces. window.__spaceReady lets console.js (a classic script,
+  // loaded first, can't import this module) await the instance before wiring it up.
+  import { initSpace } from "/ui/space.js";
+  window.__spaceReady = initSpace({
+    status: document.getElementById("space-status-line"),
+    onFocus: (id) => { if (window.onSpaceFocus) window.onSpaceFocus(id); },
+  }).then((api) => { window.OsirisSpace = api; return api; })
+    .catch((err) => {
+      console.error("space init failed", err);
+      var el = document.getElementById("space-status-line");
+      if (el) el.textContent = "ERROR: " + err.message;
+    });
+</script>
 </body>
 </html>

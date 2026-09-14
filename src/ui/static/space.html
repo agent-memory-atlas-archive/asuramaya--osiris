@@ -2,27 +2,50 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>Osiris — navigable space (spike)</title>
+<title>Osiris — navigable space</title>
+<link rel="stylesheet" href="osiris.css" />
 <style>
   html, body { margin: 0; height: 100%; background: #0d1219; color: #e6edf3;
                font: 13px/1.4 -apple-system, system-ui, sans-serif; overflow: hidden; }
-  #canvas-wrap { position: absolute; inset: 0; }
+  #main { display: flex; height: 100vh; }
+  #stage { position: relative; flex: 1; }
+  #canvas-wrap, #labels { position: absolute; inset: 0; }
+  #labels { pointer-events: none; z-index: 5; }
   canvas { display: block; }
-  #hud { position: absolute; top: 8px; left: 8px; background: rgba(13,18,25,0.85);
-         border: 1px solid #30363d; border-radius: 6px; padding: 8px 10px; z-index: 10;
-         min-width: 260px; white-space: pre; }
-  #hud button { background: #21262d; color: #e6edf3; border: 1px solid #30363d;
-                border-radius: 4px; padding: 3px 8px; margin-top: 6px; cursor: pointer; }
-  #labels { position: absolute; inset: 0; pointer-events: none; z-index: 5; }
   .lbl { position: absolute; font-size: 10px; color: #c9d1d9; background: rgba(13,18,25,0.75);
          padding: 1px 4px; border-radius: 3px; transform: translate(-50%, -140%);
-         white-space: nowrap; }
+         white-space: nowrap; pointer-events: none; }
+  .lbl.lit { color: #f0f6fc; background: rgba(35,55,80,0.9); font-weight: 600; }
+  #status-line { position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
+                 font-size: 11px; color: #8b949e; z-index: 10; }
+  aside#right.rail { width: 340px; flex: none; overflow-y: auto; }
 </style>
 </head>
 <body>
-<div id="canvas-wrap"></div>
-<div id="labels"></div>
-<div id="hud">loading…</div>
-<script type="module" src="space.js"></script>
+<div id="main">
+  <div id="stage">
+    <div id="canvas-wrap"></div>
+    <div id="labels"></div>
+    <div class="graph-canvas-controls">
+      <span id="graph-level-badge" class="o-faint" style="align-self:center;font-size:11px;padding:0 4px"></span>
+      <button class="iconbtn" id="fit-btn">Fit</button>
+      <button class="iconbtn" id="up-btn">Clear focus</button>
+    </div>
+    <div class="graph-search-row">
+      <input id="graph-search" class="filter" placeholder="Find a node…" autocomplete="off" />
+      <div id="graph-search-dd" class="dd-list" style="display:none"></div>
+    </div>
+    <div id="status-line">loading…</div>
+  </div>
+  <aside id="right" class="rail"><div class="insp-empty" id="insp"><div style="font-weight:700;font-size:13px;letter-spacing:0.5px;text-transform:uppercase;color:var(--text);margin-bottom:8px">Provenance Inspector</div>Click any object to inspect its evidence grade and relationships.</div></aside>
+</div>
+<script src="osiris.js"></script>
+<script type="module">
+  import { initSpace } from "./space.js";
+  initSpace().catch((err) => {
+    document.getElementById("status-line").textContent = `ERROR: ${err.message}`;
+    console.error(err);
+  });
+</script>
 </body>
 </html>
