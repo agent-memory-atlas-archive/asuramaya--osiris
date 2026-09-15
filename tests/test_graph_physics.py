@@ -381,6 +381,43 @@ def test_verify_min_separation_raises_on_two_coincident_points() -> None:
         _verify_min_separation(pos, min_sep=_MIN_SEPARATION)
 
 
+def test_place_hubs_in_zone_spreads_hubs_at_least_min_sep_apart() -> None:
+    """THE HUB ZONE fix (live specimen, first bcc6b3f3 migration attempt): the old
+    "jitter by 1 unit around the centroid" scheme packed every hub into a 2-unit
+    disc regardless of population -- this replacement must give hubs a REAL
+    min-sep-respecting spread among themselves before declump ever runs, and NEVER
+    rescale that spread down below the floor."""
+    hubs = [uuid.uuid4() for _ in range(11)]
+    center = np.array([500.0, -300.0])
+    out = graph_physics._place_hubs_in_zone(hubs, center)
+    assert set(out.keys()) == set(hubs)
+    pts = np.array(list(out.values()))
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            assert np.linalg.norm(pts[i] - pts[j]) >= _MIN_SEPARATION - 1e-6
+    radii = np.linalg.norm(pts - center, axis=1)
+    assert float(radii.max()) <= graph_physics._hub_zone_radius(len(hubs)) + 1e-6
+
+
+def test_place_hubs_in_zone_single_hub_lands_near_center() -> None:
+    hub = uuid.uuid4()
+    center = np.array([1.0, 2.0])
+    out = graph_physics._place_hubs_in_zone([hub], center)
+    assert np.linalg.norm(out[hub] - center) <= graph_physics._hub_zone_radius(1) + 1e-6
+
+
+def test_place_hubs_in_zone_empty_returns_empty() -> None:
+    assert graph_physics._place_hubs_in_zone([], np.zeros(2)) == {}
+
+
+def test_hub_zone_radius_matches_the_real_sunflower_extent() -> None:
+    n = 11
+    center = np.zeros(2)
+    out = graph_physics._place_hubs_in_zone([uuid.uuid4() for _ in range(n)], center)
+    real_extent = max(float(np.linalg.norm(p)) for p in out.values())
+    assert graph_physics._hub_zone_radius(n) == pytest.approx(real_extent)
+
+
 async def test_physics_positions_empty_population_returns_empty(actions: Actions) -> None:
     # a fresh hermetic DB per test -- no active objects yet at this point isn't
     # guaranteed (other fixtures may seed some), so only assert the no-crash shape.

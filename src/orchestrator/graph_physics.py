@@ -26,10 +26,16 @@ HUBS: reuses graph_layout.py's own `_hub_ids` (structural-degree >= threshold)
 unchanged as "universal hub" -- rather than inventing a second, narrower
 cross-project-breadth metric, the existing measured threshold already selects the
 unambiguous cases (principal Persons, the biggest projects) this ruling means by
-"anything over threshold". A hub's OWN organic FR position (high-degree nodes already
-tend toward a layout's centroid) is overridden as a final, disclosed step: snapped to
-the real-vertex center of mass, tiny deterministic jitter so two hubs never coincide
-before `_declump` runs.
+"anything over threshold". A hub's OWN organic FR position is overridden as a final,
+disclosed step -- as of v8 (THE HUB ZONE, `_HUB_ZONE_ID`) this is its own extra
+level-1 vertex with its own radius budget, run through the SAME
+`_separate_extents` pass as every real project, never the raw centroid-of-everything
+a v7-style "snap to the mean, jitter by 1 unit" scheme used: that scheme's own
+1-unit jitter radius had no separation guarantee against whatever real content
+happened to already occupy that centroid, and the first real hierarchical migration
+attempt (bcc6b3f3) hit exactly that -- eleven hubs squeezed into a 2-unit disc that
+collided with a dense project sitting at the same point, caught by
+`_verify_min_separation` rather than shipped silently.
 
 SEEDED, DETERMINISTIC: every real vertex's FR starting position is
 `graph_layout._sunflower_point` keyed on its own stable creation-order rank (the
@@ -232,6 +238,21 @@ _VERIFY_MAX_CANDIDATES = 2000  # a cell-pair candidate count above this is treat
                                # sharing a min-sep neighbourhood already means
                                # declump did not converge; see
                                # `_verify_min_separation`'s own docstring.
+_HUB_ZONE_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")  # sentinel level-1
+                            # vertex for THE HUB ZONE (live specimen, first real
+                            # migration attempt on bcc6b3f3: hubs snapped to the raw
+                            # centroid-of-everything with only a 1-unit jitter
+                            # collided with a dense project's own disc sitting right
+                            # at that centroid -- DeclumpVerificationFailed caught it,
+                            # a pair 1.664 units apart under the 15-unit floor. A
+                            # fixed low-valued UUID, not drawn from the same uuid4
+                            # generator that mints every real object id, so a
+                            # collision is not just unlikely, it needs one of this
+                            # house's own object ids to have been minted OUTSIDE
+                            # `uuid.uuid4()` -- giving the hub cluster its OWN radius
+                            # budget and running it through the SAME
+                            # `_separate_extents` pass as every real project is what
+                            # actually guarantees it never lands inside one again.
 
 
 async def _active_object_ids(actions: Actions) -> list[uuid.UUID]:
@@ -656,6 +677,41 @@ def _verify_min_separation(pos: np.ndarray, *, min_sep: float = _MIN_SEPARATION)
                 f"{_MIN_SEP_EPSILON}) -- declump did not converge")
 
 
+def _hub_zone_radius(n_hubs: int) -> float:
+    """The REAL max radius `_place_hubs_in_zone`'s own raw (never rescaled)
+    sunflower spread needs for `n_hubs` points at `_MIN_SEPARATION` -- unlike
+    `_level1_radius`'s area-based packing formula (asymptotically accurate for a
+    real project's hundreds-to-thousands of members), a small hub count needs the
+    EXACT sunflower extent: the packing-density assumption underestimates badly at
+    this scale, and `_place_hubs_in_zone` never rescales DOWN to fit a smaller
+    budget (that would recreate the very bug this zone exists to fix), so the
+    radius fed into `_separate_extents` has to already match what the raw
+    placement actually needs, not the other way around."""
+    if n_hubs <= 1:
+        return _MIN_SEPARATION
+    return _MIN_SEPARATION * math.sqrt(n_hubs - 1 + 0.5)
+
+
+def _place_hubs_in_zone(
+    hub_order: list[uuid.UUID], center: np.ndarray,
+) -> dict[uuid.UUID, np.ndarray]:
+    """THE HUB ZONE (live fix, first bcc6b3f3 migration attempt -- see
+    `_HUB_ZONE_ID`'s own docstring): hubs spread by raw `_sunflower_point` (a real
+    minimum-pairwise-spacing guarantee among themselves, `hub_order`'s own stable
+    creation-order rank), translated onto `center`, NEVER rescaled -- rescaling
+    down to fit a smaller radius budget (the way `_level2_layout_for_project`
+    rescales a project's own members) would shrink hub-to-hub spacing back below
+    the floor this zone exists to guarantee; `_hub_zone_radius` sizes level 1's own
+    separation budget to match this placement's real extent instead. Replaces the
+    old "jitter by 1 unit around the raw centroid-of-everything" scheme, which had
+    no radius budget of its own and could land inside whatever real content
+    happened to sit at that centroid."""
+    if not hub_order:
+        return {}
+    raw = np.array([_sunflower_point(i, _MIN_SEPARATION) for i in range(len(hub_order))])
+    return {oid: raw[i] + center for i, oid in enumerate(hub_order)}
+
+
 async def _physics_positions(
     actions: Actions,
 ) -> dict[uuid.UUID, tuple[float, float]]:
@@ -687,9 +743,16 @@ async def _physics_positions(
     project_id_set = set(project_ids)
     unfiled_ids = [oid for oid in object_ids if oid not in member_set and oid not in project_id_set]
 
+    hub_ids = await _hub_ids(actions, object_ids)
+    hub_order = [oid for oid in object_ids if oid in hub_ids]
+
     radii = {pid: _level1_radius(len(groups[pid])) for pid in project_ids}
+    level1_ids = list(project_ids)
+    if hub_order:
+        radii[_HUB_ZONE_ID] = _hub_zone_radius(len(hub_order))
+        level1_ids.append(_HUB_ZONE_ID)
     cross_edges = _cross_project_edges(link_rows, membership, project_id_set)
-    centroids = _level1_layout(project_ids, radii, cross_edges)
+    centroids = _level1_layout(level1_ids, radii, cross_edges)
 
     positions: dict[uuid.UUID, np.ndarray] = {}
     for pid in project_ids:
@@ -700,13 +763,8 @@ async def _physics_positions(
     _apply_bridge_nudges(positions, link_rows, membership, centroids)
     positions.update(_place_unfiled(unfiled_ids, link_rows, positions))
 
-    hub_ids = await _hub_ids(actions, object_ids)
-    if hub_ids and positions:
-        center = np.array(list(positions.values())).mean(axis=0)
-        for oid in hub_ids:
-            if oid in positions:
-                angle = _hash01(f"physics-hub:{oid}") * 2 * math.pi
-                positions[oid] = center + np.array([math.cos(angle), math.sin(angle)]) * 1.0
+    if hub_order:
+        positions.update(_place_hubs_in_zone(hub_order, centroids[_HUB_ZONE_ID]))
 
     real_positions = np.array([positions[oid] for oid in object_ids])
     reason = await _memory_guard(actions, real_positions)
