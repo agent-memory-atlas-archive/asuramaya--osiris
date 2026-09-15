@@ -377,17 +377,33 @@ async def _live_link_rows(actions: Actions) -> list[asyncpg.Record]:
 
 
 async def _project_membership(actions: Actions) -> dict[uuid.UUID, uuid.UUID]:
-    """object_id -> project_id via a LIVE in_repo link, DISTINCT ON the object (lowest
-    link id wins a rare multi-project membership) -- used ONLY to decide which
-    project's own community detection a member is eligible for; every live container
-    edge (not just in_repo) still drives this member's own gravity in the final
-    graph, this is a narrower question."""
+    """object_id -> project_id, UNION of a LIVE in_repo link (DISTINCT ON the
+    object, lowest link id wins a rare multi-project membership) and a `project`
+    assertion mapped to its repo object by canonical `repo:<name>` (ruling
+    d7d55257: membership is in_repo UNION the project assertion) -- THE MEMBERSHIP
+    UNION FIX (live specimen, first real v8 write's own follow-up measurement,
+    Thoth mail 11221): 16,226 objects carried a `project` assertion with ZERO
+    carrying an in_repo link at the same time -- threads/decisions/messages minted
+    with a project but never actually linked in_repo -- and the OLD in_repo-only
+    query laid every one of them out as unfiled fog. in_repo wins when an object
+    somehow carries both and they disagree (the assertion is a `dict.setdefault`
+    fallback, never an override)."""
     rows = await actions.pool.fetch(
         "SELECT DISTINCT ON (l.from_id) l.from_id AS object_id, l.to_id AS project_id "
         "FROM links l WHERE l.type='in_repo' "
         "  AND (l.valid_until IS NULL OR l.valid_until > now()) "
         "ORDER BY l.from_id, l.id")
-    return {r["object_id"]: r["project_id"] for r in rows}
+    membership = {r["object_id"]: r["project_id"] for r in rows}
+
+    assertion_rows = await actions.pool.fetch(
+        "SELECT a.object_id, p.id AS project_id "
+        "FROM current_assertions a "
+        "JOIN objects p ON p.type='SoftwareProject' "
+        "  AND p.canonical = 'repo:' || (a.value #>> '{}') "
+        "WHERE a.name='project'")
+    for r in assertion_rows:
+        membership.setdefault(r["object_id"], r["project_id"])
+    return membership
 
 
 def _semantic_weight(link_type: str, deg_u: int, deg_v: int) -> float:
@@ -440,13 +456,24 @@ def _build_physics_graph(
     object_ids: list[uuid.UUID],
     link_rows: list[asyncpg.Record],
     communities: dict[uuid.UUID, tuple[uuid.UUID, int]],
+    membership: dict[uuid.UUID, uuid.UUID] | None = None,
 ) -> tuple[ig.Graph, list[uuid.UUID | None]]:
     """The one shared graph every force in this layout acts on: real active objects
     (index-aligned to `object_ids`) plus one synthetic vertex per real (project,
     community) pair found by `_detect_communities` (appended after, no `object_id` of
     their own -- `vertex_ids[i] is None` marks a synthetic row). Returns the graph and
     a vertex-index -> object_id-or-None list the caller strips synthetic rows with
-    after layout."""
+    after layout.
+
+    `membership`, when given (THE MEMBERSHIP UNION FIX, Thoth mail 11221): a
+    member whose project comes ONLY from the `project` assertion (no in_repo
+    link at all) gets NO container edge from the `link_rows` loop below, since
+    that loop only ever reads real links -- without one, that member is an
+    isolated vertex FR has no reason to pull toward its own project at all.
+    After the real-link container edges are built, every id in `object_ids`
+    still missing one gets a synthetic edge straight to its own `membership`
+    target (community-routed the same way a real in_repo edge would be, when
+    one applies) -- the fallback a real link never needed."""
     idx = {oid: i for i, oid in enumerate(object_ids)}
 
     # total live-link degree per real object (ANY type) -- the same "weight" concept
@@ -494,6 +521,21 @@ def _build_physics_graph(
         dst_i = community_vertex[comm] if reroute and comm is not None else j
         container_edges.append((i, dst_i))
         dst_member_counts[dst_i] += 1
+
+    if membership:
+        has_edge = {i for i, _dst in container_edges}
+        for oid in object_ids:
+            i = idx[oid]
+            if i in has_edge:
+                continue
+            target = membership.get(oid)
+            if target is None or target not in idx or target == oid:
+                continue
+            comm = communities.get(oid)
+            reroute = comm is not None and comm[0] == target
+            dst_i = community_vertex[comm] if reroute and comm is not None else idx[target]
+            container_edges.append((i, dst_i))
+            dst_member_counts[dst_i] += 1
 
     edges: list[tuple[int, int]] = []
     weights: list[float] = []
@@ -653,6 +695,7 @@ _NOISE_COMMUNITY_KEY = -1  # local-community-id sentinel for "no real community 
 def _level2_flat_raw_layout(
     pid: uuid.UUID, members: list[uuid.UUID], link_rows: list[asyncpg.Record],
     communities: dict[uuid.UUID, tuple[uuid.UUID, int]],
+    membership: dict[uuid.UUID, uuid.UUID] | None = None,
 ) -> dict[uuid.UUID, np.ndarray]:
     """One (project or community) population's own internal FR pass, RAW -- reuses
     `_build_physics_graph` UNCHANGED (semantic springs, district/community gravity,
@@ -676,7 +719,7 @@ def _level2_flat_raw_layout(
     `_level2_finalize`'s own docstring for why its own scale factor is never
     allowed below 1.0."""
     object_ids = [pid, *members]
-    g, vertex_ids = _build_physics_graph(object_ids, link_rows, communities)
+    g, vertex_ids = _build_physics_graph(object_ids, link_rows, communities, membership)
     seed = _seed_positions(vertex_ids)
     coords = g.layout_fruchterman_reingold(
         weights=g.es["weight"] if g.ecount() else None,
@@ -741,6 +784,7 @@ def _intra_project_community_edges(
 def _level2_raw_layout_for_project(
     pid: uuid.UUID, members: list[uuid.UUID], link_rows: list[asyncpg.Record],
     communities: dict[uuid.UUID, tuple[uuid.UUID, int]],
+    membership: dict[uuid.UUID, uuid.UUID] | None = None,
 ) -> dict[uuid.UUID, np.ndarray]:
     """THE RECURSIVE HIERARCHY FIX (live specimen, fourth real migration attempt on
     41b7bea6+): a project with ~12,000 members (nearly 7x the next-biggest) kept
@@ -767,14 +811,14 @@ def _level2_raw_layout_for_project(
     measured necessary."""
     buckets = _project_community_buckets(pid, members, communities)
     if len(buckets) <= 1:
-        return _level2_flat_raw_layout(pid, members, link_rows, communities)
+        return _level2_flat_raw_layout(pid, members, link_rows, communities, membership)
 
     vertex_for = {key: _community_vertex_id(pid, key) for key in buckets}
     oid_community_vertex = {
         oid: vertex_for[key] for key, ms in buckets.items() for oid in ms}
 
     sub_raws = {
-        key: _level2_flat_raw_layout(pid, ms, link_rows, communities)
+        key: _level2_flat_raw_layout(pid, ms, link_rows, communities, membership)
         for key, ms in buckets.items()
     }
     real_extents = {vertex_for[key]: _level2_extent(sub_raws[key]) for key in buckets}
@@ -1122,7 +1166,7 @@ async def _physics_positions(
     # ZONE, now generalised to every project.
     radii_nominal = {pid: _level1_radius(len(groups[pid])) for pid in project_ids}
     raw_layouts = {
-        pid: _level2_raw_layout_for_project(pid, groups[pid], link_rows, communities)
+        pid: _level2_raw_layout_for_project(pid, groups[pid], link_rows, communities, membership)
         for pid in project_ids
     }
     real_extents = {pid: _level2_extent(raw_layouts[pid]) for pid in project_ids}

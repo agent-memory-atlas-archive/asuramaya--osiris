@@ -345,15 +345,27 @@ async def _project_and_type(
     own ID (not its canonical) is what a caller needs to look up ITS stored center via
     `positions_for` -- THE READING LAYER, ruling c5953bb1: a project's position is no
     longer derivable from a rank alone, it has to be read back from wherever
-    `_place_projects` actually put it."""
+    `_place_projects` actually put it.
+
+    THE MEMBERSHIP UNION FIX (ruling d7d55257, Thoth mail 11221): `project_id` is
+    now `COALESCE(<in_repo target>, <project assertion mapped to its repo object
+    by canonical 'repo:'||name>)` -- in_repo still wins when an object somehow
+    carries both, the assertion is only ever a fallback for an object with NO live
+    in_repo link at all. Live specimen: 16,226 objects carried a `project`
+    assertion with ZERO carrying an in_repo link, all incrementally placed as
+    unfiled before this fix."""
     if not ids:
         return {}
     rows = await actions.pool.fetch(
-        "SELECT DISTINCT ON (o.id) o.id, o.type, p.id AS project_id "
+        "SELECT DISTINCT ON (o.id) o.id, o.type, "
+        "  COALESCE(p.id, ap.id) AS project_id "
         "FROM objects o "
         "LEFT JOIN links l ON l.from_id=o.id AND l.type='in_repo' "
         "  AND (l.valid_until IS NULL OR l.valid_until > now()) "
         "LEFT JOIN objects p ON p.id=l.to_id AND p.type='SoftwareProject' "
+        "LEFT JOIN current_assertions a ON a.object_id=o.id AND a.name='project' "
+        "LEFT JOIN objects ap ON ap.type='SoftwareProject' "
+        "  AND ap.canonical = 'repo:' || (a.value #>> '{}') "
         "WHERE o.id = ANY($1::uuid[]) "
         "ORDER BY o.id, l.id",
         ids)
@@ -375,7 +387,10 @@ async def _adjacency_ranks(
     link) rather than a per-row correlated subquery -- the same shape `_hub_ids`'s
     own UNION ALL degree count uses, cheap at this house's ~49k-object scale. The
     inner DISTINCT ON mirrors `_project_and_type`'s own multi-in_repo-link tie-break
-    (lowest link id wins)."""
+    (lowest link id wins). `project_key` is the SAME THE MEMBERSHIP UNION FIX
+    (ruling d7d55257, Thoth mail 11221) `_project_and_type` uses -- in_repo,
+    falling back to a `project` assertion mapped to its repo object's canonical,
+    falling back to `_UNFILED_KEY` only when neither exists."""
     if not ids:
         return {}
     rows = await actions.pool.fetch(
@@ -389,12 +404,15 @@ async def _adjacency_ranks(
         "  ) x WHERE type <> ALL($3::text[])"
         "), members AS ("
         "  SELECT DISTINCT ON (o.id) o.id, o.created_at, "
-        "    COALESCE(p.canonical, $2) AS project_key, "
+        "    COALESCE(p.canonical, ap.canonical, $2) AS project_key, "
         "    (s.node IS NOT NULL) AS connected "
         "  FROM objects o "
         "  LEFT JOIN links l ON l.from_id=o.id AND l.type='in_repo' "
         "    AND (l.valid_until IS NULL OR l.valid_until > now()) "
         "  LEFT JOIN objects p ON p.id=l.to_id AND p.type='SoftwareProject' "
+        "  LEFT JOIN current_assertions a ON a.object_id=o.id AND a.name='project' "
+        "  LEFT JOIN objects ap ON ap.type='SoftwareProject' "
+        "    AND ap.canonical = 'repo:' || (a.value #>> '{}') "
         "  LEFT JOIN semantic_ids s ON s.node = o.id "
         "  WHERE o.status NOT IN ('archived','merged','retired') "
         "  ORDER BY o.id, l.id"

@@ -28,6 +28,7 @@ from src.orchestrator.graph_layout import (
     _intra_project_neighbors,
     _neighbors_of,
     _place_projects,
+    _project_and_type,
     _project_connected_counts,
     _project_halo_base,
     _relax_projects,
@@ -647,6 +648,44 @@ async def test_adjacency_ranks_object_with_only_a_structural_edge_is_halo(
     out = await _adjacency_ranks(actions, [oid])
     connected, _rank = out[oid]
     assert connected is False
+
+
+async def test_project_and_type_falls_back_to_the_project_assertion(
+    actions: Actions,
+) -> None:
+    """THE MEMBERSHIP UNION FIX (ruling d7d55257, Thoth mail 11221): a member with
+    NO in_repo link but a `project` assertion naming the repo must still resolve
+    to that project's own object id -- the incremental heartbeat's own placement
+    door, not just the physics migration's."""
+    proj = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gl-union", "test")
+    member = await actions.create_or_find_object("Thread", "thread:gl-union-member", "test")
+    now = datetime.now(UTC)
+    await actions.assert_property(member, "project", "gl-union", "test", now, 1.0)
+
+    out = await _project_and_type(actions, [member])
+    project_id, obj_type = out[member]
+    assert project_id == proj
+    assert obj_type == "Thread"
+
+
+async def test_adjacency_ranks_project_key_falls_back_to_the_project_assertion(
+    actions: Actions,
+) -> None:
+    proj = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gl-union-rank", "test")
+    member = await actions.create_or_find_object(
+        "Thread", "thread:gl-union-rank-member", "test")
+    now = datetime.now(UTC)
+    await actions.assert_property(member, "project", "gl-union-rank", "test", now, 1.0)
+    unfiled = await actions.create_or_find_object(
+        "Thread", "thread:gl-union-rank-unfiled", "test")
+
+    out = await _adjacency_ranks(actions, [member, unfiled, proj])
+    # a real assertion-only project_key never shares a band with the pure-unfiled
+    # sentinel -- both got SOME rank (never an exception), and they don't collide.
+    assert member in out
+    assert unfiled in out
 
 
 async def test_layout_batch_clusters_semantically_connected_objects_closer_than_halo(

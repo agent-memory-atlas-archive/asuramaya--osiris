@@ -223,6 +223,26 @@ async def test_fetch_snapshot_excludes_unplaced_objects(actions: Actions) -> Non
     assert str(oid) not in out["object_ids"]
 
 
+async def test_fetch_snapshot_project_falls_back_to_the_project_assertion(
+    actions: Actions,
+) -> None:
+    """THE MEMBERSHIP UNION FIX (ruling d7d55257, Thoth mail 11221): a member with
+    NO in_repo link but a `project` assertion must still surface under that
+    project's own canonical in the snapshot -- the renderer's labels, counts and
+    filter all key on this same `projects` array."""
+    await actions.create_or_find_object("SoftwareProject", "repo:gs-union", "test")
+    member = await actions.create_or_find_object("Thread", "thread:gs-union-member", "test")
+    now = datetime.now(UTC)
+    await actions.assert_property(member, "project", "gs-union", "test", now, 1.0)
+    await layout_batch(actions, limit=1000)
+
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    idx = out["object_ids"].index(str(member))
+    pcode = out["project_code"][idx]
+    assert out["projects"][pcode] == "repo:gs-union"
+    assert out["projects"][pcode] != "unfiled"
+
+
 async def test_fetch_snapshot_watermark_matches_the_live_outbox_tip(
     actions: Actions,
 ) -> None:

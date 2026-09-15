@@ -155,6 +155,21 @@ def test_build_physics_graph_reroutes_community_members_through_synthetic_vertex
     assert 1 in community_edges
 
 
+def test_build_physics_graph_membership_gives_an_assertion_only_member_an_edge(
+) -> None:
+    """THE MEMBERSHIP UNION FIX (Thoth mail 11221): a member whose project comes
+    ONLY from the `project` assertion (no in_repo link, so NO container edge from
+    the link_rows loop) would otherwise be an isolated vertex FR has no reason to
+    pull toward its own project -- `membership` gives it a synthetic edge."""
+    a, proj = uuid.uuid4(), uuid.uuid4()
+    object_ids = [a, proj]
+    g, vertex_ids = _build_physics_graph(object_ids, [], {}, membership={a: proj})
+    assert vertex_ids == object_ids  # no communities -> no synthetic vertices
+    assert g.ecount() == 1
+    edge = g.es[0]
+    assert {edge.source, edge.target} == {0, 1}  # a <-> proj
+
+
 async def test_project_membership_reflects_live_in_repo_links(actions: Actions) -> None:
     proj = await actions.create_or_find_object(
         "SoftwareProject", "repo:gp-membership", "test")
@@ -163,6 +178,39 @@ async def test_project_membership_reflects_live_in_repo_links(actions: Actions) 
         member, proj, "in_repo", "test", datetime.now(UTC), 1.0)
     membership = await _project_membership(actions)
     assert membership.get(member) == proj
+
+
+async def test_project_membership_falls_back_to_the_project_assertion(
+    actions: Actions,
+) -> None:
+    """THE MEMBERSHIP UNION FIX (ruling d7d55257, Thoth mail 11221): 16,226 live
+    objects carried a `project` assertion with ZERO carrying an in_repo link --
+    minted with a project but never actually linked in_repo. A member with NO
+    in_repo link but a `project` assertion naming the repo (mapped to the repo
+    object's own canonical `repo:<name>`) must still resolve to that project."""
+    proj = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gp-union", "test")
+    member = await actions.create_or_find_object("Thread", "thread:gp-union-member", "test")
+    now = datetime.now(UTC)
+    await actions.assert_property(member, "project", "gp-union", "test", now, 1.0)
+    membership = await _project_membership(actions)
+    assert membership.get(member) == proj
+
+
+async def test_project_membership_prefers_in_repo_over_the_assertion_on_disagreement(
+    actions: Actions,
+) -> None:
+    proj_a = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gp-union-a", "test")
+    # proj_b exists purely so the assertion's own name-to-canonical mapping has a
+    # real object to (wrongly) resolve to -- never read back directly.
+    await actions.create_or_find_object("SoftwareProject", "repo:gp-union-b", "test")
+    member = await actions.create_or_find_object("Thread", "thread:gp-union-conflict", "test")
+    now = datetime.now(UTC)
+    await actions.create_link(member, proj_a, "in_repo", "test", now, 1.0)
+    await actions.assert_property(member, "project", "gp-union-b", "test", now, 1.0)
+    membership = await _project_membership(actions)
+    assert membership.get(member) == proj_a
 
 
 async def test_detect_communities_finds_real_clusters_above_threshold(
