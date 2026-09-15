@@ -23,7 +23,6 @@ from src.orchestrator.graph_physics import (
     _detect_communities,
     _level1_layout,
     _level1_radius,
-    _level2_layout_for_project,
     _memory_guard,
     _physics_positions,
     _place_unfiled,
@@ -267,10 +266,9 @@ async def test_level2_layout_does_not_collapse_a_large_project_into_one_cell(
     link_rows = await graph_physics._live_link_rows(actions)
     membership = await _project_membership(actions)
     communities = _detect_communities(link_rows, membership, {proj, *members})
-    radius = _level1_radius(len(members))
 
-    member_pos = _level2_layout_for_project(
-        proj, members, link_rows, communities, np.zeros(2), radius)
+    member_pos = graph_physics._level2_raw_layout_for_project(
+        proj, members, link_rows, communities)
     pos = np.array([member_pos[m] for m in members])
     cells = _grid_cells(pos, _MIN_SEPARATION)
     worst_cell = max(len(v) for v in cells.values())

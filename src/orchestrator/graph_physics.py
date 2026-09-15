@@ -104,13 +104,22 @@ per-vertex radius instead of one shared floor. This is what actually stops the
 "one white blob" -- no two projects' own member clouds can ever occupy the same
 world-space region once this pass has run.
 
-LEVEL 2, one project at a time: `_level2_layout_for_project` reuses
+LEVEL 2, one project at a time: `_level2_raw_layout_for_project` reuses
 `_build_physics_graph` UNCHANGED, scoped to just that project's own members (semantic
 springs, district/community gravity, the collapsed-container fix's 1/member-count
 container weight) -- the project's own vertex is included as an ordinary participant,
 so its FINAL FR position (not the origin) is what the whole subgraph gets recentred
-on, then rescaled so the 95th-percentile member radius matches that project's own
-`R_p` from level 1, then translated onto its level-1 centroid.
+on, then a LOCAL `_declump` pass makes this raw layout already floor-respecting in
+its own unscaled units, computed BEFORE level 1 runs so level 1's own
+`_separate_extents` can use each project's REAL extent (`_level2_extent`) rather than
+`_level1_radius`'s nominal guess. `_level2_finalize` then only ever SCALES UP
+(never down) to fill the nominal disc when there's room, translated onto the
+level-1 centroid -- THE RESCALE COMPRESSION FIX (live specimen, first real migration
+attempt on e7cf6c59: two members landed 0.14-0.93 units apart after the OLD scheme's
+single downward percentile-based rescale compressed an already-tight FR cluster,
+dense core plus a few far outliers driving up the 95th-percentile radius, straight
+past the floor). Same measure-the-real-thing pattern `_hub_zone_radius` already
+uses for THE HUB ZONE, generalised to every project.
 
 CROSS-PROJECT BRIDGING (item 3): a member with a live semantic edge to a member of a
 DIFFERENT project gets a small post-hoc nudge (`_apply_bridge_nudges`) toward that
@@ -555,21 +564,28 @@ def _level1_layout(
     return {pid: pos[i] for i, pid in enumerate(project_ids)}
 
 
-def _level2_layout_for_project(
+def _level2_raw_layout_for_project(
     pid: uuid.UUID, members: list[uuid.UUID], link_rows: list[asyncpg.Record],
-    communities: dict[uuid.UUID, tuple[uuid.UUID, int]], centroid: np.ndarray, radius: float,
+    communities: dict[uuid.UUID, tuple[uuid.UUID, int]],
 ) -> dict[uuid.UUID, np.ndarray]:
-    """One project's own internal FR pass -- reuses `_build_physics_graph` UNCHANGED
-    (semantic springs, district/community gravity, THE COLLAPSED-CONTAINER FIX's
-    1/member-count container weight), scoped to just `[pid, *members]` so container
-    and semantic edges outside this project are dropped by that function's own
-    `idx` membership check. The project's own vertex is an ordinary participant, so
-    its FINAL FR position -- not the origin -- is what the whole subgraph recenters
-    on (`pos[0]` since `pid` is always first in `object_ids`), exactly mirroring how
-    v7's flat layout let a container's own position be "wherever the pull leaves
-    it". Rescaled so the 95th-percentile member radius from that recentred point
-    matches this project's own `radius` (a `_LEVEL1_RADIUS_K`-sized disc), then
-    translated onto `centroid`."""
+    """One project's own internal FR pass, RAW -- reuses `_build_physics_graph`
+    UNCHANGED (semantic springs, district/community gravity, THE COLLAPSED-
+    CONTAINER FIX's 1/member-count container weight), scoped to just
+    `[pid, *members]` so container and semantic edges outside this project are
+    dropped by that function's own `idx` membership check. The project's own
+    vertex is an ordinary participant, so its FINAL FR position -- not the origin --
+    is what the whole subgraph recentres on (`pos[0]` since `pid` is always first in
+    `object_ids`), exactly mirroring how v7's flat layout let a container's own
+    position be "wherever the pull leaves it". Finished with a LOCAL `_declump`
+    pass at the full `_MIN_SEPARATION` floor (cheap at project scale) -- THE
+    RESCALE COMPRESSION FIX (live specimen, first real migration attempt on
+    e7cf6c59: two members landed 0.14-0.93 units apart): a single global
+    percentile-based downward rescale in the OLD scheme could compress an already-
+    tight FR cluster (dense core, a few far outliers driving up the 95th-percentile
+    radius) straight past the floor -- ending HERE, in raw/unscaled units, before
+    any caller ever shrinks anything, is what actually prevents that; see
+    `_level2_finalize`'s own docstring for why its own scale factor is never
+    allowed below 1.0."""
     object_ids = [pid, *members]
     g, vertex_ids = _build_physics_graph(object_ids, link_rows, communities)
     seed = _seed_positions(vertex_ids)
@@ -581,10 +597,48 @@ def _level2_layout_for_project(
     member_pos = pos[1:]
     if len(member_pos) == 0:
         return {}
-    extent = float(np.percentile(np.linalg.norm(member_pos, axis=1), 95))
-    scale = radius / extent if extent > 1e-6 else 1.0
-    member_pos = member_pos * scale + centroid
+    if len(member_pos) > 1:
+        member_pos = _declump(
+            member_pos, np.zeros((0, 2)), members, min_sep=_MIN_SEPARATION,
+            iterations=_PHYSICS_DECLUMP_ITERATIONS)
     return {oid: member_pos[i] for i, oid in enumerate(members)}
+
+
+def _level2_extent(raw: dict[uuid.UUID, np.ndarray]) -> float:
+    """The REAL radius `raw`'s own (already floor-respecting, per
+    `_level2_raw_layout_for_project`) spread needs -- the 95th percentile member
+    radius from the project's own recentred FR position, same statistic the old
+    scheme used, just no longer fed straight into a scale factor that could shrink
+    below 1.0. Floored at `_MIN_SEPARATION` so an empty or single-member project
+    still gets a little real clearance in level 1's own separation pass."""
+    if not raw:
+        return _MIN_SEPARATION
+    pts = np.array(list(raw.values()))
+    if len(pts) == 1:
+        return max(_MIN_SEPARATION, float(np.linalg.norm(pts[0])))
+    return max(_MIN_SEPARATION, float(np.percentile(np.linalg.norm(pts, axis=1), 95)))
+
+
+def _level2_finalize(
+    raw: dict[uuid.UUID, np.ndarray], nominal_radius: float, real_radius: float,
+    centroid: np.ndarray,
+) -> dict[uuid.UUID, np.ndarray]:
+    """THE RESCALE COMPRESSION FIX's own other half: scale is `max(nominal_radius /
+    real_radius, 1.0)` -- NEVER below 1.0, so this step can only ever GROW the raw
+    layout (filling more of its nominal `_level1_radius`-sized disc when there's
+    room) or leave it exactly as `_level2_raw_layout_for_project`'s own local
+    declump already made it (when the project's real spread already exceeds its
+    nominal budget) -- never compress an already floor-respecting layout back
+    below the floor. The caller feeds `real_radius`, not `nominal_radius`, into
+    level 1's own `_separate_extents` pass whenever the project's real spread is
+    the larger of the two, so a project that keeps its full raw size here never
+    encroaches on its neighbours either -- the exact same "measure the real thing,
+    never trust the formula's guess" pattern `_hub_zone_radius` already uses for
+    THE HUB ZONE."""
+    if not raw:
+        return {}
+    scale = max(nominal_radius / real_radius, 1.0) if real_radius > 1e-6 else 1.0
+    return {oid: p * scale + centroid for oid, p in raw.items()}
 
 
 def _apply_bridge_nudges(
@@ -737,11 +791,13 @@ async def _physics_positions(
 ) -> dict[uuid.UUID, tuple[float, float]]:
     """THE HIERARCHICAL PHYSICS pipeline (v8, Thoth mail 11128) -- pure enough to
     unit-test without a live migration write past the DB reads at the top:
-    population + links -> communities -> level 1 (project-contracted FR +
-    extent-aware separation) -> level 2 (one FR pass per project, rescaled onto its
-    own level-1 disc) -> cross-project bridge nudges -> unfiled placement -> hub
-    re-centering -> the memory guard -> the existing declump floor -> VERIFIED.
-    Real object positions only. Can raise `MemoryBudgetExceeded` or
+    population + links -> communities -> level 2's own RAW per-project FR (already
+    floor-respecting via a local declump) -> level 1 (project-contracted FR +
+    extent-aware separation, using each project's REAL extent) -> level 2 finalize
+    (scale UP only, translated onto its level-1 disc) -> cross-project bridge
+    nudges -> unfiled placement -> hub re-centering -> the memory guard -> the
+    existing declump floor -> VERIFIED. Real object positions only. Can raise
+    `MemoryBudgetExceeded` or
     `DeclumpVerificationFailed` -- the caller (`run_physics_migrate`) turns either
     into a written refusal receipt rather than letting a bad layout write."""
     object_ids = await _active_object_ids(actions)
@@ -766,7 +822,20 @@ async def _physics_positions(
     hub_ids = await _hub_ids(actions, object_ids)
     hub_order = [oid for oid in object_ids if oid in hub_ids]
 
-    radii = {pid: _level1_radius(len(groups[pid])) for pid in project_ids}
+    # THE RESCALE COMPRESSION FIX: raw level-2 layouts (already floor-respecting,
+    # per `_level2_raw_layout_for_project`'s own local declump) computed BEFORE
+    # level 1, so level 1's own separation pass can use each project's REAL extent
+    # instead of `_level1_radius`'s nominal area-based guess -- the same
+    # measure-the-real-thing pattern `_hub_zone_radius` already uses for THE HUB
+    # ZONE, now generalised to every project.
+    radii_nominal = {pid: _level1_radius(len(groups[pid])) for pid in project_ids}
+    raw_layouts = {
+        pid: _level2_raw_layout_for_project(pid, groups[pid], link_rows, communities)
+        for pid in project_ids
+    }
+    real_extents = {pid: _level2_extent(raw_layouts[pid]) for pid in project_ids}
+    radii = {pid: max(radii_nominal[pid], real_extents[pid]) for pid in project_ids}
+
     level1_ids = list(project_ids)
     if hub_order:
         radii[_HUB_ZONE_ID] = _hub_zone_radius(len(hub_order))
@@ -777,8 +846,8 @@ async def _physics_positions(
     positions: dict[uuid.UUID, np.ndarray] = {}
     for pid in project_ids:
         positions[pid] = centroids[pid]
-        positions.update(_level2_layout_for_project(
-            pid, groups[pid], link_rows, communities, centroids[pid], radii[pid]))
+        positions.update(_level2_finalize(
+            raw_layouts[pid], radii_nominal[pid], real_extents[pid], centroids[pid]))
 
     _apply_bridge_nudges(positions, link_rows, membership, centroids)
     positions.update(_place_unfiled(unfiled_ids, link_rows, positions))
