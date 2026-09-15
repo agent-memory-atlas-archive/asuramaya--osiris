@@ -1268,46 +1268,15 @@ export async function initSpace(container) {
   // TIP 1(c), TIP 1b (Thoth mail 10755): LABELS ARE NAMES — Agent by handle/name,
   // SoftwareProject by repo name, Person by name, everything else type + short title. One
   // line, hard-truncated at 40 chars with an ellipsis. Khnum's own `labels` wire header
-  // (tip 2g) now computes exactly this rule server-side, index-aligned to object_ids — the
-  // client fallback (a per-node /objects/{id} fetch) is retired for the general case; nd.label
-  // is already the final text, synchronous, no network wait. ONE narrow exception: Khnum's
-  // own label for a Commit falls back to "Commit commit:<sha>" (no subject property exists
-  // on the wire snapshot yet, review flaw #6) — for Commit only, a single async fetch
-  // upgrades the label to the real subject line once resolved, cached per id.
-  const LABEL_MAX = 40;
-  function truncateLabel(s) {
-    const flat = String(s || "").replace(/\s+/g, " ").trim();
-    return flat.length <= LABEL_MAX ? flat : flat.slice(0, LABEL_MAX - 1) + "…";
-  }
+  // (tip 2g, fixed live in mail 10892/commit 0496a7d to resolve a real summary/title/
+  // subject/name assertion for every type — a Commit's own label now carries its real
+  // subject line straight off the wire) computes exactly this rule server-side,
+  // index-aligned to object_ids — nd.label is already the final text, synchronous, no
+  // per-node network fetch for any type. The earlier Commit-only client-side upgrade
+  // (fetchCommitSubject, review flaw #6) is retired outright now that the gap it patched
+  // is closed at the source.
   function fallbackLabel(nd) { return `${nd.type} ${nd.id.slice(0, 8)}`; }
-  const _commitSubjectCache = new Map(); // id -> resolved text
-  const _commitSubjectInFlight = new Set();
-  async function fetchCommitSubject(nd) {
-    let text = nd.label || fallbackLabel(nd);
-    try {
-      const obj = await fetch(`/objects/${nd.id}`).then((r) => r.json());
-      const subject = obj && obj.properties &&
-        obj.properties.find((p) => p.name === "subject");
-      if (subject && subject.value) text = `Commit: ${subject.value}`;
-    } catch { /* keep the wire label on any fetch failure */ }
-    return truncateLabel(text);
-  }
-  function labelTextFor(nd) {
-    if (nd.type !== "Commit") return nd.label || fallbackLabel(nd);
-    const cached = _commitSubjectCache.get(nd.id);
-    if (cached) return cached;
-    if (!_commitSubjectInFlight.has(nd.id)) {
-      _commitSubjectInFlight.add(nd.id);
-      fetchCommitSubject(nd).then((text) => {
-        _commitSubjectCache.set(nd.id, text);
-        _commitSubjectInFlight.delete(nd.id);
-        const div = labelDivs.get(nd);
-        if (div) div.textContent = text;
-        if (hoverNode === nd) updateHoverCard(nd);
-      });
-    }
-    return nd.label || fallbackLabel(nd);
-  }
+  function labelTextFor(nd) { return nd.label || fallbackLabel(nd); }
 
   const N_LABELS = 40;
   let labeledNodes = [];
