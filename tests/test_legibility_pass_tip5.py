@@ -19,6 +19,7 @@ from pathlib import Path
 
 _STATIC = Path(__file__).parent.parent / "src" / "ui" / "static"
 _SPACE_JS = (_STATIC / "space.js").read_text()
+_CONSOLE_JS = (_STATIC / "console.js").read_text()
 
 
 # --- "kill LOD entirely" -- every named tier/cluster/halo mechanism is gone ----------------
@@ -227,3 +228,23 @@ def test_drill_and_anchor_labels_accept_pointer_events_unlike_the_base_tier_clas
     space_html = (_STATIC / "space.html").read_text()
     for html in (index_html, space_html):
         assert ".ego-drill-label { pointer-events: auto;" in html
+
+
+# --- two confirms Thoth asked for by DM (mail 11087) before gating this tip ----------------
+
+def test_the_header_repo_dropdown_closes_on_pick() -> None:
+    # confirmed by live review (mail 11087): a pick used to leave the dropdown open and
+    # just re-render it in place (renderRepoDropdown), reading as though the click did
+    # nothing. toggleRepo now closes it via the same closeAllDropdowns() every other
+    # dropdown-dismiss path already uses.
+    body = _CONSOLE_JS.split("function toggleRepo(name)", 1)[1].split("\n}\n", 1)[0]
+    assert "closeAllDropdowns();" in body
+    assert "renderRepoDropdown();" not in body
+
+
+def test_the_inspector_follows_a_container_focus_too() -> None:
+    # mail 11087's own second confirm ("the table drawer and the inspector follow the
+    # focus set") -- the inspector half: renderContainerDrill's own trailing await mirrors
+    # the ordinary focusObject's own trailing inspect(id) call.
+    body = _SPACE_JS.split("async function renderContainerDrill(id, opts)", 1)[1][:4000]
+    assert "await inspect(id);" in body
