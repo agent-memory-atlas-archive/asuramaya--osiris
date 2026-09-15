@@ -1142,47 +1142,49 @@ function runOmniSearch(q) {
   const myToken = ++OMNI_SEARCH_TOKEN;
   clearTimeout(OMNI_SEARCH_TIMER);
   OMNI_SEARCH_TIMER = setTimeout(async () => {
-    let hits = [];
-    try {
-      const res = await fetch('/search?q=' + encodeURIComponent(q) + '&limit=8').then(r => r.json());
-      hits = Array.isArray(res.hits) ? res.hits : (Array.isArray(res) ? res : []);
-    } catch (e) { hits = []; }
+    // TIP 3b review (Thoth mail 10953): the fallback used to be gated on `hits.length ===
+    // 0`, computed only AFTER the /search fetch's own await -- a second, sequential await
+    // (window.__spaceReady) then followed, with its own token re-check. Two sequential
+    // awaits, two chances for a race, and a gate that skipped the client scan entirely on
+    // any response shape that didn't trip that one condition -- the live page kept saying
+    // "No matches" regardless, the exact contributing bug never pinned down with certainty.
+    // Rather than patch one more edge case onto a fragile gate, the gate is gone: both
+    // requests run together (one await, one token check), and the client-side agent scan is
+    // UNCONDITIONAL once the graph is loaded, deduped against whatever the server found
+    // rather than only stepping in when the server came back empty.
+    const [searchResult, space] = await Promise.all([
+      fetch('/search?q=' + encodeURIComponent(q) + '&limit=8').then(r => r.json()).catch(() => null),
+      window.OsirisSpace ? Promise.resolve(window.OsirisSpace) : (window.__spaceReady || Promise.resolve(null)),
+    ]);
     if (myToken !== OMNI_SEARCH_TOKEN) return; // a newer keystroke already superseded this
+    const hits = searchResult
+      ? (Array.isArray(searchResult.hits) ? searchResult.hits : (Array.isArray(searchResult) ? searchResult : []))
+      : [];
     // THE LEGIBILITY PASS, TIP 1(e) (ruling e1cb9e3b): ONE search -- the graph's own
     // in-canvas "Find a node" box is gone, this omnibox drives it directly. TIP 1 AMENDMENT
     // (mail 10726): "one gesture" -- a Graph hit always focuses now, click or Enter, matching
     // the canvas's own single-click-is-focus (select-vs-focus is retired outright).
+    const seenIds = new Set(hits.filter(h => h && h.id).map(h => h.id));
     const graphHits = hits.filter(h => h && h.id).map(h => ({
       label: h.display_label || h.label || h.name || h.canonical || h.id,
       hint: h.type || '', cat: 'Graph',
       run: () => { switchSurface('browse'); focus(h.id); },
     }));
-    // review flaw #7, TIP 1c re-fix (Thoth mail 10891): "the fallback did not fire on the
-    // deployed page" -- it gated on `window.OsirisSpace`, which is undefined until
-    // initSpace's own promise resolves (window.__spaceReady); a search typed before that
-    // promise settles silently found nothing and stayed that way (OMNI_SEARCH_TOKEN never
-    // re-fires on its own). Awaiting the readiness promise here means the fallback ALWAYS
-    // has real data once the graph has loaded at all, not just when the timing happens to
-    // work out. Scoped to when the server itself returned nothing, per Thoth's own words.
     let agentHits = [];
-    if (hits.length === 0) {
-      const space = window.OsirisSpace || (window.__spaceReady && await window.__spaceReady);
-      if (myToken !== OMNI_SEARCH_TOKEN) return; // the await above can cross a newer keystroke
-      if (space && space.idToNode) {
-        // TIP 3 review carry-over (Thoth mail 10930): a plain n.label read silently missed
-        // every node whose label wasn't already resolved on this snapshot -- read it the
-        // same fallback-safe way space.js's own pickLabels/labelTextFor do (nd.label, else
-        // `${type} ${id.slice(0,8)}`), so the fallback always has real text to search.
-        agentHits = space.idToNode
-          .filter(n => n.type === 'Agent')
-          .map(n => ({ n, text: n.label || `${n.type} ${n.id.slice(0, 8)}` }))
-          .filter(({ text }) => text.toLowerCase().includes(ql))
-          .slice(0, 8)
-          .map(({ n, text }) => ({
-            label: text, hint: 'Agent', cat: 'Graph',
-            run: () => { switchSurface('browse'); focus(n.id); },
-          }));
-      }
+    if (space && space.idToNode) {
+      // TIP 3 review carry-over (Thoth mail 10930): read the label the same fallback-safe
+      // way space.js's own pickLabels/labelTextFor do (nd.label, else
+      // `${type} ${id.slice(0,8)}`), so the scan always has real text to search; skip any
+      // id the server already returned so the same agent never appears twice.
+      agentHits = space.idToNode
+        .filter(n => n.type === 'Agent' && !seenIds.has(n.id))
+        .map(n => ({ n, text: n.label || `${n.type} ${n.id.slice(0, 8)}` }))
+        .filter(({ text }) => text.toLowerCase().includes(ql))
+        .slice(0, 8)
+        .map(({ n, text }) => ({
+          label: text, hint: 'Agent', cat: 'Graph',
+          run: () => { switchSurface('browse'); focus(n.id); },
+        }));
     }
     OMNI_ITEMS = toolHits.concat(compHits, graphHits, agentHits).slice(0, 16);
     OMNI_SEL = Math.min(OMNI_SEL, OMNI_ITEMS.length - 1);

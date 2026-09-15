@@ -62,9 +62,13 @@ def test_escape_clears_focus_stepbackbreadcrumb_is_gone() -> None:
 # --- (3) the omnibox fallback awaits space readiness, not just a truthy global check ------
 
 def test_omnibox_agent_fallback_awaits_space_readiness() -> None:
-    body = _CONSOLE_JS.split("const graphHits = hits.filter", 1)[1][:2000]
-    assert "if (hits.length === 0) {" in body
-    assert "window.OsirisSpace || (window.__spaceReady && await window.__spaceReady)" in body
+    # TIP 3b (Thoth mail 10953) replaced the `hits.length === 0`-gated fallback this test
+    # used to assert with an unconditional client-side scan run inside a single Promise.all
+    # alongside the server search -- see test_legibility_pass_tip3b.py for the full rewrite;
+    # this still confirms the readiness promise is part of that combined wait.
+    body = _CONSOLE_JS.split("OMNI_SEARCH_TIMER = setTimeout(async () => {", 1)[1][:1200]
+    assert "window.OsirisSpace ? Promise.resolve(window.OsirisSpace) : " \
+        "(window.__spaceReady || Promise.resolve(null))" in body
 
 
 # --- (4) #main's grid row is pinned to 100%, breaking the content-driven growth ----------

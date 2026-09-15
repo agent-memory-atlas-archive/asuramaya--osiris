@@ -93,12 +93,16 @@ def test_drilling_into_a_glyph_lands_inside_the_next_tier_down() -> None:
 
 # --- piece 2: EDGE BUDGET ------------------------------------------------------------------
 
-def test_edge_budget_is_none_at_far_all_at_near_capped_semantic_at_mid() -> None:
-    body = _SPACE_JS.split("function applyEdgeBudget(edgeList)", 1)[1][:800]
-    assert 'if (tier === "far") return [];' in body
+def test_edge_budget_is_none_at_far_and_mid_all_at_near() -> None:
+    # TIP 3b flaw #2 (Thoth mail 10953): mid used to keep a capped per-node subset of real
+    # per-object edges, which read as "the solid green cobweb" behind the type glyphs at
+    # that scale -- her own instruction was aggregated (project,type) edges or nothing,
+    # never per-object lines. No (project,type) aggregate exists on the wire, so mid now
+    # draws nothing, same as far.
+    body = _SPACE_JS.split("function applyEdgeBudget(edgeList)", 1)[1][:400]
     assert 'if (tier === "near") return edgeList;' in body
-    assert 'if (e.edgeClass !== "semantic") continue;' in body
-    assert "EDGE_BUDGET_PER_NODE_MID" in body
+    assert "return []; // far and mid: no per-object edges, ever" in body
+    assert "EDGE_BUDGET_PER_NODE_MID" not in _SPACE_JS
 
 
 def test_build_edge_lines_applies_the_budget_but_the_legend_sees_every_type_regardless() -> None:

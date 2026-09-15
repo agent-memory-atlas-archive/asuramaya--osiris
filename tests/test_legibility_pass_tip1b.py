@@ -100,11 +100,16 @@ def test_omnibox_fallback_awaits_space_readiness_not_just_a_truthy_global() -> N
     # TIP 1c re-fix (Thoth mail 10891): "the fallback did not fire on the deployed page" --
     # it gated on window.OsirisSpace, which is undefined until initSpace's own promise
     # resolves; a search typed before that settles found nothing and stayed that way.
-    body = _CONSOLE_JS.split("const graphHits = hits.filter", 1)[1][:2000]
-    assert "if (hits.length === 0) {" in body
-    assert "window.OsirisSpace || (window.__spaceReady && await window.__spaceReady)" in body
+    # TIP 3b (Thoth mail 10953) replaced the two-sequential-awaits shape this test used to
+    # assert (a `hits.length === 0` gate, then a second await/token-check pair) with one
+    # Promise.all over both the server search and the readiness promise together -- see
+    # test_legibility_pass_tip3b.py for the full rewrite; this still confirms the readiness
+    # promise itself is part of that combined wait, not dropped in the simplification.
+    body = _CONSOLE_JS.split("OMNI_SEARCH_TIMER = setTimeout(async () => {", 1)[1][:1600]
+    assert "window.OsirisSpace ? Promise.resolve(window.OsirisSpace) : " \
+        "(window.__spaceReady || Promise.resolve(null))" in body
     assert "if (myToken !== OMNI_SEARCH_TOKEN) return; " \
-        "// the await above can cross a newer keystroke" in body
+        "// a newer keystroke already superseded this" in body
 
 
 # --- flaw #9: a null/undefined focus id never produces a degenerate focused state ---------
