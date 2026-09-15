@@ -344,7 +344,10 @@ def test_apply_bridge_nudges_moves_a_bridging_member_toward_the_other_centroid()
 
 def test_place_unfiled_with_neighbours_lands_at_their_mean_position() -> None:
     a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
-    placed = {b: np.array([0.0, 0.0]), c: np.array([10.0, 0.0])}
+    # anchors far enough apart (200 units) that their mean (the naive target for a)
+    # sits well clear of both -- isolates "lands at the mean" from THE
+    # UNFILED-VS-PLACED FIX's own anchor-declump nudge, checked separately below.
+    placed = {b: np.array([0.0, 0.0]), c: np.array([200.0, 0.0])}
 
     class _Row(dict):
         def __getitem__(self, key: str) -> object:
@@ -352,7 +355,30 @@ def test_place_unfiled_with_neighbours_lands_at_their_mean_position() -> None:
 
     link_rows = [_Row(from_id=a, to_id=b, type="cites"), _Row(from_id=a, to_id=c, type="cites")]
     out = _place_unfiled([a], link_rows, placed)
-    assert np.allclose(out[a], [5.0, 0.0])
+    assert np.allclose(out[a], [100.0, 0.0])
+
+
+def test_place_unfiled_never_lands_within_min_sep_of_an_already_placed_point() -> None:
+    """THE UNFILED-VS-PLACED FIX (live specimen, third real migration attempt on
+    bcf0ca63): a naive neighbour-mean placement dropped an unfiled object right on
+    top of an already-densely-packed project -- pre-declump positions 205 units
+    apart converged to 0.058 apart post-declump because the single GLOBAL declump
+    pass at the very end couldn't always finish that local cleanup. `_place_unfiled`
+    now runs its own local anchor-mode declump against every already-placed
+    position, so its OWN output must already respect the floor before the caller
+    ever merges it in."""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    # b sits exactly where a's only neighbour (also at the origin) would naively
+    # place it -- the naive mean is 0 units from an already-placed point.
+    placed = {b: np.array([0.0, 0.0])}
+
+    class _Row(dict):
+        def __getitem__(self, key: str) -> object:
+            return dict.__getitem__(self, key)
+
+    link_rows = [_Row(from_id=a, to_id=b, type="cites")]
+    out = _place_unfiled([a], link_rows, placed)
+    assert np.linalg.norm(out[a] - placed[b]) >= _MIN_SEPARATION - 1e-6
 
 
 def test_place_unfiled_edgeless_scatters_away_from_a_fixed_ring() -> None:
