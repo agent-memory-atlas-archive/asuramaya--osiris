@@ -104,6 +104,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -232,14 +233,60 @@ def _tool_result_content(raw_line: str) -> str | None:
     return "\n".join(chunks) if chunks else None
 
 
+_SHORT_ID_RE = re.compile(r"^[0-9a-f]{6,40}$")
+
+
+def _settle_receipt_short_ids(text: str) -> list[str]:
+    """settle()'s OWN receipt shape (thread e332177f, Thoth mail 10791/10975,
+    specimen decision ab991412) — structurally different from record_decision's/
+    open_thread's own direct tool_result, which is what `_RECEIPT_CANONICAL_RE_SRC`
+    matches. A decision/thread minted via `settle(decisions=[...]/threads_open=[...]/
+    threads_resolve=[...])` never echoes its own `"canonical"` key back to the
+    caller's transcript at all — only settle()'s own completeness report does,
+    `{"accepted": {"decisions": [{"id": "<short-id>"}], "threads_opened": [...],
+    "threads_resolved": [...]}}`, keyed by the object's SHORT id (the first 6-40 hex
+    chars of its canonical — the SAME short-id convention every osiris DM/thread
+    reference already uses), never the full `type:hex` canonical string.
+
+    A STRUCTURAL json.loads of the already-flattened tool_result content, not a
+    second regex layer — scoped to the `accepted` key specifically so a decision
+    merely CITED as `prior_art` elsewhere in the SAME tool_result (a sibling,
+    unrelated key on a record_decision response, e.g.) is never mistaken for its
+    own creation/resolution receipt."""
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    accepted = parsed.get("accepted")
+    if not isinstance(accepted, dict):
+        return []
+    ids: list[str] = []
+    for key in ("decisions", "threads_opened", "threads_resolved"):
+        items = accepted.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            item_id = item.get("id") if isinstance(item, dict) else None
+            if isinstance(item_id, str) and _SHORT_ID_RE.match(item_id):
+                ids.append(item_id)
+    return ids
+
+
 def _do_scan_lines(transcript: Path) -> tuple[list[str], dict[str, int]]:
     """The actual blocking file walk, run only via `asyncio.to_thread` below — never
     called directly, so this name itself never appears as a bare `.read`-family call
     the blocking-transcript-read guard (tests/test_blocking_transcript_reads.py) scans
     for. ONE PASS, iterating the file object directly (never `f.read()`/`.splitlines()`
-    materializing the whole file as a second, separate string first)."""
-    import re
+    materializing the whole file as a second, separate string first).
 
+    `index` carries BOTH keying shapes in the same dict — a full canonical string
+    (`"decision:<hex>"`) from a direct record_decision/open_thread receipt, or a bare
+    short id (`"<hex>"`, no type prefix) from a settle() receipt — since the two forms
+    can never collide (a canonical always contains `:`, a short id never does). The
+    lookup side (`backfill_possible_upstream`) tries the candidate's own full canonical
+    first, then its short-id prefix as a fallback."""
     pattern = re.compile(_RECEIPT_CANONICAL_RE_SRC)
     lines: list[str] = []
     index: dict[str, int] = {}
@@ -252,6 +299,8 @@ def _do_scan_lines(transcript: Path) -> tuple[list[str], dict[str, int]]:
                 continue
             for m in pattern.finditer(text):
                 index.setdefault(m.group(1), idx)
+            for short_id in _settle_receipt_short_ids(text):
+                index.setdefault(short_id, idx)
     return lines, index
 
 
@@ -439,7 +488,8 @@ async def backfill_possible_upstream(
             _tag(writer, "no_ledger")
             continue
         canon_to_path, too_large_count, any_scanned = await _writer_receipt_index(writer, sids)
-        receipt_path = canon_to_path.get(cand["canonical"])
+        short_id = cand["canonical"].split(":", 1)[-1][:8]
+        receipt_path = canon_to_path.get(cand["canonical"]) or canon_to_path.get(short_id)
         if receipt_path is None:
             if not any_scanned and too_large_count:
                 reason = (f"every one of the writer's {too_large_count} resolvable "
@@ -459,7 +509,9 @@ async def backfill_possible_upstream(
         scanned = scan_cache[receipt_path]
         assert scanned is not None  # canon_to_path only ever names a successfully-scanned file
         receipt_lines, receipt_line_index = scanned
-        receipt_line = receipt_line_index[cand["canonical"]]
+        receipt_line_val = receipt_line_index.get(cand["canonical"])
+        receipt_line = (receipt_line_val if receipt_line_val is not None
+                        else receipt_line_index[short_id])
         _tag(writer, "matched")
 
         for target, props in await _upstream_targets(

@@ -277,6 +277,40 @@ async def test_a_transcript_over_the_cap_is_skipped_unopened(
     assert not _sidecar_for(big).exists()  # never opened, so never cached either
 
 
+async def test_a_settle_minted_write_matches_via_its_short_id(
+    actions: Actions, tmp_path: Path,
+) -> None:
+    """Thoth mail 10791/10975, specimen decision ab991412: a Decision minted via
+    settle(decisions=[...]) never gets its own `"canonical"` key echoed to the writer's
+    transcript — only settle()'s own report does, keyed by the object's SHORT id under
+    `accepted.decisions[].id`, never the full canonical string. Real-world specimen
+    proved the receipt line genuinely exists (`grep` found it) while the old matcher,
+    which only recognized the direct record_decision `"canonical"` shape, missed it —
+    this is the fix, not a hypothetical."""
+    now = datetime.now(UTC)
+    settle_report = json.dumps({
+        "complete": True, "accepted": {
+            "decisions": [{"id": "1234abcd", "is_handoff": True}],
+            "threads_opened": [], "threads_resolved": []},
+        "rejected": []})
+    lines = [_tool_result(settle_report)]
+    await _mint_agent_with_sid(actions, "agent:writer-settle", "sidsettle1deadbeef",
+                               tmp_path, lines)
+    # A canonical LONGER than the 8-char short id, proving genuine prefix matching,
+    # not mere string equality.
+    decision = await actions.create_or_find_object(
+        "Decision", "decision:1234abcd5678ef90", "agent:writer-settle")
+    await actions.assert_property(
+        decision, "summary", "minted via settle(), never its own record_decision call",
+        "agent:writer-settle", now, 0.9)
+
+    report = await backfill_possible_upstream(
+        actions, dry_run=True, transcript_root=tmp_path)
+
+    assert report["summary"]["candidates"]["matched"] == 1
+    assert report["summary"]["candidates"]["no_transcript"] == 0
+
+
 async def test_a_writer_with_three_sessions_matches_via_the_second(
     actions: Actions, tmp_path: Path,
 ) -> None:
