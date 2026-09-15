@@ -175,20 +175,12 @@ async function fetchStreamSnapshot() {
       type, edgeClass,
     });
   }
-  // THE LEGIBILITY PASS, TIP 3 (Thoth mail 10930): Khnum's own tip 2i/2j LOD tables --
-  // per-project and per-(project,type) centroid/count/radius summaries, plus cross-project
-  // edge counts by link class -- ride the same header this endpoint already sends (no new
-  // request). types/projects are the same name tables node.type/node.project already
-  // resolve through above; handed back raw here since the aggregates below are keyed by the
-  // same codes, not by name.
-  return {
-    nodes, edges,
-    projectAggregates: snap.project_aggregates || [],
-    typeAggregates: snap.type_aggregates || [],
-    clusterEdges: snap.cluster_edges || [],
-    projectNames: snap.projects || [],
-    typeNames: snap.types || [],
-  };
+  // THE LAST RENDERER (operator ruling d7d55257, Thoth mail 11066) killed LOD entirely --
+  // Khnum's own project_aggregates/type_aggregates/cluster_edges/type_pair_edges (tip
+  // 2i/2j/h) still ride the same wire header, but nothing client-side reads them any more;
+  // node.type/node.project are already resolved to name strings above, off the same
+  // types/projects tables those aggregates were keyed against.
+  return { nodes, edges };
 }
 
 // resolves DOM refs from a passed-in container map, falling back to the same fixed ids
@@ -242,6 +234,52 @@ export async function initSpace(container) {
   scene.background = new THREE.Color(0x0d1219);
   const pickScene = new THREE.Scene();
 
+  // THE LAST RENDERER (operator ruling d7d55257, Thoth mail 11066): "a per-pixel saturation
+  // cap (tone-map the additive pass...) so overlap reads as brightness and never as white."
+  // Additive blending alone can sum well past 1.0 per channel and hard-clip to flat white
+  // the moment enough points/edges overlap the same pixel -- a genuine HDR render target
+  // (HalfFloatType, values free to exceed 1.0) plus a Reinhard tone-map full-screen pass
+  // (color / (color + 1), mathematically bounded in [0, 1) for any non-negative input, no
+  // matter how many instances overlap) makes "never white" a property of the math, not a
+  // heuristic. Falls back to rendering straight to the canvas if the render target can't be
+  // created (an old GPU lacking float render-target support) -- the additive brightness cap
+  // this buys is a real improvement, never a hard requirement to render at all.
+  let sceneTarget = null, toneMapScene = null, toneMapCamera = null;
+  try {
+    sceneTarget = new THREE.WebGLRenderTarget(1, 1, {
+      type: THREE.HalfFloatType, depthBuffer: true, stencilBuffer: false,
+    });
+    toneMapCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    toneMapScene = new THREE.Scene();
+    const toneMapMaterial = new THREE.ShaderMaterial({
+      uniforms: { tDiffuse: { value: sceneTarget.texture } },
+      depthTest: false, depthWrite: false,
+      vertexShader: `
+        varying vec2 vUv;
+        void main() { vUv = uv; gl_Position = vec4(position, 1.0); }
+      `,
+      fragmentShader: `
+        uniform sampler2D tDiffuse;
+        varying vec2 vUv;
+        void main() {
+          vec3 color = texture2D(tDiffuse, vUv).rgb;
+          vec3 mapped = color / (color + vec3(1.0)); // Reinhard: bounded in [0,1) always
+          gl_FragColor = vec4(mapped, 1.0);
+        }
+      `,
+    });
+    toneMapScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), toneMapMaterial));
+  } catch (err) {
+    console.error("tone-map render target unavailable, rendering without a saturation cap", err);
+    sceneTarget = null;
+  }
+  function resizeSceneTarget() {
+    if (!sceneTarget) return;
+    sceneTarget.setSize(
+      Math.max(1, Math.round(wrap.clientWidth * dpr)),
+      Math.max(1, Math.round(wrap.clientHeight * dpr)));
+  }
+
   // world extent depends entirely on Khnum's own layout heartbeat (deterministic hash
   // placement, piece A) and is NOT a fixed constant — a project-center hash can land
   // anywhere; fitToNodes() (below) frames the camera from the real loaded bbox instead of
@@ -253,12 +291,6 @@ export async function initSpace(container) {
   // read by the operator as "zoom does not work").
   let viewSize = 1300;
   let minViewSize = 20, maxViewSize = 2000;
-  // TIP 3 (Thoth mail 10930): the whole-graph FIT scale itself, captured by fitToNodes and
-  // held stable across zoom/focus (same discipline as maxViewSize) -- LOD tier thresholds
-  // below are fractions of THIS, not a hardcoded world-per-px number, so they self-scale to
-  // whatever a real graph's own extent happens to be rather than needing per-deployment
-  // tuning.
-  let fitViewSize = 1300;
   const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
   camera.position.set(0, 0, 5);
   camera.lookAt(0, 0, 0);
@@ -271,9 +303,11 @@ export async function initSpace(container) {
     camera.updateProjectionMatrix();
   }
   updateFrustum();
+  resizeSceneTarget();
   window.addEventListener("resize", () => {
     renderer.setSize(wrap.clientWidth, wrap.clientHeight);
     updateFrustum();
+    resizeSceneTarget();
     edgeFadeUniforms.uViewportPx.value.set(wrap.clientWidth, wrap.clientHeight);
     markDirty();
   });
@@ -292,10 +326,22 @@ export async function initSpace(container) {
     rafPending = true;
     requestAnimationFrame(renderIfDirty);
   }
+  // shared by the render-on-demand loop and the api's own forceRender debug hook -- one
+  // place decides whether the tone-map pass runs, never duplicated.
+  function renderScene() {
+    if (sceneTarget) {
+      renderer.setRenderTarget(sceneTarget);
+      renderer.render(scene, camera);
+      renderer.setRenderTarget(null);
+      renderer.render(toneMapScene, toneMapCamera);
+    } else {
+      renderer.render(scene, camera);
+    }
+  }
   function renderIfDirty() {
     rafPending = false;
     if (!running || !dirty) return;
-    renderer.render(scene, camera);
+    renderScene();
     positionLabels();
     dirty = false;
   }
@@ -320,16 +366,6 @@ export async function initSpace(container) {
     if (idToNode.length) {
       buildScene(idToNode, edges);
       fitToNodes(idToNode);
-      // context loss invalidates every GPU resource, the tier-label DOM state and cluster/
-      // halo meshes included -- rebuild them too, not just the main scene. Tier labels are
-      // pure DOM (no GPU resource), but buildTierLabels also rebuilds centroidByProjectName,
-      // which buildEdgeLines (just called via buildScene) needs for cross-cluster bundling --
-      // rebuilding it here too keeps that index correct even though it wasn't actually lost.
-      buildTierLabels();
-      buildClusterEdgeLines();
-      buildClusterRings();
-      buildHalo();
-      refreshLOD();
       setStatus(`${idToNode.length} objects, ${edges.length} edges (recovered)`);
     }
     resume();
@@ -344,12 +380,6 @@ export async function initSpace(container) {
   // premature one: rebuilding a 49k-entry Map costs ~15ms each, and focusObject used to
   // build FOUR of them (ego layout, restore, path edges, camera fit) on every single click.
   let idById = new Map();
-  // TIP 3 (Thoth mail 10930): Khnum's own LOD tables, captured once per snapshot load --
-  // aggregates don't track live /graph/stream/deltas (a moved/retired object nudges a
-  // centroid by less than a glyph's own screen size between snapshots; not worth a
-  // recompute per delta, an accepted staleness).
-  let projectAggregates = [], typeAggregates = [], clusterEdges = [];
-  let projectNames = [], typeNames = [];
   // TIP 1(e): header taxonomy-pill type filters hide instances through the same per-instance
   // aVisible flag focus uses (1(d)) — empty means nothing filtered, everything shown.
   let hiddenNodeTypes = new Set();
@@ -359,6 +389,10 @@ export async function initSpace(container) {
   // project_code lookup, line ~148) is the field it filters on, empty means nothing
   // filtered, everything shown.
   let hiddenProjects = new Set();
+  // THE DRILL, item 5 (Thoth mail 11048): ids a project-filter stub click revealed --
+  // "without unhiding the project" itself, so this stays a NARROW override, never merged
+  // into hiddenProjects. Reset whenever the filter itself changes (setHiddenProjects).
+  let revealedStubIds = new Set();
   // THE READING LAYER, part B: FOCUS = PATH LENS (ruling c5953bb1, Thoth DM 10596). SELECT
   // (a plain click) and FOCUS (double-click, Enter, or the inspector's Focus button) are now
   // two different acts — selectedId just shows the inspector; pathFocusId/pathReachable are
@@ -379,85 +413,36 @@ export async function initSpace(container) {
     mesh = pickMesh = edgeLines = null;
   }
 
-  // THE LEGIBILITY PASS (ruling e1cb9e3b, Thoth DM 10708), TIP 1(a)+(b): SIZE now lives in
-  // WORLD UNITS, not screen pixels. The old scheme (aRadiusPx * uWorldPerPx) kept every node
-  // the SAME pixel size regardless of zoom — Thoth's own live measurement at fit found that
-  // read as a solid pink mass (9 world units/px, median nearest-neighbour 19 units = 2px,
-  // average node radius 8.4px = 75 world units — each node covering ~60 neighbours). A real
-  // object should shrink as you zoom out and grow as you zoom in, same as everything else in
-  // the scene; the floor/cap below exist only so it never vanishes or swallows the screen.
-  //
-  // Degree curve: LOG-scale, not the old asymptotic 1x-3x (which made a 20k-edge hub read
-  // almost the same size as a leaf — the operator's own complaint). factor = 1 + k*log2(d/d0)
-  // clamped at 0, tuned against Thoth's own anchors (degree 3 -> ~1x, 30 -> ~2x, 300 -> ~3.5x,
-  // 20,000 -> ~6x): k=0.43, d0=6 fits all four within a few percent.
-  const CATEGORY_BASE_WORLD = { agent: 8, object: 5 };
-  const DEGREE_LOG_K = 0.43;
-  const DEGREE_LOG_D0 = 6;
-  // TIP 4 (operator ruling "DENSITY NOT DISCS", Thoth mail 11011): the floor is a literal
-  // 1px now -- every object draws at every zoom as a point, never fully vanishing, rather
-  // than the LOD glyph tiers this tip retires standing in for it once zoomed out.
-  const NODE_MIN_SCREEN_PX = 1;
-  const NODE_MAX_SCREEN_PX = 48; // cap — never render bigger than this, however far zoomed in
-  function categoryOf(nd) { return nd.type === "Agent" ? "agent" : "object"; }
-  function degreeFactor(nd) {
-    const d = nd.degree || 0;
-    return 1 + Math.max(0, DEGREE_LOG_K * Math.log2(Math.max(d, 1e-9) / DEGREE_LOG_D0));
+  // THE LAST RENDERER (operator ruling d7d55257, Thoth mail 11066, freezing the renderer):
+  // "points at a constant SCREEN size in px on a steep degree curve (~2px leaf, ~8px@100
+  // links, ~16px@1000, ~32px@10000; no world-unit sizing, no 48px cap)." A full circle back
+  // to this file's own ORIGINAL pre-legibility-pass scheme (aRadiusPx * uWorldPerPx, a
+  // constant screen size regardless of zoom) -- what changed since is the CURVE, not the
+  // mechanism: px = 2 * degree^log10(2) hits all four of the ruling's own anchors exactly
+  // (degree 1 -> 2px, 100 -> 8px, 1,000 -> 16px, 10,000 -> 32px -- verified algebraically:
+  // d^log10(2) = 10^(log10(d)*log10(2)) = 2^log10(d), so at d=10^k the curve is exactly
+  // 2*2^k), left uncapped past that per the ruling's own words -- no world-unit sizing, no
+  // LOD tiers standing in for a floor once zoomed out (kill LOD entirely, same mail).
+  const DEGREE_PX_BASE = 2;
+  const DEGREE_PX_EXPONENT = Math.log10(2); // ≈0.30103
+  function nodeScreenPx(nd) {
+    return DEGREE_PX_BASE * Math.pow(Math.max(nd.degree || 0, 1), DEGREE_PX_EXPONENT);
   }
-  function nodeRadiusWorld(nd) { return CATEGORY_BASE_WORLD[categoryOf(nd)] * degreeFactor(nd); }
   function worldPerPx() { return viewSize / wrap.clientHeight; }
 
-  // TIP 4, LOD BY ZOOM -- LABELS ONLY NOW (operator ruling "DENSITY NOT DISCS", Thoth mail
-  // 11011, retiring TIP 3/3b's own glyph-disc tiers wholesale): every object draws at every
-  // zoom as a point (buildScene/makeInstancedCircleMaterial, additive), so "tier" no longer
-  // decides WHAT is drawn, only which LABELS show -- far: project names; mid: project names
-  // plus each cluster's own dominant type; near: individual object titles (see
-  // buildTierLabels/positionTierLabels below, and positionLabels' own near-only gate for
-  // node titles). Thresholds unchanged from TIP 3: world-per-px, fractions of the fit-time
-  // scale (fitViewSize) so they self-scale to any real graph's own extent.
-  //
-  // FOCUS DISABLES TIERING ENTIRELY (tip 4 piece (d)): the operator's own second complaint
-  // -- "a focus whose fit lands in the far band shows a blob instead of the tree" -- a wide
-  // ego layout's own camera-fit viewSize could land in the far/mid wpp band by pure
-  // coincidence, which used to hide the real per-object mesh behind glyph discs exactly
-  // when a reader most needed to see the actual tree. A focus is never tiered now,
-  // whatever the camera's own zoom happens to be: only the reachable set is on screen
-  // during a focus anyway (applyDim/aVisible), so per-object labels/edges are always the
-  // right level of detail for it.
-  const LOD_FAR_FRACTION = 0.9;
-  const LOD_MID_FRACTION = 0.3;
-  function zoomLOD() {
-    if (pathFocusId) return "near";
-    const wpp = worldPerPx();
-    const fitWpp = fitViewSize / wrap.clientHeight;
-    if (wpp >= fitWpp * LOD_FAR_FRACTION) return "far";
-    if (wpp >= fitWpp * LOD_MID_FRACTION) return "mid";
-    return "near";
-  }
-
-  // SCREEN-BOUNDED WORLD SIZE ON THE GPU: a node's WORLD radius is fixed at build time (one
-  // static instanced attribute, aRadiusWorld — set once, never rewritten until the data
-  // itself changes); the floor/cap are expressed in world units too (screen px * worldPerPx,
-  // recomputed on zoom) so the vertex shader can clamp with nothing but a per-material
-  // uniform — a zoom step still only ever touches two floats per material (min/max), never a
-  // per-instance rewrite, same GPU-uniform discipline as the old pixel-constant scheme (Thoth
-  // mail 10581). aVisible (also a static instanced attribute, TIP 1(d)/(e)) hides a node
-  // outright — collapses it to zero size — when it's filtered by type or unreachable during
-  // an active focus; shared by the pick mesh via the same geometry, so a hidden node is
-  // neither drawn nor clickable.
   // TIP 4 (operator ruling "DENSITY NOT DISCS", mail 11011): "every object draws at every
   // zoom as an additive point sprite... a project far out is a haze whose brightness is its
   // count." `additive` is true for the DRAW mesh only, never the pick mesh -- GPU picking
   // decodes an exact RGB-encoded instance id out of the render target, which additive
   // blending would corrupt the moment two picked instances' colours overlap in that tiny
-  // readback; the pick mesh stays fully opaque, same as before this tip.
-  const NODE_POINT_OPACITY = 0.55;
+  // readback; the pick mesh stays fully opaque, same as before this tip. THE LAST RENDERER
+  // caps overall SATURATION with a tone-map post-process pass instead (see
+  // makeToneMapPass below) rather than a per-instance opacity ceiling, so raw additive
+  // brightness here can exceed 1.0 without a hard per-material alpha limiting it.
+  const NODE_POINT_OPACITY = 0.85;
   function makeInstancedCircleMaterial(opts) {
     const additive = !!(opts && opts.additive);
-    const uniforms = {
-      uMinRadiusWorld: { value: NODE_MIN_SCREEN_PX * worldPerPx() },
-      uMaxRadiusWorld: { value: NODE_MAX_SCREEN_PX * worldPerPx() },
-    };
+    const uniforms = { uWorldPerPx: { value: worldPerPx() } };
     const matOpts = { vertexColors: true };
     if (additive) {
       Object.assign(matOpts, {
@@ -467,17 +452,16 @@ export async function initSpace(container) {
     }
     const mat = new THREE.MeshBasicMaterial(matOpts);
     mat.onBeforeCompile = (shader) => {
-      shader.uniforms.uMinRadiusWorld = uniforms.uMinRadiusWorld;
-      shader.uniforms.uMaxRadiusWorld = uniforms.uMaxRadiusWorld;
+      shader.uniforms.uWorldPerPx = uniforms.uWorldPerPx;
       shader.vertexShader =
-        "attribute float aRadiusWorld;\nattribute float aVisible;\n" +
-        "uniform float uMinRadiusWorld;\nuniform float uMaxRadiusWorld;\n" + shader.vertexShader;
+        "attribute float aRadiusPx;\nattribute float aVisible;\n" +
+        "uniform float uWorldPerPx;\n" + shader.vertexShader;
       shader.vertexShader = shader.vertexShader.replace(
         "#include <begin_vertex>",
-        "#include <begin_vertex>\n\ttransformed *= clamp(aRadiusWorld, uMinRadiusWorld, uMaxRadiusWorld) * aVisible;"
+        "#include <begin_vertex>\n\ttransformed *= aRadiusPx * uWorldPerPx * aVisible;"
       );
     };
-    mat.customProgramCacheKey = () => "circleInstancedWorldRadius";
+    mat.customProgramCacheKey = () => "circleInstancedScreenPx";
     return { material: mat, uniforms };
   }
 
@@ -489,18 +473,17 @@ export async function initSpace(container) {
   // own on-screen length using nothing but modelViewMatrix/projectionMatrix — already
   // updated by three.js every frame for free. No per-zoom CPU work, no material.opacity
   // scalar to keep in sync (replaces the old viewSize-based updateEdgeStyle entirely).
-  // TIP 4 (operator ruling "DENSITY NOT DISCS", mail 11011): "additive blending with alpha
-  // scaled by 1/(edges on screen) so a dense web fades to haze never paint." uDensityScale
-  // is set once per buildEdgeLines rebuild (below, off the just-built visible-edge count),
-  // multiplying the existing screen-length fade rather than replacing it -- a genuinely
-  // dense cluster's OWN edges thin out as a group even where any one of them individually
-  // reads as "short" (would otherwise stay near uMaxAlpha forever).
+  // THE LAST RENDERER (Thoth mail 11066): "an edge draws only when both ends are visible,
+  // no structural-hop exception, with an alpha floor (~0.06) so any drawn edge is faintly
+  // visible." uMinAlpha raised from 0.04 to that floor; the density-scale multiplier TIP 4
+  // added (uDensityScale) is gone -- overall saturation is now bounded by the tone-map
+  // post-process pass (makeToneMapPass) instead of thinning every edge's own alpha by how
+  // many are on screen.
   const edgeFadeUniforms = {
     uViewportPx: { value: new THREE.Vector2(wrap.clientWidth, wrap.clientHeight) },
     uMaxFadePx: { value: 320 },
-    uMinAlpha: { value: 0.04 },
+    uMinAlpha: { value: 0.06 },
     uMaxAlpha: { value: 0.5 },
-    uDensityScale: { value: 1 },
   };
   function makeEdgeFadeMaterial() {
     return new THREE.ShaderMaterial({
@@ -515,7 +498,6 @@ export async function initSpace(container) {
         uniform float uMaxFadePx;
         uniform float uMinAlpha;
         uniform float uMaxAlpha;
-        uniform float uDensityScale;
         varying vec3 vColor;
         varying float vAlpha;
         void main() {
@@ -525,7 +507,7 @@ export async function initSpace(container) {
           vec2 pxA = (clip.xy / clip.w * 0.5 + 0.5) * uViewportPx;
           vec2 pxB = (otherClip.xy / otherClip.w * 0.5 + 0.5) * uViewportPx;
           float screenLen = distance(pxA, pxB);
-          vAlpha = mix(uMaxAlpha, uMinAlpha, clamp(screenLen / uMaxFadePx, 0.0, 1.0)) * uDensityScale;
+          vAlpha = mix(uMaxAlpha, uMinAlpha, clamp(screenLen / uMaxFadePx, 0.0, 1.0));
           gl_Position = clip;
         }
       `,
@@ -549,47 +531,28 @@ export async function initSpace(container) {
   function nodeVisible(nd) {
     if (!nd) return false;
     if (hiddenNodeTypes.has(nd.type)) return false;
-    if (hiddenProjects.size > 0 && hiddenProjects.has(nd.project)) return false;
+    // THE DRILL, item 5 (Thoth mail 11048): revealedStubIds overrides a project's own
+    // hidden state for the specific nodes a stub click revealed -- "without unhiding the
+    // project" itself, only this one path.
+    if (hiddenProjects.size > 0 && hiddenProjects.has(nd.project) && !revealedStubIds.has(nd.id)) return false;
     if (pathFocusId && nd.id !== pathFocusId && !pathReachable.has(nd.id)) return false;
     return true;
   }
-  // TIP 4, EDGES (operator ruling "DENSITY NOT DISCS", mail 11011, retiring TIP 3/3b's own
-  // far/mid budget cutoff -- "every object draws at every zoom," extended here to edges
-  // too): the base per-object edge layer draws at EVERY tier now, never hidden outright.
-  // Density itself stays legible instead of a hard cutoff -- edgeFadeUniforms.uDensityScale
-  // (set below, off the just-built visible-edge count) multiplies every edge's own alpha,
-  // so a genuinely dense web thins toward a haze rather than either a solid paint or an
-  // arbitrary vanish. Far ADDITIONALLY draws buildClusterEdgeLines' own weighted project-
-  // centroid lines, layered on top (unchanged from TIP 3).
-  //
-  // CROSS-CLUSTER BUNDLING: "cross-cluster edges curve toward the two centroids (quadratic
-  // bundling) so fans read as ribbons." An edge whose two endpoints sit in DIFFERENT real
-  // projects (nd.project, neither "unfiled" -- no real centroid to bend toward) is
-  // tessellated as a quadratic Bezier whose control point is pulled from the straight
-  // midpoint toward the midpoint of the two projects' own aggregate centroids
-  // (centroidByProjectName, built by buildCentroidIndex) -- many individual cross-cluster
-  // edges then visually converge into one readable ribbon between the two clusters instead
-  // of chaotic straight spaghetti. Same-project (or unfiled-involved) edges stay straight,
-  // one segment, exactly as before this tip.
-  const EDGE_CURVE_SEGMENTS = 6;
-  const EDGE_BUNDLE_STRENGTH = 0.55; // 0 = straight, 1 = control point AT the centroid midpoint
-  const EDGE_DENSITY_TARGET = 60; // tuned, noted: ~60 edges on screen reads as full alpha
-  const EDGE_DENSITY_MIN = 0.03, EDGE_DENSITY_MAX = 1;
+  // THE LAST RENDERER (Thoth mail 11066): "an edge draws only when both ends are visible,
+  // no structural-hop exception." Every prior tier/budget/bundling mechanism (TIP 3's LOD
+  // cutoff, TIP 4's density scale, THE DRILL's cross-cluster Bezier bundling) is gone --
+  // one universal rule, straight lines, nodeVisible on both ends, same at every zoom.
   function buildEdgeLines(nodes, edgeList) {
     if (edgeLines) { scene.remove(edgeLines); edgeLines.geometry.dispose(); edgeLines.material.dispose(); edgeLines = null; }
     const byId = new Map(nodes.map((nd) => [nd.id, nd]));
     const visible = edgeList.filter((e) =>
       !hiddenEdgeClasses.has(e.edgeClass) && !hiddenEdgeTypes.has(e.type) &&
       nodeVisible(byId.get(e.source)) && nodeVisible(byId.get(e.target)));
-    edgeFadeUniforms.uDensityScale.value = Math.max(EDGE_DENSITY_MIN,
-      Math.min(EDGE_DENSITY_MAX, EDGE_DENSITY_TARGET / Math.max(1, visible.length)));
-    const positions = [], otherPositions = [], edgeColors = [];
+    const positions = new Float32Array(visible.length * 6);
+    const otherPositions = new Float32Array(visible.length * 6);
+    const edgeColors = new Float32Array(visible.length * 6);
     const ec = new THREE.Color();
-    const pushSeg = (ax, ay, bx, by) => {
-      positions.push(ax, ay, -0.1, bx, by, -0.1);
-      otherPositions.push(bx, by, -0.1, ax, ay, -0.1);
-      edgeColors.push(ec.r, ec.g, ec.b, ec.r, ec.g, ec.b);
-    };
+    let vi = 0;
     for (const e of visible) {
       const na = byId.get(e.source), nb = byId.get(e.target);
       if (!na || !nb) continue;
@@ -598,29 +561,19 @@ export async function initSpace(container) {
       // same colour across reloads without inventing new server state).
       ec.set(colorForEdgeType(e.type));
       const ax = na.x || 0, ay = na.y || 0, bx = nb.x || 0, by = nb.y || 0;
-      const ca = na.project !== "unfiled" ? centroidByProjectName.get(na.project) : null;
-      const cb = nb.project !== "unfiled" ? centroidByProjectName.get(nb.project) : null;
-      if (na.project !== nb.project && ca && cb) {
-        const mx = (ax + bx) / 2, my = (ay + by) / 2;
-        const cmx = (ca.cx + cb.cx) / 2, cmy = (ca.cy + cb.cy) / 2;
-        const ctrlX = mx + (cmx - mx) * EDGE_BUNDLE_STRENGTH;
-        const ctrlY = my + (cmy - my) * EDGE_BUNDLE_STRENGTH;
-        let px = ax, py = ay;
-        for (let s = 1; s <= EDGE_CURVE_SEGMENTS; s++) {
-          const t = s / EDGE_CURVE_SEGMENTS, it = 1 - t;
-          const qx = it * it * ax + 2 * it * t * ctrlX + t * t * bx;
-          const qy = it * it * ay + 2 * it * t * ctrlY + t * t * by;
-          pushSeg(px, py, qx, qy);
-          px = qx; py = qy;
-        }
-      } else {
-        pushSeg(ax, ay, bx, by);
-      }
+      positions[vi] = ax; positions[vi + 1] = ay; positions[vi + 2] = -0.1;
+      otherPositions[vi] = bx; otherPositions[vi + 1] = by; otherPositions[vi + 2] = -0.1;
+      vi += 3;
+      positions[vi] = bx; positions[vi + 1] = by; positions[vi + 2] = -0.1;
+      otherPositions[vi] = ax; otherPositions[vi + 1] = ay; otherPositions[vi + 2] = -0.1;
+      vi += 3;
+      edgeColors[vi - 6] = ec.r; edgeColors[vi - 5] = ec.g; edgeColors[vi - 4] = ec.b;
+      edgeColors[vi - 3] = ec.r; edgeColors[vi - 2] = ec.g; edgeColors[vi - 1] = ec.b;
     }
     const edgeGeo = new THREE.BufferGeometry();
-    edgeGeo.setAttribute("position", new THREE.Float32BufferAttribute(new Float32Array(positions), 3));
-    edgeGeo.setAttribute("otherPosition", new THREE.Float32BufferAttribute(new Float32Array(otherPositions), 3));
-    edgeGeo.setAttribute("color", new THREE.Float32BufferAttribute(new Float32Array(edgeColors), 3));
+    edgeGeo.setAttribute("position", new THREE.BufferAttribute(positions.subarray(0, vi), 3));
+    edgeGeo.setAttribute("otherPosition", new THREE.BufferAttribute(otherPositions.subarray(0, vi), 3));
+    edgeGeo.setAttribute("color", new THREE.BufferAttribute(edgeColors.subarray(0, vi), 3));
     edgeLines = new THREE.LineSegments(edgeGeo, makeEdgeFadeMaterial());
     scene.add(edgeLines);
     renderLegend(edgeList, nodes);
@@ -694,6 +647,8 @@ export async function initSpace(container) {
     disposeCurrent();
     idToNode = nodes;
     idById = new Map(nodes.map((nd) => [nd.id, nd]));
+    buildProjectObjectIndex(); // THE DRILL: project-anchor click targets, kept current
+
     const n = nodes.length;
     const geo = new THREE.CircleGeometry(1, 10);
     // this three.js build's fragment shader only multiplies by vColor (and so only shows
@@ -704,7 +659,7 @@ export async function initSpace(container) {
     geo.setAttribute("color", new THREE.Float32BufferAttribute(
       new Float32Array(geo.attributes.position.count * 3).fill(1), 3));
     const radiusAttr = new THREE.InstancedBufferAttribute(new Float32Array(Math.max(n, 1)), 1);
-    geo.setAttribute("aRadiusWorld", radiusAttr); // shared by mesh + pickMesh, same geometry instance
+    geo.setAttribute("aRadiusPx", radiusAttr); // shared by mesh + pickMesh, same geometry instance
     visibleAttr = new THREE.InstancedBufferAttribute(new Float32Array(Math.max(n, 1)).fill(1), 1);
     geo.setAttribute("aVisible", visibleAttr); // TIP 1(d)/(e): per-instance hide, updated in place by applyDim
 
@@ -725,15 +680,15 @@ export async function initSpace(container) {
     const idColor = new THREE.Color();
     for (let i = 0; i < n; i++) {
       const nd = nodes[i];
-      nd.radiusWorld = nodeRadiusWorld(nd);
-      radiusAttr.setX(i, nd.radiusWorld);
+      nd.radiusPx = nodeScreenPx(nd);
+      radiusAttr.setX(i, nd.radiusPx);
       visibleAttr.setX(i, 1);
       // "sizing more intuitive where high-degree nodes stand out without obfuscating
       // smaller nodes" — a bigger circle can still sit BEHIND a smaller one drawn later
       // in the same z-plane; give every node a tiny z bias proportional to its own radius
       // so the important (bigger) ones are always nearer the camera and never occluded.
-      // Scale stays 1 here deliberately — the shader (aRadiusWorld, clamped) owns sizing.
-      dummy.position.set(nd.x || 0, nd.y || 0, nd.radiusWorld * 0.002);
+      // Scale stays 1 here deliberately — the shader (aRadiusPx * uWorldPerPx) owns sizing.
+      dummy.position.set(nd.x || 0, nd.y || 0, nd.radiusPx * 0.002);
       dummy.scale.setScalar(1);
       dummy.updateMatrix();
       mesh.setMatrixAt(i, dummy.matrix);
@@ -767,7 +722,8 @@ export async function initSpace(container) {
     for (let i = 0; i < idToNode.length; i++) {
       const nd = idToNode[i];
       const typeHidden = hiddenNodeTypes.has(nd.type);
-      const projectHidden = hiddenProjects.size > 0 && hiddenProjects.has(nd.project);
+      const projectHidden = hiddenProjects.size > 0 && hiddenProjects.has(nd.project) &&
+        !revealedStubIds.has(nd.id);
       const focusHidden = focused && nd.id !== pathFocusId && !pathReachable.has(nd.id);
       visibleAttr.setX(i, (typeHidden || projectHidden || focusHidden) ? 0 : 1);
       color.set(typeColors.get(nd.type) || "#6e7681");
@@ -799,8 +755,19 @@ export async function initSpace(container) {
   // shape toggleEntityType already does for types).
   function setHiddenProjects(projects) {
     hiddenProjects = new Set(projects || []);
+    // THE DRILL, item 5: a fresh filter change starts from a clean reveal state -- a stub
+    // reveal was scoped to the OLD filter's own boundary, not guaranteed to still make
+    // sense against a new one.
+    revealedStubIds = new Set();
     applyDim();
     buildEdgeLines(idToNode, edges);
+    buildProjectStubs();
+    // THE LAST RENDERER (Thoth mail 11066, measured leak): "project filter hides points,
+    // edges and labels of hidden projects completely." applyDim/buildEdgeLines already gate
+    // points/edges via nodeVisible; labels are a separate pool (pickLabels) that needs its
+    // own re-pick to drop a just-hidden project's own labels immediately, not on the next
+    // debounced pan/zoom.
+    scheduleLabelPick();
   }
 
   async function loadTypeColors() {
@@ -827,11 +794,6 @@ export async function initSpace(container) {
     camera.position.y = (minY + maxY) / 2;
     const span = Math.max(maxX - minX, maxY - minY, 0);
     viewSize = Math.max(30, span * 1.1 + 40);
-    // TIP 3: this IS the fit-time scale zoomLOD's own thresholds are fractions of -- captured
-    // here, not just at initial load, so re-fitting (the Fit button, a fresh focus's own
-    // camera fit does NOT touch this) keeps LOD tiers anchored to what "the whole graph"
-    // actually means right now.
-    fitViewSize = viewSize;
     // the wheel clamp's own bounds (Thoth's fix, mail 10581) — derived from THIS fit's real
     // span, not a guess: a floor small enough to inspect one dense cluster, a ceiling about
     // 2x the whole fitted graph so "zoom out" can't run away past anything meaningful.
@@ -842,238 +804,16 @@ export async function initSpace(container) {
     markDirty();
   }
 
-  // ---- TIP 4: LABEL-ONLY TIERING + the cross-cluster bundling index -----------------------
-  // (operator ruling "DENSITY NOT DISCS", Thoth mail 11011, off Khnum's tip 2i/2j wire
-  // aggregates -- retires TIP 3/3b's own glyph discs wholesale). Built once per snapshot
-  // load (and again on a WebGL context restore for the GPU-side pieces) -- see the
-  // projectAggregates/typeAggregates/clusterEdges declaration above for why these don't
-  // track live deltas.
-  //
-  // "far = project names at centroids, mid = plus the dominant type per cluster, near =
-  // object titles" -- one label PER PROJECT at far (name/aggregate.count), one MORE label
-  // per project at mid for that project's single highest-count type (not all (project,type)
-  // pairs the way TIP 3's own type glyphs did -- "the dominant type," singular). Unfiled is
-  // excluded from both, same reasoning TIP 3b flaw #4 established for its old glyph: not a
-  // project a reader chose to look at; its own connected members still read through the
-  // at-fit halo instead.
-  const TIER_LABEL_W = 130, TIER_LABEL_H = 22, TIER_LABEL_GAP = 4;
-  let centroidByProjectName = new Map(); // project name -> its own project_aggregates row
-  function buildCentroidIndex() {
-    centroidByProjectName = new Map();
-    for (const agg of projectAggregates) {
-      const name = projectNames[agg.project] || "unfiled";
-      if (name !== "unfiled") centroidByProjectName.set(name, agg);
-    }
-  }
-  function dominantTypePerProject() {
-    const best = new Map(); // project code -> its own highest-count type_aggregates row
-    for (const agg of typeAggregates) {
-      const cur = best.get(agg.project);
-      if (!cur || agg.count > cur.count) best.set(agg.project, agg);
-    }
-    return best;
-  }
-  let projectLabelEntries = [], typeLabelEntries = [];
-  function disposeTierLabels() {
-    for (const e of [...projectLabelEntries, ...typeLabelEntries]) e.div.remove();
-    projectLabelEntries = []; typeLabelEntries = [];
-  }
-  function buildTierLabels() {
-    disposeTierLabels();
-    buildCentroidIndex();
-    const dominant = dominantTypePerProject();
-    for (const agg of projectAggregates) {
-      const name = projectNames[agg.project] || "unfiled";
-      if (name === "unfiled") continue;
-      const div = document.createElement("div");
-      div.className = "lod-glyph-label";
-      div.textContent = `${name} (${agg.count})`;
-      labelsEl.appendChild(div);
-      projectLabelEntries.push({ div, x: agg.cx, y: agg.cy, count: agg.count });
-      const dom = dominant.get(agg.project);
-      if (!dom) continue;
-      const typeName = typeNames[dom.type] || "?";
-      const tdiv = document.createElement("div");
-      tdiv.className = "lod-glyph-label";
-      tdiv.textContent = `${typeName} (${dom.count})`;
-      labelsEl.appendChild(tdiv);
-      typeLabelEntries.push({ div: tdiv, x: dom.cx, y: dom.cy, count: dom.count });
-    }
-  }
-  // TIP 3b flaw #1's own de-overlap, carried forward: screen-space collision, largest count
-  // first, colliding labels hidden until zoomed apart. Project labels place first (they're
-  // the coarser, always-more-important read at either tier they appear in), then type labels
-  // layer in against the SAME placed-box list, so the two families never collide with each
-  // other either.
-  const _tierV = new THREE.Vector3();
-  const _tierPlaced = [];
-  function tierLabelOverlaps(x, y) {
-    const x0 = x - TIER_LABEL_W / 2, x1 = x + TIER_LABEL_W / 2, y0 = y - TIER_LABEL_H, y1 = y;
-    for (const b of _tierPlaced) {
-      if (x0 < b[2] + TIER_LABEL_GAP && x1 > b[0] - TIER_LABEL_GAP &&
-        y0 < b[3] + TIER_LABEL_GAP && y1 > b[1] - TIER_LABEL_GAP) return true;
-    }
-    return false;
-  }
-  function placeTierLabels(entries, show) {
-    if (!show) { entries.forEach((e) => { e.div.hidden = true; }); return; }
-    const order = entries.map((_, i) => i).sort((a, b) => entries[b].count - entries[a].count);
-    for (const i of order) {
-      const e = entries[i];
-      _tierV.set(e.x, e.y, 0).project(camera);
-      const x = (_tierV.x * 0.5 + 0.5) * wrap.clientWidth;
-      const y = (-_tierV.y * 0.5 + 0.5) * wrap.clientHeight;
-      if (tierLabelOverlaps(x, y)) { e.div.hidden = true; continue; }
-      e.div.hidden = false;
-      e.div.style.left = `${x}px`;
-      e.div.style.top = `${y}px`;
-      _tierPlaced.push([x - TIER_LABEL_W / 2, y - TIER_LABEL_H, x + TIER_LABEL_W / 2, y]);
-    }
-  }
-  function positionTierLabels(tier) {
-    _tierPlaced.length = 0;
-    placeTierLabels(projectLabelEntries, tier === "far" || tier === "mid");
-    placeTierLabels(typeLabelEntries, tier === "mid");
-  }
-
-  // TIP 3, CLUSTER EDGES (Khnum tip 2j): one line per (project pair, link class) at the far
-  // tier, between the two projects' own aggregate centroids -- stands in for the real
-  // per-object edges the edge budget drops entirely at that scale. LineBasicMaterial has no
-  // per-vertex alpha without a custom shader, so edge WEIGHT is read off colour brightness
-  // (mixed toward white as count grows) instead of line opacity -- a deliberate
-  // simplification, noted rather than silently approximated.
-  let clusterEdgeLines = null;
-  function buildClusterEdgeLines() {
-    if (clusterEdgeLines) {
-      scene.remove(clusterEdgeLines);
-      clusterEdgeLines.geometry.dispose();
-      clusterEdgeLines.material.dispose();
-      clusterEdgeLines = null;
-    }
-    const centroidByProject = new Map(projectAggregates.map((a) => [a.project, a]));
-    const pos = [], col = [];
-    const base = new THREE.Color(), c = new THREE.Color();
-    for (const ce of clusterEdges) {
-      const a = centroidByProject.get(ce.a), b = centroidByProject.get(ce.b);
-      if (!a || !b) continue;
-      base.set(ce.class === "structural" ? "#6e7681" : "#58a6ff");
-      const weight = Math.min(1, Math.log2(ce.count + 1) / 8);
-      c.copy(base).lerp(new THREE.Color(0xffffff), weight * 0.6);
-      pos.push(a.cx, a.cy, -0.02, b.cx, b.cy, -0.02);
-      col.push(c.r, c.g, c.b, c.r, c.g, c.b);
-    }
-    if (!pos.length) return;
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute("position", new THREE.Float32BufferAttribute(new Float32Array(pos), 3));
-    geo.setAttribute("color", new THREE.Float32BufferAttribute(new Float32Array(col), 3));
-    clusterEdgeLines = new THREE.LineSegments(
-      geo, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.5 }));
-    clusterEdgeLines.visible = zoomLOD() === "far";
-    scene.add(clusterEdgeLines);
-  }
-
-  // TIP 4 (operator ruling "DENSITY NOT DISCS", mail 11011): "optionally a thin outline ring
-  // per cluster at far, no fill" -- a real spatial boundary (project_aggregates' own radius,
-  // the max member distance from its centroid), not the old glyph's count-encoded icon size.
-  // Unfiled excluded, same reasoning as the labels above.
-  const CLUSTER_RING_SEGMENTS = 48, CLUSTER_RING_OPACITY = 0.16;
-  let clusterRingLines = null;
-  function buildClusterRings() {
-    if (clusterRingLines) {
-      scene.remove(clusterRingLines);
-      clusterRingLines.geometry.dispose();
-      clusterRingLines.material.dispose();
-      clusterRingLines = null;
-    }
-    const pos = [];
-    for (const agg of projectAggregates) {
-      if ((projectNames[agg.project] || "unfiled") === "unfiled") continue;
-      for (let s = 0; s < CLUSTER_RING_SEGMENTS; s++) {
-        const a0 = (s / CLUSTER_RING_SEGMENTS) * Math.PI * 2;
-        const a1 = ((s + 1) / CLUSTER_RING_SEGMENTS) * Math.PI * 2;
-        pos.push(
-          agg.cx + Math.cos(a0) * agg.radius, agg.cy + Math.sin(a0) * agg.radius, -0.03,
-          agg.cx + Math.cos(a1) * agg.radius, agg.cy + Math.sin(a1) * agg.radius, -0.03);
-      }
-    }
-    if (!pos.length) return;
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute("position", new THREE.Float32BufferAttribute(new Float32Array(pos), 3));
-    clusterRingLines = new THREE.LineSegments(geo, new THREE.LineBasicMaterial({
-      color: 0x8ab4f8, transparent: true, opacity: CLUSTER_RING_OPACITY }));
-    clusterRingLines.visible = zoomLOD() === "far";
-    scene.add(clusterRingLines);
-  }
-
-  // TIP 3, THE HALO (Thoth mail 10930): "drawn as faint texture at fit so the connected
-  // third reads first" -- a soft, additive-blended wash sits behind every node that has AT
-  // LEAST ONE real edge (nd.degree > 0), visible only at the whole-graph fit view itself
-  // (not merely the "far" tier's wider band -- fit specifically) and only while nothing is
-  // focused. So before a reader zooms or clicks anything, which portion of the graph is
-  // actually connected already reads visually, ahead of any individual label or glyph.
-  const HALO_RADIUS_FACTOR = 6; // a fixed multiple of the node's own radius, not literal size
-  const HALO_OPACITY = 0.05;
-  let haloMesh = null;
-  function buildHalo() {
-    if (haloMesh) { scene.remove(haloMesh); haloMesh.geometry.dispose(); haloMesh.material.dispose(); haloMesh = null; }
-    const connected = idToNode.filter((nd) => (nd.degree || 0) > 0);
-    if (!connected.length) return;
-    const geo = new THREE.CircleGeometry(1, 12);
-    const mat = new THREE.MeshBasicMaterial({
-      color: 0x58a6ff, transparent: true, opacity: HALO_OPACITY,
-      depthWrite: false, blending: THREE.AdditiveBlending,
-    });
-    haloMesh = new THREE.InstancedMesh(geo, mat, connected.length);
-    const dummy = new THREE.Object3D();
-    connected.forEach((nd, i) => {
-      dummy.position.set(nd.x || 0, nd.y || 0, -0.15);
-      dummy.scale.setScalar((nd.radiusWorld || 5) * HALO_RADIUS_FACTOR);
-      dummy.updateMatrix();
-      haloMesh.setMatrixAt(i, dummy.matrix);
-    });
-    haloMesh.instanceMatrix.needsUpdate = true;
-    haloMesh.visible = false;
-    scene.add(haloMesh);
-  }
-  function isAtFit() {
-    if (pathFocusId) return false;
-    const fitWpp = fitViewSize / wrap.clientHeight;
-    return worldPerPx() >= fitWpp * 0.98;
-  }
-  function updateHaloVisibility() {
-    if (haloMesh) haloMesh.visible = isAtFit();
-  }
-
-  // TIP 4 (operator ruling "DENSITY NOT DISCS", mail 11011): objects and edges no longer
-  // change WHAT is drawn by tier (mesh/pickMesh stay visible always, buildEdgeLines no
-  // longer takes a tier-dependent budget) -- the only things left that still toggle on a
-  // zoom step are the far-only cluster overlay (cluster_edges + the optional ring) and the
-  // halo's own at-fit visibility, both trivial boolean writes. Per-frame DOM label
-  // repositioning (a pan moves label screen positions) runs from positionLabels(), called
-  // every render, not here.
-  function refreshLOD() {
-    const tier = zoomLOD();
-    if (clusterEdgeLines) clusterEdgeLines.visible = tier === "far";
-    if (clusterRingLines) clusterRingLines.visible = tier === "far";
-    updateHaloVisibility();
-  }
-
+  // ---- THE LAST RENDERER retired the whole LOD/tier/cluster/halo machinery this comment
+  // block used to introduce (operator ruling d7d55257, Thoth mail 11066: "kill LOD
+  // entirely -- remove zoomLOD, label tiers, cluster_edges at far, cluster rings, the halo
+  // texture, per-tier alpha, and every far/mid/near branch; delete their tests"). See
+  // positionLabels/pickLabels below for the one label rule that replaces it (viewport
+  // top-N by degree, de-overlapped, at every zoom, no separate project-label pass).
   setStatus("loading the whole graph…");
-  let { nodes, edges, projectAggregates: pAgg, typeAggregates: tAgg, clusterEdges: cEdges,
-    projectNames: pNames, typeNames: tNames } = await fetchStreamSnapshot();
-  projectAggregates = pAgg; typeAggregates = tAgg; clusterEdges = cEdges;
-  projectNames = pNames; typeNames = tNames;
-  // buildScene (below) calls buildEdgeLines, which needs centroidByProjectName for
-  // cross-cluster bundling -- populated ahead of the DOM-label build (buildTierLabels also
-  // rebuilds this index, redundantly but harmlessly, whenever it's called after a reload).
-  buildCentroidIndex();
+  let { nodes, edges } = await fetchStreamSnapshot();
   buildScene(nodes, edges);
   fitToNodes(nodes);
-  buildTierLabels();
-  buildClusterEdgeLines();
-  buildClusterRings();
-  buildHalo();
-  refreshLOD();
   setStatus(`${nodes.length} objects, ${edges.length} edges`);
   levelBadge.textContent = "whole graph";
 
@@ -1092,11 +832,6 @@ export async function initSpace(container) {
       nodes = Array.from(nodesById.values());
       buildScene(nodes, edges);
       if (pathFocusId || selectedId) applyDim();
-      // a delta can move/retire a node the halo's own instance buffer was built against
-      // (TIP 3) -- rebuild it off the fresh radiusWorld/positions buildScene just set;
-      // aggregates themselves stay the accepted-stale snapshot (see their declaration above).
-      buildHalo();
-      refreshLOD();
       setStatus(`${nodes.length} objects, ${edges.length} edges (live)`);
     }, 250);
   }
@@ -1196,6 +931,7 @@ export async function initSpace(container) {
       if (id === focusId || hop === 0) continue;
       (byRank.get(hop) || (byRank.set(hop, []), byRank.get(hop))).push(id);
     }
+    const seed = new Map([[focusId, { x: cx, y: cy }]]);
     for (const [signedHop, ids] of byRank) {
       const x = cx + signedHop * colW;
       ids.sort(); // deterministic, not otherwise meaningful
@@ -1203,11 +939,75 @@ export async function initSpace(container) {
         const nd = idx.get(id);
         if (!nd) return;
         egoSaved.set(id, { x: nd.x, y: nd.y });
-        nd.x = x;
-        nd.y = cy + (i - (ids.length - 1) / 2) * rowH;
+        seed.set(id, { x, y: cy + (i - (ids.length - 1) / 2) * rowH });
       });
     }
+    // THE DRILL, item 6: relax the rank layout's own output -- a wide rank (many siblings
+    // at the same hop) used to stack in one straight column, reading as a solid bar/disc
+    // once density-not-discs made every one of them a real point; the physics step spreads
+    // them apart while real edges among the reachable set still pull related nodes toward
+    // each other.
+    const springs = [];
+    for (const e of edges) {
+      if (seed.has(e.source) && seed.has(e.target)) springs.push([e.source, e.target]);
+    }
+    const relaxed = relaxPositions(seed, springs, focusId);
+    for (const [id, p] of relaxed) {
+      if (id === focusId) continue;
+      const nd = idx.get(id);
+      if (nd) { nd.x = p.x; nd.y = p.y; }
+    }
   }
+  // THE DRILL (ruling d7d55257, Thoth mail 11048, item 6): "physics on the visible set
+  // only: a small force step (repulsion + springs, a few hundred iterations, seeded) over
+  // the expanded nodes, nothing else moves." `seed` is a Map<id,{x,y}> of STARTING
+  // positions (the rank layout's own output, or a simple radial scatter for the drill) --
+  // a good seed matters far more than iteration count for this to converge quickly and
+  // legibly; `edges` is a list of [aId, bId] pairs to spring together (real reachable-set
+  // edges for an ego tree, synthetic hub-to-child pairs for a drill's star topology).
+  // `fixedId` (usually the focus/hub) never moves. O(n^2) repulsion is fine at this scale
+  // -- the whole point of THE DRILL and the ego cap is that n never exceeds MAX_EGO_NODES.
+  const EGO_FORCE_ITERATIONS = 180;
+  const EGO_REPULSION = 3200;
+  const EGO_SPRING = 0.02;
+  function relaxPositions(seed, springs, fixedId) {
+    const ids = [...seed.keys()];
+    if (ids.length < 2) return seed;
+    const pos = new Map(ids.map((id) => [id, { x: seed.get(id).x, y: seed.get(id).y }]));
+    for (let iter = 0; iter < EGO_FORCE_ITERATIONS; iter++) {
+      const force = new Map(ids.map((id) => [id, { x: 0, y: 0 }]));
+      for (let i = 0; i < ids.length; i++) {
+        const a = pos.get(ids[i]);
+        for (let j = i + 1; j < ids.length; j++) {
+          const b = pos.get(ids[j]);
+          let dx = a.x - b.x, dy = a.y - b.y;
+          let d2 = dx * dx + dy * dy;
+          if (d2 < 1) d2 = 1;
+          const d = Math.sqrt(d2);
+          const f = EGO_REPULSION / d2;
+          const fx = (dx / d) * f, fy = (dy / d) * f;
+          const fa = force.get(ids[i]), fb = force.get(ids[j]);
+          fa.x += fx; fa.y += fy;
+          fb.x -= fx; fb.y -= fy;
+        }
+      }
+      for (const [aId, bId] of springs) {
+        const a = pos.get(aId), b = pos.get(bId);
+        if (!a || !b) continue;
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const fa = force.get(aId), fb = force.get(bId);
+        if (fa) { fa.x += dx * EGO_SPRING; fa.y += dy * EGO_SPRING; }
+        if (fb) { fb.x -= dx * EGO_SPRING; fb.y -= dy * EGO_SPRING; }
+      }
+      for (const id of ids) {
+        if (id === fixedId) continue;
+        const p = pos.get(id), f = force.get(id);
+        p.x += f.x; p.y += f.y;
+      }
+    }
+    return pos;
+  }
+
   // pushes the (few) moved nodes' new positions into the GPU buffers directly — never a
   // full buildScene rebuild, so this stays well inside the 100ms budget below regardless of
   // total graph size (cost is O(moved), not O(49k)).
@@ -1218,7 +1018,7 @@ export async function initSpace(container) {
     for (let i = 0; i < idToNode.length; i++) {
       const nd = idToNode[i];
       if (!movedIds.has(nd.id)) continue;
-      dummy.position.set(nd.x || 0, nd.y || 0, (nd.radiusWorld || 0) * 0.002);
+      dummy.position.set(nd.x || 0, nd.y || 0, (nd.radiusPx || 0) * 0.002);
       dummy.scale.setScalar(1);
       dummy.updateMatrix();
       mesh.setMatrixAt(i, dummy.matrix);
@@ -1228,12 +1028,316 @@ export async function initSpace(container) {
     if (touched) { mesh.instanceMatrix.needsUpdate = true; pickMesh.instanceMatrix.needsUpdate = true; }
   }
 
+  // ---- THE DRILL (operator ruling d7d55257, Thoth mail 11048) ----------------------------
+  // A CONTAINER is any object whose own structural (containment/membership) degree exceeds
+  // MAX_EGO_NODES -- a project, an agent with a huge working set, any hub the ordinary ego
+  // walk could never show in full. Until Khnum's own `container` flag lands in
+  // link_type_class, "structural" stands in for it (his own note, same mail) -- the exact
+  // set every other container-shaped check in this file already uses. Focusing a container
+  // is a DRILL, not the ordinary ego tree: the hub plus one count node per member type,
+  // sorted by count, real members hidden until a reader clicks a type open. Acceptance:
+  // "focusing repo:osiris opens under 30 nodes" -- confirmed live, see the tip's own commit.
+  function containerMembersByType(id) {
+    const byType = new Map(); // type -> nd[]
+    for (const e of edges) {
+      if (e.edgeClass !== "structural") continue;
+      const other = e.source === id ? e.target : e.target === id ? e.source : null;
+      if (other == null) continue;
+      const nd = idById.get(other);
+      if (!nd) continue;
+      (byType.get(nd.type) || (byType.set(nd.type, []), byType.get(nd.type))).push(nd);
+    }
+    return byType;
+  }
+  function isContainerFocus(id) {
+    let n = 0;
+    for (const e of edges) {
+      if (e.edgeClass !== "structural") continue;
+      if (e.source === id || e.target === id) { n++; if (n > MAX_EGO_NODES) return true; }
+    }
+    return false;
+  }
+
+  let drillContainerId = null;
+  let drillMembersByType = null;
+  let drillExpandedType = null; // the one type currently paged open, or null
+  let drillPageCount = 1; // pages of DRILL_PAGE_SIZE shown for drillExpandedType
+  const DRILL_PAGE_SIZE = 50;
+  let drillNodeEntries = []; // [{key, kind:'type'|'more', type, count, x, y, div}]
+  function disposeDrillDivs() {
+    for (const e of drillNodeEntries) e.div.remove();
+    drillNodeEntries = [];
+  }
+  function clearDrillState() {
+    disposeDrillDivs();
+    drillContainerId = null;
+    drillMembersByType = null;
+    drillExpandedType = null;
+    drillPageCount = 1;
+  }
+  function buildDrillDivs() {
+    for (const entry of drillNodeEntries) {
+      const div = document.createElement("div");
+      div.className = "lod-glyph-label ego-drill-label";
+      div.style.cursor = "pointer";
+      div.textContent = entry.kind === "more"
+        ? `+${entry.count} more ${entry.type}`
+        : `${entry.type} ${entry.count}`;
+      div.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        if (entry.kind === "more") { drillPageCount++; } else { drillExpandedType = entry.type; drillPageCount = 1; }
+        renderContainerDrill(drillContainerId, { skipStackPush: true });
+      });
+      labelsEl.appendChild(div);
+      entry.div = div;
+    }
+  }
+  function positionDrillDivs() {
+    for (const entry of drillNodeEntries) {
+      if (!entry.div) continue;
+      _tierV.set(entry.x, entry.y, 0).project(camera);
+      entry.div.style.left = `${(_tierV.x * 0.5 + 0.5) * wrap.clientWidth}px`;
+      entry.div.style.top = `${(-_tierV.y * 0.5 + 0.5) * wrap.clientHeight}px`;
+    }
+  }
+  // "top 50 by degree then recency" -- recency isn't on the wire (fetchStreamSnapshot's own
+  // node shape carries no timestamp), so degree desc with a stable id tiebreak stands in
+  // until a real recency field exists to sort by; noted rather than faked.
+  async function renderContainerDrill(id, opts) {
+    const t0 = performance.now();
+    const options = opts || {};
+    const restored = egoSaved ? new Set(egoSaved.keys()) : null;
+    restoreEgoLayout();
+    if (restored) syncMovedInstancePositions(restored);
+    disposeProjectAnchors(); // a drill replaces the normal focus view entirely
+    clearDrillState();
+    selectedId = id;
+    pathFocusId = id;
+    drillContainerId = id;
+    drillMembersByType = containerMembersByType(id);
+    if (!options.skipStackPush) pushFocusStack(id);
+    if (onFocus) onFocus(id);
+
+    const hub = idById.get(id);
+    const cx = hub.x || 0, cy = hub.y || 0;
+    const wpp = maxViewSize / wrap.clientHeight;
+    const ringR = EGO_COL_SPACING_PX * wpp;
+
+    pathReachable = new Set([id]);
+    egoSaved = new Map();
+    const seed = new Map([[id, { x: cx, y: cy }]]);
+    const springs = [];
+    const typeEntries = [...drillMembersByType.entries()].sort((a, b) => b[1].length - a[1].length);
+    const angleStep = typeEntries.length ? (2 * Math.PI / typeEntries.length) : 0;
+
+    typeEntries.forEach(([type, members], i) => {
+      const angle = i * angleStep;
+      const tx = cx + Math.cos(angle) * ringR, ty = cy + Math.sin(angle) * ringR;
+      if (type === drillExpandedType) {
+        const ranked = members.slice().sort((a, b) =>
+          (b.degree || 0) - (a.degree || 0) || (a.id < b.id ? -1 : 1));
+        const budget = MAX_EGO_NODES - pathReachable.size;
+        const take = Math.min(ranked.length, DRILL_PAGE_SIZE * drillPageCount, Math.max(0, budget));
+        for (let k = 0; k < take; k++) {
+          const nd = ranked[k];
+          pathReachable.add(nd.id);
+          egoSaved.set(nd.id, { x: nd.x, y: nd.y });
+          const a2 = angle + (k - (take - 1) / 2) * 0.12;
+          seed.set(nd.id, { x: cx + Math.cos(a2) * ringR * 1.8, y: cy + Math.sin(a2) * ringR * 1.8 });
+          springs.push([id, nd.id]);
+        }
+        if (ranked.length > take) {
+          const key = `more:${type}`;
+          seed.set(key, { x: tx, y: ty });
+          springs.push([id, key]);
+          drillNodeEntries.push({ key, kind: "more", type, count: ranked.length - take, x: tx, y: ty, div: null });
+        }
+      } else {
+        const key = `type:${type}`;
+        seed.set(key, { x: tx, y: ty });
+        springs.push([id, key]);
+        drillNodeEntries.push({ key, kind: "type", type, count: members.length, x: tx, y: ty, div: null });
+      }
+    });
+
+    const relaxed = relaxPositions(seed, springs, id);
+    for (const [key, p] of relaxed) {
+      if (key === id) continue;
+      const nd = idById.get(key);
+      if (nd) { nd.x = p.x; nd.y = p.y; continue; }
+      const entry = drillNodeEntries.find((e) => e.key === key);
+      if (entry) { entry.x = p.x; entry.y = p.y; }
+    }
+    syncMovedInstancePositions(new Set(egoSaved.keys()));
+    buildDrillDivs();
+
+    let minX = cx, maxX = cx, minY = cy, maxY = cy;
+    for (const rid of pathReachable) {
+      const nd = idById.get(rid);
+      if (!nd) continue;
+      minX = Math.min(minX, nd.x); maxX = Math.max(maxX, nd.x);
+      minY = Math.min(minY, nd.y); maxY = Math.max(maxY, nd.y);
+    }
+    for (const e of drillNodeEntries) {
+      minX = Math.min(minX, e.x); maxX = Math.max(maxX, e.x);
+      minY = Math.min(minY, e.y); maxY = Math.max(maxY, e.y);
+    }
+    camera.position.x = (minX + maxX) / 2;
+    camera.position.y = (minY + maxY) / 2;
+    const span = Math.max(maxX - minX, maxY - minY, 0);
+    const EGO_FIT_MIN_VIEWSIZE = 400;
+    viewSize = Math.max(EGO_FIT_MIN_VIEWSIZE, Math.min(maxViewSize, span * 1.6 + 40));
+    updateFrustum();
+    rescaleForZoom();
+
+    applyDim();
+    buildEdgeLines(idToNode, edges);
+    updatePathEdges();
+    setStatus(`container: ${drillMembersByType.size} member types, ` +
+      `${pathReachable.size - 1} shown`);
+    scheduleLabelPick();
+    markDirty();
+    if (window.__spaceDebugTiming) console.debug("renderContainerDrill sync ms:", performance.now() - t0);
+    await inspect(id);
+  }
+
+  // THE DRILL, items 2/4: "the walk stops at a container... containers passed through are
+  // single anchor nodes, so a thread-to-decision walk across two projects reads as two
+  // anchors and the path." The ordinary ego walk (bfsHops over outAdjPath/inAdjPath) only
+  // ever follows PATH_EDGE_TYPES, never structural/container edges, so it already never
+  // walks INTO a container -- nothing to enforce there. What's new: when the reachable set
+  // spans more than one real project, each distinct project gets one small anchor label
+  // (not per member) so a cross-project path still reads as "which project is this part of"
+  // at a glance; clicking an anchor drills into that project's own container view.
+  let projectAnchorEntries = [];
+  function disposeProjectAnchors() {
+    for (const e of projectAnchorEntries) e.div.remove();
+    projectAnchorEntries = [];
+  }
+  let projectObjectByName = new Map(); // "repo:foo" -> that SoftwareProject object's own id
+  function buildProjectObjectIndex() {
+    projectObjectByName = new Map();
+    for (const nd of idToNode) {
+      if (nd.type === "SoftwareProject" && nd.label) projectObjectByName.set(`repo:${nd.label}`, nd.id);
+    }
+  }
+  function buildProjectAnchors(focusId) {
+    disposeProjectAnchors();
+    const byProject = new Map(); // project name -> {sumX,sumY,count}
+    for (const rid of pathReachable) {
+      const nd = idById.get(rid);
+      if (!nd || !nd.project || nd.project === "unfiled") continue;
+      const agg = byProject.get(nd.project) || { sumX: 0, sumY: 0, count: 0 };
+      agg.sumX += nd.x || 0; agg.sumY += nd.y || 0; agg.count++;
+      byProject.set(nd.project, agg);
+    }
+    if (byProject.size < 2) return; // one project (or none) -- nothing to distinguish
+    for (const [proj, agg] of byProject) {
+      const x = agg.sumX / agg.count, y = agg.sumY / agg.count;
+      const targetId = projectObjectByName.get(proj);
+      const div = document.createElement("div");
+      div.className = "lod-glyph-label ego-drill-label";
+      div.style.cursor = targetId ? "pointer" : "default";
+      div.textContent = `${proj} (${agg.count})`;
+      if (targetId) {
+        div.addEventListener("click", (ev) => { ev.stopPropagation(); focusObject(targetId); });
+      }
+      labelsEl.appendChild(div);
+      projectAnchorEntries.push({ x, y, div });
+    }
+  }
+  function positionProjectAnchors() {
+    for (const e of projectAnchorEntries) {
+      _tierV.set(e.x, e.y, 0).project(camera);
+      e.div.style.left = `${(_tierV.x * 0.5 + 0.5) * wrap.clientWidth}px`;
+      e.div.style.top = `${(-_tierV.y * 0.5 + 0.5) * wrap.clientHeight}px`;
+    }
+  }
+
+  // THE DRILL, item 5 (Thoth mail 11048): "under a project filter a visible node with
+  // hidden cross-project links shows a small counted stub; clicking the stub reveals that
+  // project's part of the path without unhiding the project." Computed once per filter
+  // change (setHiddenProjects calls buildProjectStubs), never per-frame -- a full edge
+  // scan is a rare, deliberate act's cost, not a render one.
+  let projectStubEntries = []; // [{nodeId, hiddenProject, count, div}]
+  function disposeProjectStubs() {
+    for (const e of projectStubEntries) e.div.remove();
+    projectStubEntries = [];
+  }
+  function buildProjectStubDivs() {
+    for (const entry of projectStubEntries) {
+      const div = document.createElement("div");
+      div.className = "lod-glyph-label ego-drill-label";
+      div.style.cursor = "pointer";
+      div.textContent = `+${entry.count} in ${entry.hiddenProject}`;
+      div.addEventListener("click", (ev) => { ev.stopPropagation(); revealProjectStub(entry); });
+      labelsEl.appendChild(div);
+      entry.div = div;
+    }
+  }
+  function buildProjectStubs() {
+    disposeProjectStubs();
+    if (hiddenProjects.size === 0) return;
+    const stubs = new Map(); // nodeId -> Map<hiddenProjectName, count>
+    for (const e of edges) {
+      const na = idById.get(e.source), nb = idById.get(e.target);
+      if (!na || !nb) continue;
+      const aHidden = hiddenProjects.has(na.project), bHidden = hiddenProjects.has(nb.project);
+      if (aHidden === bHidden) continue; // both or neither hidden -- not a filter boundary
+      const visible = aHidden ? nb : na, hiddenNd = aHidden ? na : nb;
+      if (!nodeVisible(visible)) continue; // the visible side must actually be shown itself
+      const byProj = stubs.get(visible.id) || new Map();
+      byProj.set(hiddenNd.project, (byProj.get(hiddenNd.project) || 0) + 1);
+      stubs.set(visible.id, byProj);
+    }
+    for (const [nodeId, byProj] of stubs) {
+      for (const [hiddenProject, count] of byProj) {
+        projectStubEntries.push({ nodeId, hiddenProject, count, div: null });
+      }
+    }
+    buildProjectStubDivs();
+  }
+  function positionProjectStubs() {
+    for (const entry of projectStubEntries) {
+      if (!entry.div) continue;
+      const nd = idById.get(entry.nodeId);
+      entry.div.hidden = !nd || !nodeVisible(nd);
+      if (entry.div.hidden) continue;
+      _tierV.set(nd.x || 0, nd.y || 0, 0).project(camera);
+      entry.div.style.left = `${(_tierV.x * 0.5 + 0.5) * wrap.clientWidth}px`;
+      entry.div.style.top = `${(-_tierV.y * 0.5 + 0.5) * wrap.clientHeight}px`;
+    }
+  }
+  // reveals just the one hidden-project neighbourhood a stub named -- adds those specific
+  // ids to revealedStubIds (nodeVisible/applyDim's own override), never touches
+  // hiddenProjects itself, so the rest of that project stays hidden.
+  function revealProjectStub(entry) {
+    const anchor = idById.get(entry.nodeId);
+    if (!anchor) return;
+    for (const e of edges) {
+      const na = idById.get(e.source), nb = idById.get(e.target);
+      if (!na || !nb) continue;
+      if (na.id === entry.nodeId && nb.project === entry.hiddenProject) revealedStubIds.add(nb.id);
+      if (nb.id === entry.nodeId && na.project === entry.hiddenProject) revealedStubIds.add(na.id);
+    }
+    applyDim();
+    buildEdgeLines(idToNode, edges);
+    buildProjectStubs(); // this stub's own count may now be satisfied and disappear
+    markDirty();
+  }
+
   // a second LineSegments drawn OVER the dim base edges: the reachable PATH edges (bright,
   // WITH DIRECTION — a vertex-colour gradient, brighter at the source/dependent end, dimmer
-  // at the target/depended-on end, per Osiris's own from_id->to_id convention) plus, per
-  // ruling c5953bb1, "the focused object's structural edges draw on focus only" — the
-  // focused node's own containment (which project, which agent) becomes visible exactly
-  // because it's focused, even though part A hides structural edges at rest.
+  // at the target/depended-on end, per Osiris's own from_id->to_id convention). Ruling
+  // c5953bb1's own "the focused object's structural edges draw on focus only" carve-out is
+  // GONE (THE LAST RENDERER, Thoth mail 11066: "an edge draws only when both ends are
+  // visible, no structural-hop exception") -- it used to draw every structural edge
+  // touching the focus regardless of whether the other end was ever positioned or visible,
+  // which for a container-scale focus (repo:osiris, ~20k structural neighbours) meant
+  // thousands of lines fanning to scattered original positions, "a solid disc of edges."
+  // A structural edge among the reachable set (e.g. a drill's own hub-to-member link) still
+  // draws through the ordinary base layer (buildEdgeLines) if the legend's own structural
+  // checkbox is opted back in -- no separate exception needed or wanted any more.
   let pathHighlightEdges = null;
   const PATH_EDGE_BRIGHT = new THREE.Color(0x58a6ff);
   const PATH_EDGE_DIM = new THREE.Color(0x58a6ff).multiplyScalar(0.35);
@@ -1249,8 +1353,7 @@ export async function initSpace(container) {
     const pos = [], col = [];
     for (const e of edges) {
       const onPath = PATH_EDGE_TYPES.has(e.type) && pathReachable.has(e.source) && pathReachable.has(e.target);
-      const structuralOfFocus = e.edgeClass === "structural" && (e.source === pathFocusId || e.target === pathFocusId);
-      if (!onPath && !structuralOfFocus) continue;
+      if (!onPath) continue;
       const a = idById.get(e.source), b = idById.get(e.target);
       if (!a || !b) continue;
       pos.push(a.x || 0, a.y || 0, -0.05, b.x || 0, b.y || 0, -0.05);
@@ -1294,22 +1397,17 @@ export async function initSpace(container) {
     scheduleLabelPick();
   });
 
-  // O(1) regardless of node count now — sizing lives in the shader (aRadiusWorld clamped by
-  // a uniform min/max, see makeInstancedCircleMaterial), so a zoom step only ever writes
-  // four floats (the draw mesh's and pick mesh's own min/max) instead of rewriting 49,019
-  // instance matrices.
+  // O(1) regardless of node count now — sizing lives in the shader (aRadiusPx * a live
+  // uWorldPerPx uniform, see makeInstancedCircleMaterial), so a zoom step only ever writes
+  // one float per material (the draw mesh's and pick mesh's own uWorldPerPx) instead of
+  // rewriting 49,019 instance matrices.
   function rescaleForZoom() {
     const wpp = worldPerPx();
-    const lo = NODE_MIN_SCREEN_PX * wpp, hi = NODE_MAX_SCREEN_PX * wpp;
-    if (meshUniforms) { meshUniforms.uMinRadiusWorld.value = lo; meshUniforms.uMaxRadiusWorld.value = hi; }
-    if (pickUniforms) { pickUniforms.uMinRadiusWorld.value = lo; pickUniforms.uMaxRadiusWorld.value = hi; }
+    if (meshUniforms) meshUniforms.uWorldPerPx.value = wpp;
+    if (pickUniforms) pickUniforms.uWorldPerPx.value = wpp;
     // no edge-style call here any more — the edge-fade shader (makeEdgeFadeMaterial) reads
     // screen length straight off projectionMatrix/modelViewMatrix every render, already
     // current every frame with zero extra work on a zoom step.
-    // TIP 3: every path that changes viewSize (wheel zoom, Fit, window resize) already
-    // funnels through here -- the one chokepoint refreshLOD needs to stay current without
-    // its own separate wiring at each call site.
-    refreshLOD();
   }
 
   // wheel = LOOKING ONLY, cursor-anchored (Thoth's own live fix, mail 10581 item 5: "zoom
@@ -1447,6 +1545,8 @@ export async function initSpace(container) {
     const restored = egoSaved ? new Set(egoSaved.keys()) : null;
     restoreEgoLayout();
     if (restored) syncMovedInstancePositions(restored);
+    clearDrillState();
+    disposeProjectAnchors();
     applyDim();
     // review flaw #1: the BASE edge layer is its own static geometry (built once from
     // node x/y at buildEdgeLines time) -- hiding a NODE's own instance (aVisible=0) never
@@ -1504,6 +1604,12 @@ export async function initSpace(container) {
     // "focused-badge" onclick, or a failed pick) used to set pathFocusId=null yet still walk
     // and report "focused: 1 reachable" against a degenerate single-null-entry set.
     if (!id) { clearFocus(); return; }
+    // THE DRILL (Thoth mail 11048): a container-scale focus never runs the ordinary ego
+    // walk at all -- it would either blow straight past MAX_EGO_NODES or (worse, the
+    // operator's own observed bug) silently truncate while updatePathEdges still drew every
+    // one of the focus's own uncapped structural edges, "a solid disc."
+    if (isContainerFocus(id)) { await renderContainerDrill(id, opts); return; }
+    clearDrillState(); // leaving a drill (if any) for an ordinary small-object focus
     const t0 = performance.now();
     const options = opts || {};
     selectedId = id;
@@ -1570,6 +1676,7 @@ export async function initSpace(container) {
     applyDim();
     buildEdgeLines(idToNode, edges); // review flaw #1: base layer must hide too, see clearFocus
     updatePathEdges();
+    buildProjectAnchors(id);
     setStatus(`focused: ${pathReachable.size} reachable` +
       (includeDownstream ? " (upstream+downstream)" : " (upstream)"));
     scheduleLabelPick();
@@ -1648,6 +1755,14 @@ export async function initSpace(container) {
   function fallbackLabel(nd) { return `${nd.type} ${nd.id.slice(0, 8)}`; }
   function labelTextFor(nd) { return nd.label || fallbackLabel(nd); }
 
+  // THE LAST RENDERER (operator ruling d7d55257, Thoth mail 11066): "labels for the top-N
+  // objects by degree inside the current viewport, de-overlapped, at every zoom." No
+  // separate project-label pass any more -- a project's own name just IS whatever object in
+  // it has the highest degree in view. Candidacy is nodeVisible(nd) (already the single
+  // source of truth for hidden types/hidden projects/focus-reachability everywhere else in
+  // this file) intersected with the camera's own world-space frustum bounds -- a node must
+  // genuinely be on screen to be a label candidate, not merely "near the camera centre" (the
+  // old rule, which could label something off past the edge of the viewport).
   const N_LABELS = 40;
   let labeledNodes = [];
   const labelDivs = new Map(); // node -> div, reused across frames instead of rebuilt
@@ -1657,17 +1772,14 @@ export async function initSpace(container) {
     labelPickTimer = setTimeout(() => { labelPickTimer = null; pickLabels(); }, 150);
   }
   function pickLabels() {
-    const cx = camera.position.x, cy = camera.position.y;
-    const n = Math.max(10, Math.round(N_LABELS - (viewSize / 2000) * 30));
-    // review flaw #5: labels used to ignore hiddenNodeTypes entirely, so a type-filtered
-    // node's label kept showing even with its own instance invisible.
-    const pool = (pathFocusId ? idToNode.filter((nd) => pathReachable.has(nd.id)) : idToNode)
-      .filter((nd) => !hiddenNodeTypes.has(nd.type));
-    labeledNodes = pool
-      .map((nd) => ({ nd, d: (nd.x - cx) ** 2 + (nd.y - cy) ** 2 }))
-      .sort((a, b) => a.d - b.d)
-      .slice(0, n)
-      .map((e) => e.nd);
+    const halfW = (camera.right - camera.left) / 2, halfH = (camera.top - camera.bottom) / 2;
+    const minX = camera.position.x - halfW, maxX = camera.position.x + halfW;
+    const minY = camera.position.y - halfH, maxY = camera.position.y + halfH;
+    const pool = idToNode.filter((nd) =>
+      nodeVisible(nd) && nd.x >= minX && nd.x <= maxX && nd.y >= minY && nd.y <= maxY);
+    labeledNodes = pool.slice()
+      .sort((a, b) => (b.degree || 0) - (a.degree || 0))
+      .slice(0, N_LABELS);
     // reconcile DOM: remove divs for nodes no longer labeled, add for newly labeled ones —
     // reuses existing elements instead of an innerHTML rebuild every pick.
     const wanted = new Set(labeledNodes);
@@ -1704,16 +1816,11 @@ export async function initSpace(container) {
   }
   function positionLabels() {
     _placed.length = 0;
-    // TIP 3/4: real per-object labels are a "near" tier concern only -- at far/mid the tier
-    // labels below carry the text instead (an individual object's own name means nothing
-    // once it's folded into a project/type summary). zoomLOD() itself returns "near"
-    // whenever a focus is active (TIP 4 piece (d)), regardless of camera zoom, so object
-    // titles are always what shows during a focus too.
-    const tier = zoomLOD();
+    // THE LAST RENDERER: object titles show at every zoom now, no tier gate -- the same
+    // top-N-by-degree-in-viewport pool pickLabels() computed applies universally.
     for (const nd of labeledNodes) {
       const div = labelDivs.get(nd);
       if (!div) continue;
-      if (tier !== "near") { div.hidden = true; continue; }
       _v.set(nd.x || 0, nd.y || 0, 0).project(camera);
       const x = (_v.x * 0.5 + 0.5) * wrap.clientWidth;
       const y = (-_v.y * 0.5 + 0.5) * wrap.clientHeight;
@@ -1727,7 +1834,9 @@ export async function initSpace(container) {
       div.className = "lbl" + (lit ? " lit" : "");
       _placed.push([x - LABEL_W / 2, y - LABEL_H, x + LABEL_W / 2, y]);
     }
-    positionTierLabels(tier);
+    positionDrillDivs();
+    positionProjectAnchors();
+    positionProjectStubs();
   }
 
   // the render loop itself is defined above (markDirty/renderIfDirty, right after the
@@ -1745,20 +1854,26 @@ export async function initSpace(container) {
     get pathReachable() { return pathReachable; },
     get pathFocusId() { return pathFocusId; },
     get selectedId() { return selectedId; },
-    camera, pickAt, mesh: () => mesh, worldPerPx, nodeRadiusWorld, renderer,
+    camera, pickAt, mesh: () => mesh, worldPerPx, nodeScreenPx, renderer,
     // debug/test hooks only (same convention as window.__space always being exposed) —
     // zoomAt bypasses the rAF-coalesced wheel path for direct exercise; forceRender skips
     // the dirty check for a synchronous frame.
-    zoomAt, forceRender: () => { renderer.render(scene, camera); positionLabels(); },
-    // live-verification/test hooks for the LOD tier itself and what each layer is
-    // currently showing -- same "debug hooks alongside the real api" convention as
-    // zoomAt/forceRender above.
-    get lodTier() { return zoomLOD(); },
-    get projectLabelVisibleCount() { return projectLabelEntries.filter((e) => !e.div.hidden).length; },
-    get typeLabelVisibleCount() { return typeLabelEntries.filter((e) => !e.div.hidden).length; },
-    get haloVisible() { return !!(haloMesh && haloMesh.visible); },
-    get clusterEdgesVisible() { return !!(clusterEdgeLines && clusterEdgeLines.visible); },
-    get clusterRingsVisible() { return !!(clusterRingLines && clusterRingLines.visible); },
+    zoomAt, forceRender: () => { renderScene(); positionLabels(); },
+    // live-verification/test hooks for the top-N-by-degree label pool -- same "debug hooks
+    // alongside the real api" convention as zoomAt/forceRender above.
+    get toneMapActive() { return !!sceneTarget; },
+    get labeledNodeCount() { return labeledNodes.length; },
+    get visibleLabelCount() { return [...labelDivs.values()].filter((d) => !d.hidden).length; },
+    // THE DRILL (Thoth mail 11048): live-verification/test hooks for the container drill,
+    // cross-project anchors, and the project-filter stub reveal.
+    isContainerFocus, containerMembersByType,
+    get drillContainerId() { return drillContainerId; },
+    get drillNodeEntries() { return drillNodeEntries.map((e) => ({ key: e.key, kind: e.kind, type: e.type, count: e.count })); },
+    get drillExpandedType() { return drillExpandedType; },
+    expandDrillType(type) { drillExpandedType = type; drillPageCount = 1; return renderContainerDrill(drillContainerId, { skipStackPush: true }); },
+    get projectAnchorCount() { return projectAnchorEntries.length; },
+    get projectStubEntries() { return projectStubEntries.map((e) => ({ nodeId: e.nodeId, hiddenProject: e.hiddenProject, count: e.count })); },
+    revealProjectStub,
   };
   window.__space = api; // kept for existing debugging/test scripts, same shape as before
   return api;

@@ -23,6 +23,11 @@
                       background: rgba(13,18,25,0.82); padding: 2px 7px; border-radius: 4px;
                       transform: translate(-50%, -50%); white-space: nowrap; pointer-events: none;
                       letter-spacing: 0.2px; }
+  /* THE DRILL (ruling d7d55257, Thoth mail 11048): a container's own type/"more" nodes and
+     a cross-project anchor are genuinely clickable (expand, page, drill, or re-focus) --
+     pointer-events: auto overrides the plain tier label's own none, plus a left accent so
+     a reader can tell "this one does something" from "this one is just a name." */
+  .ego-drill-label { pointer-events: auto; border-left: 2px solid #58a6ff; }
   /* THE LEGIBILITY PASS, TIP 1(f) (ruling e1cb9e3b): the table drawer owns the bottom edge
      now -- nothing floats in its collapsed 34px handle band any more (Thoth's own
      screenshot showed the canvas controls colliding with it there). */

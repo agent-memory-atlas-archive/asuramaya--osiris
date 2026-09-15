@@ -63,26 +63,23 @@ def test_wheel_events_coalesce_to_one_rendered_zoom_per_frame() -> None:
 # a static per-instance attribute so a zoom step touches two floats, never a buffer -----------
 
 def test_node_size_is_a_shader_uniform_not_a_per_instance_matrix_rewrite() -> None:
-    # THE LEGIBILITY PASS, TIP 1(a) (ruling e1cb9e3b) moved sizing from a screen-pixel-
-    # constant scheme to a WORLD-unit radius clamped by a uniform min/max -- still a shader
-    # uniform, still never a per-instance matrix rewrite, just the opposite invariant (a
-    # node now shrinks with zoom-out instead of staying a fixed pixel size).
-    # TIP 4 (operator ruling "DENSITY NOT DISCS", mail 11011) added an `opts` param (the
-    # draw mesh's own additive-blending flag) -- the shader-uniform sizing scheme itself
-    # this test is about is otherwise unchanged.
+    # THE LEGIBILITY PASS, TIP 1(a) moved sizing off a fixed-screen-pixel scheme to a
+    # WORLD-unit radius, clamped by a uniform min/max. THE LAST RENDERER (operator ruling
+    # d7d55257, Thoth mail 11066) moved it BACK to a screen-pixel scheme (per-object
+    # degree curve now, not the old flat constant) -- still a shader uniform, still never a
+    # per-instance matrix rewrite: aRadiusPx (a per-instance PIXEL target, fixed at build
+    # time) times a single live uWorldPerPx uniform, no clamp/cap at all.
     assert "function makeInstancedCircleMaterial(opts)" in _SPACE_JS
     assert "onBeforeCompile" in _SPACE_JS
-    assert "attribute float aRadiusWorld;" in _SPACE_JS
-    assert "uniform float uMinRadiusWorld;" in _SPACE_JS
-    assert "uniform float uMaxRadiusWorld;" in _SPACE_JS
-    assert "transformed *= clamp(aRadiusWorld, uMinRadiusWorld, uMaxRadiusWorld) * aVisible;" \
-        in _SPACE_JS
+    assert "attribute float aRadiusPx;" in _SPACE_JS
+    assert "uniform float uWorldPerPx;" in _SPACE_JS
+    assert "transformed *= aRadiusPx * uWorldPerPx * aVisible;" in _SPACE_JS
 
 
 def test_rescale_for_zoom_is_o1_uniform_writes_no_matrix_loop() -> None:
     body = _SPACE_JS.split("function rescaleForZoom()", 1)[1].split("\n  }\n", 1)[0]
-    assert "meshUniforms.uMinRadiusWorld.value = lo" in body
-    assert "pickUniforms.uMinRadiusWorld.value = lo" in body
+    assert "meshUniforms.uWorldPerPx.value = wpp" in body
+    assert "pickUniforms.uWorldPerPx.value = wpp" in body
     assert "getMatrixAt" not in body
     assert "setMatrixAt" not in body
     assert "for (" not in body  # no per-instance loop at all
@@ -91,7 +88,7 @@ def test_rescale_for_zoom_is_o1_uniform_writes_no_matrix_loop() -> None:
 def test_build_scene_sets_instance_scale_to_one_not_a_baked_pixel_size() -> None:
     body = _SPACE_JS.split("function buildScene(nodes, edges)", 1)[1][:3000]
     assert "dummy.scale.setScalar(1);" in body
-    assert "radiusAttr.setX(i, nd.radiusWorld);" in body
+    assert "radiusAttr.setX(i, nd.radiusPx);" in body
 
 
 # --- (3) the render loop ran forever (rAF + a 50ms setTimeout fallback), even off-surface or
@@ -131,14 +128,10 @@ def test_context_loss_is_handled_not_left_to_crash() -> None:
     assert '"webglcontextlost"' in _SPACE_JS
     assert "ev.preventDefault();" in _SPACE_JS
     assert '"webglcontextrestored"' in _SPACE_JS
-    # window widened for TIP 3/4: context loss invalidates every GPU resource, so the tier
-    # labels/cluster edges/rings/halo (all their own GPU meshes) rebuild here too now,
-    # pushing resume() further into the handler body.
-    body = _SPACE_JS.split('"webglcontextrestored"', 1)[1][:900]
+    # THE LAST RENDERER (Thoth mail 11066) retired the tier-label/cluster/halo GPU
+    # resources this handler used to rebuild alongside the main scene -- context restore
+    # is back to its simpler pre-LOD shape.
+    body = _SPACE_JS.split('"webglcontextrestored"', 1)[1][:400]
     assert "buildScene(idToNode, edges)" in body
     assert "fitToNodes(idToNode)" in body
-    # TIP 4 (operator ruling "DENSITY NOT DISCS", mail 11011) renamed the glyph rebuild to
-    # the label-only rebuild it retired the glyphs in favour of.
-    assert "buildTierLabels()" in body
-    assert "buildHalo()" in body
     assert "resume();" in body
