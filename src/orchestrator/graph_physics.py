@@ -242,33 +242,58 @@ def _build_physics_graph(
         community_vertex[key] = len(vertex_ids)
         vertex_ids.append(None)
 
+    # THE COLLAPSED-CONTAINER FIX (Thoth mail 11111, ruling 853d0f9c): a flat
+    # container weight pulled EVERY member of a shared container toward the exact
+    # same point with equal strength regardless of how many siblings it had --
+    # for a container with thousands of members and few or no semantic edges to
+    # differentiate them, that isn't "weak gravity" in aggregate, it's a landslide
+    # (a live specimen: 6,131 points collapsed into one post-FR grid cell). The
+    # SAME edge weight (_CONTAINER_SPRING_WEIGHT) is now divided by the
+    # container's own live member count (1/N, not 1/sqrt(N) -- measured live: a
+    # 1,000-member test container still landed 264 points in one post-FR cell at
+    # 1/sqrt(N), well over the ~50-point acceptance line; 1/N brings it comfortably
+    # under), so a container with N members pulls each one at 1/N strength --
+    # sibling repulsion (which every vertex exerts on every other regardless of
+    # edges) then actually wins for a large container, letting members spread out
+    # around it instead of collapsing onto it. Counted by FINAL destination
+    # (`dst_i`, already resolved to a synthetic community vertex where one
+    # applies) so a member routed through a district's own vertex is counted
+    # against THAT vertex's member count, not the whole project's.
+    container_edges: list[tuple[int, int]] = []
+    dst_member_counts: dict[int, int] = defaultdict(int)
+    for r in link_rows:
+        f, t, lt = r["from_id"], r["to_id"], r["type"]
+        if f not in idx or t not in idx or lt not in CONTAINER_LINK_TYPES:
+            continue
+        i, j = idx[f], idx[t]
+        comm = communities.get(f)
+        reroute = lt == "in_repo" and comm is not None and comm[0] == t
+        dst_i = community_vertex[comm] if reroute and comm is not None else j
+        container_edges.append((i, dst_i))
+        dst_member_counts[dst_i] += 1
+
     edges: list[tuple[int, int]] = []
     weights: list[float] = []
     for r in link_rows:
         f, t, lt = r["from_id"], r["to_id"], r["type"]
-        if f not in idx or t not in idx:
+        if f not in idx or t not in idx or lt in CONTAINER_LINK_TYPES:
             continue
-        i, j = idx[f], idx[t]
-        if lt in CONTAINER_LINK_TYPES:
-            # a member landing in a real detected community reroutes its in_repo
-            # container edge to the SYNTHETIC community vertex instead of the
-            # project directly -- every other container edge (works_in, acts_for,
-            # spawned_by, holds, member_of, and in_repo for anyone without a
-            # community) attaches to its own real container object unchanged.
-            comm = communities.get(f)
-            reroute = lt == "in_repo" and comm is not None and comm[0] == t
-            dst_i = community_vertex[comm] if reroute and comm is not None else j
-            edges.append((i, dst_i))
-            weights.append(_CONTAINER_SPRING_WEIGHT)
-        elif lt not in STRUCTURAL_LINK_TYPES:
+        if lt not in STRUCTURAL_LINK_TYPES:
+            i, j = idx[f], idx[t]
             edges.append((i, j))
             weights.append(_semantic_weight(lt, degree[i], degree[j]))
 
-    for (pid, _comm), cvi in community_vertex.items():
-        pi = idx.get(pid)
+    for i, dst_i in container_edges:
+        w = _CONTAINER_SPRING_WEIGHT / max(1, dst_member_counts[dst_i])
+        edges.append((i, dst_i))
+        weights.append(w)
+
+    for (_pid, _comm), cvi in community_vertex.items():
+        pi = idx.get(_pid)
         if pi is not None:
+            w = _CONTAINER_SPRING_WEIGHT / max(1, dst_member_counts.get(cvi, 1))
             edges.append((cvi, pi))
-            weights.append(_CONTAINER_SPRING_WEIGHT)
+            weights.append(w)
 
     g = ig.Graph()
     g.add_vertices(len(vertex_ids))
@@ -293,33 +318,35 @@ def _seed_positions(vertex_ids: list[uuid.UUID | None]) -> np.ndarray:
     return out
 
 
-async def _physics_positions(
-    actions: Actions,
-) -> dict[uuid.UUID, tuple[float, float]]:
-    """The full computation, pure enough to unit-test without a live migration write:
-    population + links -> communities -> the one shared graph -> seeded FR -> hub
-    re-centering -> the existing declump floor. Real object positions only --
-    synthetic community rows never leave this function."""
-    object_ids = await _active_object_ids(actions)
-    if not object_ids:
-        return {}
-    link_rows = await _live_link_rows(actions)
-    membership = await _project_membership(actions)
-    active = set(object_ids)
-    communities = _detect_communities(link_rows, membership, active)
-    g, vertex_ids = _build_physics_graph(object_ids, link_rows, communities)
+class MemoryBudgetExceeded(Exception):
+    """Raised by `_memory_guard` when the POST-FR positions it's handed would need
+    more than `layout.physics_max_bytes` on a hypothetical quadratic fallback --
+    see that function's own docstring for why it checks post-FR, not the seed."""
 
+
+def _fr_and_recenter(
+    g: ig.Graph, vertex_ids: list[uuid.UUID | None], object_ids: list[uuid.UUID],
+    hub_ids: set[uuid.UUID],
+) -> np.ndarray:
+    """Pure (no DB): seeded FR over the whole shared graph, then hubs snapped to the
+    real-vertex center of mass. Split out from `_physics_positions` so a test can
+    check THE COLLAPSED-CONTAINER FIX's own acceptance line directly -- "no cell
+    holds more than ~50 points after FR for any project" -- against this function's
+    own output, before the memory guard or declump ever run."""
     seed = _seed_positions(vertex_ids)
+    # grid=True explicitly (Thoth mail 11111): "auto" is DOCUMENTED to already pick
+    # the grid-based approximation at this vertex count (>= 1,000), but naming it
+    # directly means this call's own real-range repulsion behavior is never at the
+    # mercy of a future igraph version changing that heuristic's threshold.
     coords = g.layout_fruchterman_reingold(
         weights=g.es["weight"] if g.ecount() else None,
-        niter=_FR_ITERATIONS, seed=seed.tolist())
+        niter=_FR_ITERATIONS, seed=seed.tolist(), grid=True)
     pos = np.array(coords.coords)
 
     real_mask = [oid is not None for oid in vertex_ids]
     real_pos = pos[real_mask]
     center = real_pos.mean(axis=0) if len(real_pos) else np.zeros(2)
 
-    hub_ids = await _hub_ids(actions, object_ids)
     real_index = {oid: i for i, oid in enumerate(object_ids)}
     for oid in hub_ids:
         i = real_index.get(oid)
@@ -328,7 +355,35 @@ async def _physics_positions(
         angle = _hash01(f"physics-hub:{oid}") * 2 * math.pi
         pos[i] = center + np.array([math.cos(angle), math.sin(angle)]) * 1.0
 
-    real_positions = pos[: len(object_ids)]
+    return pos[: len(object_ids)]
+
+
+async def _physics_positions(
+    actions: Actions,
+) -> dict[uuid.UUID, tuple[float, float]]:
+    """The full computation, pure enough to unit-test without a live migration write:
+    population + links -> communities -> the one shared graph -> seeded FR -> hub
+    re-centering (`_fr_and_recenter`) -> the memory guard -> the existing declump
+    floor. Real object positions only -- synthetic community rows never leave this
+    function. Can raise `MemoryBudgetExceeded` (THE COLLAPSED-CONTAINER FIX, Thoth
+    mail 11111) if FR's own output still lands too many points in one grid cell for
+    the configured budget -- the caller (`run_physics_migrate`) turns that into a
+    written refusal receipt rather than letting declump try anyway."""
+    object_ids = await _active_object_ids(actions)
+    if not object_ids:
+        return {}
+    link_rows = await _live_link_rows(actions)
+    membership = await _project_membership(actions)
+    active = set(object_ids)
+    communities = _detect_communities(link_rows, membership, active)
+    g, vertex_ids = _build_physics_graph(object_ids, link_rows, communities)
+    hub_ids = await _hub_ids(actions, object_ids)
+
+    real_positions = _fr_and_recenter(g, vertex_ids, object_ids, hub_ids)
+    reason = await _memory_guard(actions, real_positions)
+    if reason:
+        raise MemoryBudgetExceeded(reason)
+
     declumped = _declump(
         real_positions, np.zeros((0, 2)), object_ids, min_sep=_MIN_SEPARATION)
 
@@ -336,26 +391,25 @@ async def _physics_positions(
             for i, oid in enumerate(object_ids)}
 
 
-async def _memory_guard(actions: Actions, seed: np.ndarray) -> str | None:
-    """THE PHYSICS LAYOUT OOM guard (Thoth mail 11097): a defensive check against
-    the ONE shape that could still cost O(k^2) memory after graph_layout._declump's
-    own grid rewrite -- not the whole population `n` (the grid fix means declump's
-    real memory cost is O(n), never O(n^2), for any reasonably spread population,
-    seeded or not), but the largest SINGLE grid cell's own point count `k`: a
-    degenerate all-coincident-seed input (every point landing in one cell) is the
-    one remaining case where a future VECTORISED per-cell fallback could
-    reintroduce an (k,k,2) pairwise array. Checked against the deterministic seed
-    positions (cheap, pure, no DB) before the expensive FR/declump pass ever runs
-    -- returns a written refusal reason, or None when safe."""
+async def _memory_guard(actions: Actions, positions: np.ndarray) -> str | None:
+    """THE COLLAPSED-CONTAINER FIX (Thoth mail 11111): checked against POST-FR
+    positions, not the seed -- a live specimen showed the seed (always sparse by
+    the sunflower's own construction) passing clean while FR's own springs/gravity
+    later collapsed thousands of container-only siblings onto one point, the exact
+    case this guard exists to catch. Still a defensive check against the ONE shape
+    that could still cost O(k^2) memory after graph_layout._declump's own grid
+    rewrite (its real cost is O(n) for any reasonably spread population) -- the
+    largest SINGLE grid cell's own point count `k`. Returns a written refusal
+    reason, or None when safe."""
     from src.orchestrator.settings_service import current_stored_value
 
-    cells = _grid_cells(seed, _MIN_SEPARATION)
+    cells = _grid_cells(positions, _MIN_SEPARATION)
     worst_k = max((len(v) for v in cells.values()), default=0)
     stored = await current_stored_value(actions.pool, "layout.physics_max_bytes")
     max_bytes = int(stored) if isinstance(stored, int | float) else _DEFAULT_PHYSICS_MAX_BYTES
     needed = worst_k * worst_k * 16
     if needed > max_bytes:
-        return (f"refusing: the worst single seeded grid cell holds {worst_k} points -- "
+        return (f"refusing: the worst single post-FR grid cell holds {worst_k} points -- "
                 f"a quadratic fallback there would need ~{needed} bytes, over "
                 f"layout.physics_max_bytes={max_bytes}")
     return None
@@ -367,24 +421,22 @@ async def run_physics_migrate(actions: Actions) -> AsyncIterator[dict[str, Any]]
     sharing `graph_layout._LAYOUT_LOCK_KEY` with the cron heartbeat and
     `run_layout_migrate` so nothing else touches graph_x/graph_y while this runs.
     Yields coarse stage receipts (not one per batch, since there are none) and a
-    final `{"done": True, "placed": N, "peak_rss_kb": N}` -- `_memory_guard` runs
-    first (THE OOM, Thoth mail 11097) and can yield a single `{"error": ...}` and
-    return instead, doing no work."""
+    final `{"done": True, "placed": N, "peak_rss_kb": N}` -- `_physics_positions`'s
+    own post-FR memory guard (THE COLLAPSED-CONTAINER FIX, Thoth mail 11111) can
+    raise `MemoryBudgetExceeded` instead, turned here into a single `{"error": ...}`
+    receipt with no write."""
     async with actions.pool.acquire() as lock_conn:
         if not await _try_acquire_layout_lock(lock_conn):
             yield {"error": "the layout heartbeat (or a migrate run) currently holds "
                             "the layout lock -- try again shortly"}
             return
         try:
-            object_ids = await _active_object_ids(actions)
-            if object_ids:
-                seed_vertex_ids: list[uuid.UUID | None] = list(object_ids)
-                reason = await _memory_guard(actions, _seed_positions(seed_vertex_ids))
-                if reason:
-                    yield {"error": reason}
-                    return
             yield {"stage": "computing"}
-            positions = await _physics_positions(actions)
+            try:
+                positions = await _physics_positions(actions)
+            except MemoryBudgetExceeded as exc:
+                yield {"error": str(exc)}
+                return
             yield {"stage": "writing", "count": len(positions)}
             now = datetime.now(UTC)
             ids = list(positions.keys())

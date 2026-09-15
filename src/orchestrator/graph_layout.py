@@ -575,6 +575,17 @@ _DECLUMP_VECTORIZE_THRESHOLD = 400  # pair count above which a vectorized numpy 
                                     # specimen, one cell holding 6,131 points) is what
                                     # justifies the vectorized path existing at all --
                                     # see `_resolve_cell_pair`'s own docstring.
+_DECLUMP_MAX_VECTORIZE_PAIRS = 5_000_000  # ~80 MB delta array ceiling (THE
+                                          # COLLAPSED-CONTAINER FIX, Thoth mail
+                                          # 11111, item (b) "cap per-cell work") --
+                                          # defense in depth: the LAYOUT fix
+                                          # (container gravity scaled by
+                                          # 1/sqrt(member count)) should keep any
+                                          # post-FR cell under ~50 points (2,500
+                                          # same-cell pairs) before this ever
+                                          # matters, but a cell denser than this
+                                          # falls back to the slow-but-memory-safe
+                                          # loop instead of a huge vectorized array.
 
 
 def _resolve_cell_pair_loop(
@@ -635,12 +646,15 @@ def _resolve_cell_pair(
     HYBRID (`_DECLUMP_VECTORIZE_THRESHOLD`): delegates to `_resolve_cell_pair_loop`
     for a small candidate count instead -- the vectorized path's own fixed overhead
     costs more than it saves when there's almost nothing to check, the common case
-    for any reasonably spread population."""
+    for any reasonably spread population. Also delegates for a pair count ABOVE
+    `_DECLUMP_MAX_VECTORIZE_PAIRS` -- see that constant's own docstring: a cell
+    this dense should never occur after the layout fix, but if one does, slow-and-
+    memory-safe beats fast-and-OOMing."""
     pair_count = (
         len(a_idx) * (len(a_idx) - 1) // 2 if same_cell else len(a_idx) * len(b_idx))
     if pair_count == 0:
         return None
-    if pair_count < _DECLUMP_VECTORIZE_THRESHOLD:
+    if not _DECLUMP_VECTORIZE_THRESHOLD <= pair_count <= _DECLUMP_MAX_VECTORIZE_PAIRS:
         return _resolve_cell_pair_loop(
             pos, a_idx, b_idx, same_cell=same_cell, min_sep=min_sep, ids=ids,
             other_pos=other_pos)
