@@ -121,7 +121,7 @@ _DEFAULT_LIMIT = 200
 _MAX_SIDS_PER_WRITER = 25  # mirrors mounts.MAX_ANCHOR_SIDS_FOR_LIVENESS_CHECK's own cap
 _EC = EvidenceClass.DERIVED.value  # a transcript text scan is an inference, same as piece 2
 _CONF = confidence_for(EvidenceClass.DERIVED)
-_DEFAULT_MAX_SCAN_BYTES = 64 * 1024 * 1024  # ingest.transcript_scan_max_bytes' own default
+_DEFAULT_MAX_SCAN_BYTES = 1024 * 1024 * 1024  # ingest.transcript_scan_max_bytes' own default
 _DEFAULT_BUDGET_SECONDS = 240.0  # thread 0be2f790: a partial receipt, never a silent hang
 _RECEIPT_CANONICAL_RE_SRC = r'"canonical"\s*:\s*"([a-z_]+:[0-9a-f]{6,40})"'
 
@@ -371,29 +371,39 @@ async def backfill_possible_upstream(
     scan_cache: dict[Path, tuple[list[str], dict[str, int]] | None] = {}
     examined = 0
     partial = False
-    candidate_tally = {"matched": 0, "no_ledger": 0, "no_transcript": 0}
+    candidate_tally = {"matched": 0, "no_ledger": 0, "no_transcript": 0, "too_large": 0}
     writer_outcomes: dict[str, set[str]] = {}
     all_candidates = await _candidates(actions.pool, limit, newest_first=newest_first)
+
+    writer_sids_cache: dict[str, list[str]] = {}
+    writer_receipt_index_cache: dict[str, tuple[dict[str, Path], int, bool]] = {}
 
     def _tag(writer: str, outcome: str) -> None:
         candidate_tally[outcome] += 1
         writer_outcomes.setdefault(writer, set()).add(outcome)
 
-    for cand in all_candidates:
-        if time.monotonic() - started >= budget_seconds:
-            partial = True
-            break
-        examined += 1
-        writer = cand["writer"]
-        sids = await _anchor_sids(actions.pool, writer)
-        if not sids:
-            skipped.append({"object": cand["canonical"], "writer": writer,
-                            "reason": "writer's lineage carries no anchor_sid ledger"})
-            _tag(writer, "no_ledger")
-            continue
-        receipt_line: int | None = None
-        receipt_lines: list[str] | None = None
-        too_large = 0
+    async def _writer_sids(writer: str) -> list[str]:
+        sids = writer_sids_cache.get(writer)
+        if sids is None:
+            sids = await _anchor_sids(actions.pool, writer)
+            writer_sids_cache[writer] = sids
+        return sids
+
+    async def _writer_receipt_index(
+        writer: str, sids: list[str],
+    ) -> tuple[dict[str, Path], int, bool]:
+        """Built ONCE per writer (Thoth mail 10716: "looked up, not searched") — merges
+        every one of the writer's resolvable, in-cap transcripts into a single
+        canonical->path map, so each candidate after the first for this writer is a
+        dict lookup, never a re-walk of the writer's own sid list. `too_large_count`
+        counts sids whose file exceeds `max_scan_bytes`; `any_scanned` is True the
+        moment even one file was actually opened and indexed (never all skipped)."""
+        cached = writer_receipt_index_cache.get(writer)
+        if cached is not None:
+            return cached
+        canon_to_path: dict[str, Path] = {}
+        too_large_count = 0
+        any_scanned = False
         for sid in sids:
             path = index.get(sid)
             if path is None:
@@ -403,23 +413,53 @@ async def backfill_possible_upstream(
             scanned = scan_cache[path]
             if scanned is None:
                 try:
-                    too_large += path.stat().st_size > max_scan_bytes
+                    if path.stat().st_size > max_scan_bytes:
+                        too_large_count += 1
                 except OSError:
                     pass
                 continue
-            lines, canon_index = scanned
-            found = canon_index.get(cand["canonical"])
-            if found is not None:
-                receipt_line, receipt_lines = found, lines
-                break
-        if receipt_line is None or receipt_lines is None:
-            reason = ("no receipt for this write found in any of the writer's "
-                      f"{len(sids)} indexed transcript(s)")
-            if too_large:
-                reason += f" ({too_large} skipped — over ingest.transcript_scan_max_bytes)"
-            skipped.append({"object": cand["canonical"], "writer": writer, "reason": reason})
-            _tag(writer, "no_transcript")
+            any_scanned = True
+            _, canon_index = scanned
+            for canonical in canon_index:
+                canon_to_path.setdefault(canonical, path)
+        result = (canon_to_path, too_large_count, any_scanned)
+        writer_receipt_index_cache[writer] = result
+        return result
+
+    for cand in all_candidates:
+        if time.monotonic() - started >= budget_seconds:
+            partial = True
+            break
+        examined += 1
+        writer = cand["writer"]
+        sids = await _writer_sids(writer)
+        if not sids:
+            skipped.append({"object": cand["canonical"], "writer": writer,
+                            "reason": "writer's lineage carries no anchor_sid ledger"})
+            _tag(writer, "no_ledger")
             continue
+        canon_to_path, too_large_count, any_scanned = await _writer_receipt_index(writer, sids)
+        receipt_path = canon_to_path.get(cand["canonical"])
+        if receipt_path is None:
+            if not any_scanned and too_large_count:
+                reason = (f"every one of the writer's {too_large_count} resolvable "
+                          "transcript(s) exceeds ingest.transcript_scan_max_bytes — "
+                          "skipped unopened")
+                skipped.append({"object": cand["canonical"], "writer": writer, "reason": reason})
+                _tag(writer, "too_large")
+            else:
+                reason = ("no receipt for this write found in any of the writer's "
+                          f"{len(sids)} indexed transcript(s)")
+                if too_large_count:
+                    reason += (f" ({too_large_count} skipped — over "
+                              "ingest.transcript_scan_max_bytes)")
+                skipped.append({"object": cand["canonical"], "writer": writer, "reason": reason})
+                _tag(writer, "no_transcript")
+            continue
+        scanned = scan_cache[receipt_path]
+        assert scanned is not None  # canon_to_path only ever names a successfully-scanned file
+        receipt_lines, receipt_line_index = scanned
+        receipt_line = receipt_line_index[cand["canonical"]]
         _tag(writer, "matched")
 
         for target, props in await _upstream_targets(
@@ -448,12 +488,14 @@ async def backfill_possible_upstream(
     for item in plan:
         edges_by_door[item["door"]] = edges_by_door.get(item["door"], 0) + 1
 
-    writer_tally = {"matched": 0, "no_ledger": 0, "no_transcript": 0}
+    writer_tally = {"matched": 0, "no_ledger": 0, "no_transcript": 0, "too_large": 0}
     for outcomes in writer_outcomes.values():
         if "no_ledger" in outcomes:
             writer_tally["no_ledger"] += 1
         elif "matched" in outcomes:
             writer_tally["matched"] += 1
+        elif "too_large" in outcomes:
+            writer_tally["too_large"] += 1
         else:
             writer_tally["no_transcript"] += 1
 
