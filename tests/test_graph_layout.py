@@ -419,12 +419,16 @@ async def test_neighbors_of_semantic_only_drops_structural_edges(actions: Action
     assert b in semantic_neighbors[a]
 
 
-async def test_layout_batch_never_pulls_two_objects_together_over_a_structural_edge(
+async def test_layout_batch_container_only_members_seed_near_their_container(
     actions: Actions,
 ) -> None:
-    """The exact regression THE READING LAYER fixes: a shared structural hub (here, a
-    project acting as the hub every member links to via in_repo) must never pull
-    members toward it via relax -- only a real semantic edge should ever attract."""
+    """THE PHYSICS LAYOUT (Thoth mail 11047, item 6): a member with ONLY a container
+    edge (in_repo) and no semantic edge of its own now seeds at its container's own
+    centroid -- reversing THE READING LAYER's old "structural edges never attract"
+    rule for this one subset (container is a real, if weak, gravity source in the
+    new ruling). `relax`'s own iterative attraction still never pulls on a
+    structural/container edge (test_neighbors_of_semantic_only_drops_structural_edges
+    covers that lower-level invariant directly) -- this only checks the seed."""
     now = datetime.now(UTC)
     proj = await actions.create_or_find_object("SoftwareProject", "repo:gl-rl-hub", "test")
     members = []
@@ -438,11 +442,13 @@ async def test_layout_batch_never_pulls_two_objects_together_over_a_structural_e
 
     proj_pos = (await positions_for(actions, [proj]))[proj]
     member_pos = await positions_for(actions, members)
-    # members carry no semantic edge at all (only the structural in_repo link), so
-    # they sit in the outer HALO band around the project center, not collapsed onto
-    # the project's own position the way an in_repo-as-attraction bug would do
+    # a real minimum-separation floor among siblings (_MIN_SEPARATION) means N
+    # container-only siblings can't ALL sit within a few units of one point past a
+    # handful of them, and a few bounded relax iterations nudge them further still --
+    # 200 is not a tight bound, it's a clear order-of-magnitude line below the OLD
+    # flat ~6000-unit halo offset this same scenario used to produce
     for oid in members:
-        assert math.dist(proj_pos, member_pos[oid]) > 10
+        assert math.dist(proj_pos, member_pos[oid]) < 200
 
 
 async def test_place_projects_pulls_a_linked_project_closer_than_an_unlinked_one(

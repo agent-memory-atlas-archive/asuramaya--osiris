@@ -26,8 +26,9 @@ dependencies = [
     "model2vec>=0.5",     # local static embeddings — the semantic search door (no GPU, no key)
     "numpy>=1.26",        # cosine over the cached vector matrix (semantics.py)
     "jinja2>=3.1.6",       # THE INBOX (task #71) — the sole renderer for src/api/inbox/render.py;
-                           # already resolved transitively (model2vec) at this exact version
+    # already resolved transitively (model2vec) at this exact version
     "datastar-py>=1.0.2",  # THE INBOX — SSE/patch helpers matching vendored datastar-core.js v1.0.2
+    "python-igraph>=1.0.0",
 ]
 
 [dependency-groups]
@@ -82,7 +83,7 @@ module = ["arq.*", "playwright.*"]   # partial/untyped public API at the worker/
 disallow_untyped_calls = false
 
 [[tool.mypy.overrides]]
-module = ["keyring.*", "reportlab.*", "phonenumbers.*"]   # no bundled stubs
+module = ["keyring.*", "reportlab.*", "phonenumbers.*", "igraph.*"]   # no bundled stubs
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

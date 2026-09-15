@@ -6480,6 +6480,33 @@ async def layout_migrate(limit: int | None = None, ctx: Context | None = None) -
     return {"batches": receipts, "total_placed": total_placed}
 
 
+@mcp.tool()
+async def physics_layout_migrate(ctx: Context | None = None) -> dict[str, Any]:
+    """THE PHYSICS LAYOUT's own migration door (Thoth mail 11047, product law: every
+    action has a door): a SINGLE global force simulation over the whole active graph
+    -- springs for semantic edges, weak gravity toward containers, nested
+    communities, hub re-centering -- never a batch loop the way `layout_migrate`
+    is, since this can't be sliced into independent batches (see
+    graph_physics.run_physics_migrate's own docstring). Refuses (an `error` key, no
+    work done) if the cron heartbeat or a `layout_migrate` run is mid-tick and
+    already holds the layout lock. Same shared advisory lock, same
+    GRAPH_LAYOUT_SOURCE-only write path as `layout_migrate`."""
+    from src.actions.core import Actions
+    from src.orchestrator.graph_physics import run_physics_migrate
+
+    ident = await _ident_for(ctx)
+    if ident is None:
+        return {"error": "mount first — a layout migration is a mind's act, and the "
+                         "graph must know whose", "why": _anchorless(ctx)}
+    pool = await _pool_get()
+    actions = Actions(pool)
+    receipts = [r async for r in run_physics_migrate(actions)]
+    if receipts and "error" in receipts[0]:
+        return receipts[0]
+    final = receipts[-1] if receipts else {}
+    return {"stages": receipts, "placed": final.get("placed", 0)}
+
+
 _PROVENANCE_BACKFILL_RECEIPT_THREAD = "e332177f"  # thread 0be2f790's own live specimen
 
 

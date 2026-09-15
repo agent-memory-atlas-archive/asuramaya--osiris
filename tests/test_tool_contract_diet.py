@@ -926,7 +926,10 @@ def _tool_chars(t: Any) -> int:
 # (a bot on a real-looking domain, a local part matching no ingested repo). Genuinely
 # new capability, no existing tool mints this object type or bridges a Person via
 # same_as on demand.
-TOOL_CONTRACT_EXPECTED_COUNT = 88
+# 88 -> 89 (2026-09-15, Khnum, Thoth mail 11047, ruling d7d55257): physics_layout_
+# migrate — see TOOL_CONTRACT_CEILING_CHARS's own changelog entry just above for the
+# full reason.
+TOOL_CONTRACT_EXPECTED_COUNT = 89
 # 116 -> 117 (2026-09-04, Seshat, #203/Thoth dispatch 6966, decision a49d2730/38755abe):
 # list_unfiled_threads — the H-bucket instrument gap: a Thread filter on absence of an
 # in_repo edge (plus source=/kind= equality), paginated, that no existing door provided
@@ -1618,7 +1621,13 @@ TOOL_CONTRACT_EXPECTED_COUNT = 88
 # changelog entry just below), the manual override for git ingest's own MachineIdentity
 # heuristic. Genuinely new capability, no existing tool it could parameterize. Measured
 # exact (140,267).
-TOOL_CONTRACT_CEILING_CHARS = 140267
+# -> 141046 (2026-09-15, Khnum, Thoth mail 11047, ruling d7d55257): physics_layout_
+# migrate — a NEW @mcp.tool() (88 -> 89 tools, see TOOL_CONTRACT_EXPECTED_COUNT's own
+# changelog entry just below), THE PHYSICS LAYOUT's own one-shot migration door,
+# genuinely different execution shape from layout_migrate (a single global force
+# simulation, not a batch loop) so not a parameterization of it. Measured exact
+# (141,046).
+TOOL_CONTRACT_CEILING_CHARS = 141046
 
 def test_ceiling_has_exactly_one_executable_assignment() -> None:
     """THE RATCHET'S OWN GUARD (thread c655c757). This file used to carry every historical

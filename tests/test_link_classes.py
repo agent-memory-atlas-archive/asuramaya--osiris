@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 
 from src.ontology.link_classes import (
+    CONTAINER_LINK_TYPES,
     SEMANTIC_LINK_TYPES_KNOWN,
     STRUCTURAL_LINK_TYPES,
     link_class,
@@ -56,10 +57,25 @@ def test_every_actually_written_link_type_is_classified() -> None:
 
 
 def test_link_class_is_total_and_defaults_safely_for_unknown_types() -> None:
-    assert link_class("in_repo") == "structural"
+    assert link_class("in_repo") == "container"
+    assert link_class("managed_by") == "structural"
     assert link_class("cites") == "semantic"
     assert link_class("some-extension-type-nobody-declared") == "semantic"
 
 
 def test_structural_and_semantic_sets_never_overlap() -> None:
     assert STRUCTURAL_LINK_TYPES & SEMANTIC_LINK_TYPES_KNOWN == set()
+
+
+def test_container_types_are_a_subset_of_structural() -> None:
+    """THE PHYSICS LAYOUT (Thoth mail 11047): container is a flag NESTED inside the
+    structural class, never an independent third bucket -- every existing caller
+    checking membership in STRUCTURAL_LINK_TYPES directly (graph_layout.py's own
+    relax-exclusion) still catches every container type without any change."""
+    assert CONTAINER_LINK_TYPES <= STRUCTURAL_LINK_TYPES
+    assert CONTAINER_LINK_TYPES & SEMANTIC_LINK_TYPES_KNOWN == set()
+
+
+def test_link_class_container_types_all_read_container() -> None:
+    for lt in CONTAINER_LINK_TYPES:
+        assert link_class(lt) == "container"
