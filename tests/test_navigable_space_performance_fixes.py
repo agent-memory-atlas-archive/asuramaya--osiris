@@ -63,17 +63,23 @@ def test_wheel_events_coalesce_to_one_rendered_zoom_per_frame() -> None:
 # a static per-instance attribute so a zoom step touches two floats, never a buffer -----------
 
 def test_node_size_is_a_shader_uniform_not_a_per_instance_matrix_rewrite() -> None:
+    # THE LEGIBILITY PASS, TIP 1(a) (ruling e1cb9e3b) moved sizing from a screen-pixel-
+    # constant scheme to a WORLD-unit radius clamped by a uniform min/max -- still a shader
+    # uniform, still never a per-instance matrix rewrite, just the opposite invariant (a
+    # node now shrinks with zoom-out instead of staying a fixed pixel size).
     assert "function makeInstancedCircleMaterial()" in _SPACE_JS
     assert "onBeforeCompile" in _SPACE_JS
-    assert "attribute float aRadiusPx;" in _SPACE_JS
-    assert "uniform float uWorldPerPx;" in _SPACE_JS
-    assert "transformed *= (aRadiusPx * uWorldPerPx);" in _SPACE_JS
+    assert "attribute float aRadiusWorld;" in _SPACE_JS
+    assert "uniform float uMinRadiusWorld;" in _SPACE_JS
+    assert "uniform float uMaxRadiusWorld;" in _SPACE_JS
+    assert "transformed *= clamp(aRadiusWorld, uMinRadiusWorld, uMaxRadiusWorld) * aVisible;" \
+        in _SPACE_JS
 
 
-def test_rescale_for_zoom_is_o1_two_uniform_writes_no_matrix_loop() -> None:
+def test_rescale_for_zoom_is_o1_uniform_writes_no_matrix_loop() -> None:
     body = _SPACE_JS.split("function rescaleForZoom()", 1)[1].split("\n  }\n", 1)[0]
-    assert "meshUniforms.uWorldPerPx.value = wpp" in body
-    assert "pickUniforms.uWorldPerPx.value = wpp" in body
+    assert "meshUniforms.uMinRadiusWorld.value = lo" in body
+    assert "pickUniforms.uMinRadiusWorld.value = lo" in body
     assert "getMatrixAt" not in body
     assert "setMatrixAt" not in body
     assert "for (" not in body  # no per-instance loop at all
@@ -82,7 +88,7 @@ def test_rescale_for_zoom_is_o1_two_uniform_writes_no_matrix_loop() -> None:
 def test_build_scene_sets_instance_scale_to_one_not_a_baked_pixel_size() -> None:
     body = _SPACE_JS.split("function buildScene(nodes, edges)", 1)[1][:3000]
     assert "dummy.scale.setScalar(1);" in body
-    assert "radiusAttr.setX(i, nd.radiusPx);" in body
+    assert "radiusAttr.setX(i, nd.radiusWorld);" in body
 
 
 # --- (3) the render loop ran forever (rAF + a 50ms setTimeout fallback), even off-surface or

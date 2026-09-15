@@ -15,8 +15,18 @@
          padding: 1px 4px; border-radius: 3px; transform: translate(-50%, -140%);
          white-space: nowrap; pointer-events: none; }
   .lbl.lit { color: #f0f6fc; background: rgba(35,55,80,0.9); font-weight: 600; }
-  #space-status-line { position: absolute; bottom: 10px; left: 14px; z-index: 10;
+  /* THE LEGIBILITY PASS, TIP 1(f) (ruling e1cb9e3b): the table drawer owns the bottom edge
+     now -- nothing floats in its collapsed 34px handle band any more (Thoth's own
+     screenshot showed the canvas controls colliding with it there). */
+  #space-status-line { position: absolute; bottom: 44px; left: 14px; z-index: 10;
                         font-size: 11px; color: var(--muted); }
+  .hover-card { position: absolute; z-index: 12; pointer-events: none; max-width: 260px;
+                background: rgba(13,18,25,0.92); backdrop-filter: blur(8px);
+                border: 1px solid var(--border2); border-radius: 6px; padding: 6px 8px;
+                box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
+  .hover-label { font-size: 11px; color: #f0f6fc; font-weight: 600; white-space: nowrap;
+                 overflow: hidden; text-overflow: ellipsis; }
+  .hover-meta { font-size: 10px; color: var(--muted); margin-top: 2px; }
   .table-drawer { position: absolute; left: 0; right: 0; bottom: 0; z-index: 20;
                   background: var(--panel); border-top: 1px solid var(--border2);
                   display: flex; flex-direction: column; height: 34px;
@@ -35,7 +45,7 @@
   /* the browse drawer only ever makes sense alongside the space canvas — hidden whenever
      a non-browse surface takes over #result via the pre-existing #stage.panel toggle. */
   #stage.panel .table-drawer { display: none; }
-  .legend-panel { position: absolute; bottom: 56px; left: 14px; z-index: 11; max-height: 60%;
+  .legend-panel { position: absolute; top: 52px; right: 14px; z-index: 11; max-height: 60%;
                    overflow-y: auto; background: rgba(13,18,25,0.92); backdrop-filter: blur(8px);
                    border: 1px solid var(--border2); border-radius: 6px; padding: 8px 10px;
                    font-size: 11px; min-width: 200px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
@@ -142,10 +152,6 @@
           <button class="iconbtn" id="legend-btn">Legend</button>
         </div>
         <div id="legend-panel" class="legend-panel" hidden></div>
-        <div class="graph-search-row">
-          <input id="graph-search" class="filter" placeholder="Find a node…" autocomplete="off" />
-          <div id="graph-search-dd" class="dd-list" style="display:none"></div>
-        </div>
         <div id="graph-breadcrumbs" class="graph-breadcrumbs"></div>
         <div id="space-status-line">loading…</div>
       </div>

@@ -95,8 +95,11 @@ def test_escape_still_steps_back_a_breadcrumb_when_nothing_more_local_consumed_i
     assert "if (!hadDropdown && !hadPeek && ACTIVE_SURFACE === 'browse')" in _CONSOLE_JS
 
 
-def test_graph_search_and_breadcrumb_markup_still_exist() -> None:
-    assert 'id="graph-search"' in _INDEX_HTML
+def test_breadcrumb_markup_still_exists() -> None:
+    # the graph's OWN in-canvas search box (id="graph-search") is gone as of THE LEGIBILITY
+    # PASS, TIP 1(e) (ruling e1cb9e3b, mail 10708) -- superseded by the header omnibox, not
+    # migrated. Breadcrumbs are untouched by that tip.
+    assert 'id="graph-search"' not in _INDEX_HTML
     assert 'id="graph-breadcrumbs"' in _INDEX_HTML
 
 

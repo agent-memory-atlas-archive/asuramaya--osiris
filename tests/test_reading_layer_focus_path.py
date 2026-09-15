@@ -84,10 +84,14 @@ def test_select_vs_focus_are_two_different_acts() -> None:
     assert "focusObject(hit.id)" in dblclick_body
 
 
-def test_select_never_dims_the_graph_only_focus_does() -> None:
+def test_select_never_hides_the_graph_only_focus_does() -> None:
+    # THE LEGIBILITY PASS, TIP 1(d) (ruling e1cb9e3b) replaced the old dim-to-near-invisible
+    # with an outright per-instance HIDE (aVisible) -- "no dim" was Thoth's own instruction.
     body = _SPACE_JS.split("function applyDim()", 1)[1].split("\n  }\n", 1)[0]
-    assert "FOCUS_DIM_FACTOR" in body
     assert "const focused = !!pathFocusId;" in body
+    assert "const focusHidden = focused && nd.id !== pathFocusId " \
+        "&& !pathReachable.has(nd.id);" in body
+    assert "visibleAttr.setX(i, (typeHidden || focusHidden) ? 0 : 1);" in body
 
 
 def test_enter_key_focuses_the_selected_node() -> None:
@@ -107,8 +111,17 @@ def test_focus_walk_uses_the_curated_provenance_types_never_structural() -> None
     assert "export const PATH_EDGE_TYPES" in _SPACE_JS
 
 
-def test_focus_dims_to_near_invisible_not_the_old_softer_dim() -> None:
-    assert "const FOCUS_DIM_FACTOR = 0.03;" in _SPACE_JS
+def test_focus_hides_unreachable_outright_not_a_softer_dim() -> None:
+    assert "FOCUS_DIM_FACTOR" not in _SPACE_JS  # retired outright, not just renamed
+    assert "function setHiddenTypes(types)" in _SPACE_JS
+
+
+def test_focus_is_never_empty_a_lone_reachable_node_widens_one_structural_hop() -> None:
+    # Thoth's own live measurement (mail 10708): a degree-8 Decision with no PATH_EDGE_TYPES
+    # links reached only itself and fit the camera to a point at 300x.
+    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:1600]
+    assert "if (pathReachable.size <= 1) {" in body
+    assert 'if (e.edgeClass !== "structural") continue;' in body
 
 
 def test_reachable_path_edges_draw_with_a_directional_gradient() -> None:
@@ -125,7 +138,7 @@ def test_the_focused_nodes_own_structural_edges_draw_on_focus_only() -> None:
 
 
 def test_camera_fits_to_the_reachable_set_not_a_fixed_view() -> None:
-    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:2000]
+    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:2600]
     assert "for (const rid of pathReachable)" in body
     assert "Math.min(maxViewSize, span * 1.6 + 40)" in body
 
