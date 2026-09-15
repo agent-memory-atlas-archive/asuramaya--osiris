@@ -91,6 +91,8 @@ def test_legend_checkboxes_rebuild_edge_lines_on_change() -> None:
     # THE LEGIBILITY PASS, TIP 1(e) (ruling e1cb9e3b) added a third checkbox group (node
     # types, alongside edge class/type) to the same legend panel — all three still rebuild.
     body = _SPACE_JS.split("function renderLegend(edgeList, nodeList)", 1)[1]
-    # three legend checkbox groups (node type, class, type) plus setHiddenTypes' own call
-    # (the header taxonomy pills' entry point, TIP 1(e)) — four call sites total.
-    assert body.count("buildEdgeLines(idToNode, edges);") == 4
+    # three legend checkbox groups (node type, class, type), setHiddenTypes' own call (the
+    # header taxonomy pills' entry point, TIP 1(e)), plus TIP 1b's own review-flaw-#1 fix:
+    # focusObject and clearFocus each rebuild the base layer too, so unreachable edges
+    # actually disappear on focus instead of only nodes — six call sites total.
+    assert body.count("buildEdgeLines(idToNode, edges);") == 6

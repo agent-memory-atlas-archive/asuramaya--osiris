@@ -159,7 +159,9 @@ def test_send_pane_reply_never_calls_the_launch_or_spawn_doors() -> None:
 def test_palette_search_includes_saved_compositions_in_both_search_paths() -> None:
     assert "SAVED_COMPOSITIONS.filter(c => c.name.toLowerCase().includes(ql))" in _JS
     assert "OMNI_ITEMS = toolHits.concat(compHits);" in _JS
-    assert "OMNI_ITEMS = toolHits.concat(compHits, graphHits).slice(0, 16);" in _JS
+    # TIP 1b review flaw #7 added a third source (a client-side agent-handle scan) to the
+    # debounced graph search's own final assignment.
+    assert "OMNI_ITEMS = toolHits.concat(compHits, graphHits, agentHits).slice(0, 16);" in _JS
 
 
 # THE PROJECTS SWAP (Thoth dispatch 9542/9676/9690/9716, 588148bb): the hardcoded /projects
