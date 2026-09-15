@@ -86,21 +86,32 @@ _LABEL_MAX_CHARS = 40
 
 def _short_label(
     type_name: str, canonical: str, handle: str | None, name: str | None,
+    title: str | None,
 ) -> str:
-    """THE LEGIBILITY PASS (ruling e1cb9e3b, tip 2g): the client never guesses a
+    """THE LEGIBILITY PASS (ruling e1cb9e3b, tip 2g/2c): the client never guesses a
     label. Agent by handle (never the id), SoftwareProject by its own repo name
     (canonical minus the 'repo:' scheme), Person by name, everything else its own
-    type plus canonical as a short title -- no dedicated 'title' property exists on
-    every object type, so canonical (already this codebase's own universal
-    human-legible identifier) stands in; a documented choice, not a guess. One line,
-    hard-truncated at 40 characters with an ellipsis, matching Seshat's own tip 1c
-    formatting rule exactly so the two renderings never disagree."""
+    type plus a short TITLE -- `title` is the object's own current summary/title/
+    subject/name assertion (whichever wins by confidence then recency, one query --
+    see fetch_snapshot's own correlated subquery), never canonical, for any type
+    that actually carries one (Decision/Thread/Message/Commit and friends). Fixed
+    live (Thoth mail 10892): the first cut of this function fell through to
+    canonical for every type outside Agent/SoftwareProject/Person, so a Decision
+    read "Decision decision:91da77..." on the deployed space -- the operator's own
+    original "labels show ids" complaint in a new coat. Canonical is the LAST
+    resort now, only when no title-shaped assertion exists at all. One line (any
+    embedded newline/whitespace run collapsed to a single space -- a Decision's own
+    summary is often multi-line prose), hard-truncated at 40 characters with an
+    ellipsis, matching Seshat's own tip 1c formatting rule exactly so the two
+    renderings never disagree."""
     if type_name == "Agent" and handle:
         label = handle
     elif type_name == "SoftwareProject":
         label = canonical.removeprefix("repo:") or canonical
     elif type_name == "Person" and name:
         label = name
+    elif title:
+        label = f"{type_name} {' '.join(title.split())}"
     else:
         label = f"{type_name} {canonical}"
     if len(label) > _LABEL_MAX_CHARS:
@@ -234,6 +245,9 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
         "  (SELECT a.value #>> '{}' FROM current_assertions a "
         "   WHERE a.object_id=o.id AND a.name='name' "
         "   ORDER BY a.confidence DESC, a.observed_at DESC LIMIT 1) AS name, "
+        "  (SELECT a.value #>> '{}' FROM current_assertions a "
+        "   WHERE a.object_id=o.id AND a.name IN ('summary','title','subject','name') "
+        "   ORDER BY a.confidence DESC, a.observed_at DESC LIMIT 1) AS title, "
         "  p.canonical AS project_canonical, "
         f"  {CONTESTED_SQL} AS contested "
         "FROM objects o "
@@ -277,7 +291,8 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
         project_codes.append(project_index.setdefault(project_key, len(project_index)))
         weights.append(float(weight_by_id.get(oid, 0)))
         statuses.append(STATUS_CONTESTED if r["contested"] else 0)
-        labels.append(_short_label(r["type"], r["canonical"], r["handle"], r["name"]))
+        labels.append(
+            _short_label(r["type"], r["canonical"], r["handle"], r["name"], r["title"]))
 
     edge_src: list[int] = []
     edge_dst: list[int] = []
