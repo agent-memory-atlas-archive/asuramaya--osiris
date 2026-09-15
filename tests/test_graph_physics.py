@@ -282,6 +282,81 @@ def test_level1_radius_grows_with_membership() -> None:
     assert _level1_radius(0) >= _MIN_SEPARATION  # floored, never zero or negative
 
 
+def test_project_community_buckets_splits_by_detected_community_and_noise() -> None:
+    pid = uuid.uuid4()
+    a, b, c, d = uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    communities = {a: (pid, 0), b: (pid, 0), c: (pid, 1)}  # d has none for pid
+    buckets = graph_physics._project_community_buckets(pid, [a, b, c, d], communities)
+    assert buckets[0] == [a, b]
+    assert buckets[1] == [c]
+    assert buckets[graph_physics._NOISE_COMMUNITY_KEY] == [d]
+
+
+def test_project_community_buckets_single_bucket_when_no_real_communities() -> None:
+    pid = uuid.uuid4()
+    members = [uuid.uuid4() for _ in range(5)]
+    buckets = graph_physics._project_community_buckets(pid, members, {})
+    assert len(buckets) == 1
+    assert buckets[graph_physics._NOISE_COMMUNITY_KEY] == members
+
+
+async def test_level2_raw_layout_for_project_recurses_and_separates_real_communities(
+    actions: Actions, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE RECURSIVE HIERARCHY FIX (live specimen, fourth real migration attempt --
+    a ~12,000-member project kept failing verification no matter the iteration
+    budget): two real, tightly-linked clusters within ONE project, monkeypatched
+    thresholds so Leiden actually finds them at hermetic scale. The recursive path
+    must keep each cluster's own members close together while keeping the two
+    clusters well separated from each other -- the same "no overlap by
+    construction" guarantee level 1 already gives real projects, one level
+    deeper."""
+    monkeypatch.setattr(graph_physics, "_COMMUNITY_MIN_MEMBERS", 3)
+    monkeypatch.setattr(graph_physics, "_COMMUNITY_MIN_SIZE", 2)
+
+    proj = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gp-recurse-check", "test")
+    now = datetime.now(UTC)
+    cluster_a, cluster_b = [], []
+    for i in range(6):
+        m = await actions.create_or_find_object("Thread", f"thread:gp-recurse-a{i}", "test")
+        await actions.create_link(m, proj, "in_repo", "test", now, 1.0)
+        cluster_a.append(m)
+    for i in range(6):
+        m = await actions.create_or_find_object("Thread", f"thread:gp-recurse-b{i}", "test")
+        await actions.create_link(m, proj, "in_repo", "test", now, 1.0)
+        cluster_b.append(m)
+    for i in range(len(cluster_a) - 1):
+        await actions.create_link(cluster_a[i], cluster_a[i + 1], "cites", "test", now, 1.0)
+    for i in range(len(cluster_b) - 1):
+        await actions.create_link(cluster_b[i], cluster_b[i + 1], "cites", "test", now, 1.0)
+
+    members = [*cluster_a, *cluster_b]
+    link_rows = await graph_physics._live_link_rows(actions)
+    membership = await _project_membership(actions)
+    communities = _detect_communities(link_rows, membership, {proj, *members})
+    buckets = graph_physics._project_community_buckets(proj, members, communities)
+    assert len(buckets) > 1, "test setup should have produced >1 real community bucket"
+
+    pos = graph_physics._level2_raw_layout_for_project(proj, members, link_rows, communities)
+    assert set(pos.keys()) == set(members)
+
+    a_pts = np.array([pos[m] for m in cluster_a])
+    b_pts = np.array([pos[m] for m in cluster_b])
+    # Compares against what `_separate_extents` actually guarantees (min cross-
+    # cluster distance vs. min within-cluster distance), not a naive centroid/max-
+    # radius check -- the algorithm's own reference point for each community's
+    # radius is its recentred FR position, not the point cloud's simple mean.
+    cross = np.linalg.norm(a_pts[:, None, :] - b_pts[None, :, :], axis=-1)
+    within_a = np.linalg.norm(a_pts[:, None, :] - a_pts[None, :, :], axis=-1)
+    within_b = np.linalg.norm(b_pts[:, None, :] - b_pts[None, :, :], axis=-1)
+    np.fill_diagonal(within_a, np.inf)
+    np.fill_diagonal(within_b, np.inf)
+    assert cross.min() > max(within_a.min(), within_b.min()), (
+        "a cross-cluster pair sits closer together than points WITHIN a cluster -- "
+        "the two communities are not meaningfully separated")
+
+
 def test_separate_extents_pushes_overlapping_discs_apart() -> None:
     pos = np.array([[0.0, 0.0], [1.0, 0.0]])  # two discs, centroids 1 unit apart
     radii = np.array([50.0, 50.0])  # each wants 100+gutter of clearance
@@ -545,6 +620,27 @@ async def test_run_physics_migrate_writes_every_active_object_at_the_current_ver
         "WHERE object_id = ANY($1::uuid[]) AND name=$2",
         [a, b], _LAYOUT_VERSION_PROP)
     assert all(r["v"] == _PHYSICS_LAYOUT_VERSION for r in rows)
+
+
+async def test_run_physics_migrate_verify_only_writes_nothing(actions: Actions) -> None:
+    """THE VERIFY-ONLY DOOR (ruling 6befd2a5, Thoth mail 11178): computes and
+    verifies but never reaches the write step -- a real migration door's own
+    positions_for lookup for the SAME objects must come back empty."""
+    from src.orchestrator.graph_layout import positions_for
+
+    now = datetime.now(UTC)
+    a = await actions.create_or_find_object("Thread", "thread:gp-verify-only-a", "test")
+    b = await actions.create_or_find_object("Thread", "thread:gp-verify-only-b", "test")
+    await actions.create_link(a, b, "cites", "test", now, 1.0)
+
+    receipts = [r async for r in run_physics_migrate(actions, verify_only=True)]
+    assert receipts[-1]["done"] is True
+    assert receipts[-1]["verify_only"] is True
+    assert receipts[-1]["placed"] >= 2
+    assert "peak_rss_kb" not in receipts[-1]
+
+    placed = await positions_for(actions, [a, b])
+    assert placed == {}
 
 
 async def test_run_physics_migrate_refuses_when_the_layout_lock_is_held(

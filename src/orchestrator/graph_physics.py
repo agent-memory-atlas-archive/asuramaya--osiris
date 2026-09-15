@@ -241,26 +241,33 @@ _MIN_SEP_EPSILON = 0.5  # numerical slack `_verify_min_separation` allows below 
                         # iterations can leave a pair a few thousandths short even
                         # when it fully converged; this is tolerance for that, never
                         # a loophole for a real violation.
-_PHYSICS_DECLUMP_ITERATIONS = 60  # live flake specimen (full-suite serial gate,
-                                  # e7cf6c59 follow-up): a hermetic 3-object
-                                  # all-unfiled population -- `_place_unfiled`'s own
-                                  # Gaussian fog occasionally starts a genuinely slow-
-                                  # converging small-N configuration (simultaneous
-                                  # vectorized pushes among 2-3 mutually close points
-                                  # can overshoot and correct over several passes
-                                  # rather than settle in one) -- left a pair 14.24
-                                  # units apart after `_declump`'s own DEFAULT 30
-                                  # iterations, under the floor by more than
-                                  # `_MIN_SEP_EPSILON`. Double the budget for this
-                                  # migration's own final pass -- cheap (`_declump`'s
-                                  # real cost is near-O(n) per pass, negligible next
-                                  # to the FR phases) at any population size, and the
-                                  # real 50,317-object live migration already
-                                  # succeeded comfortably inside the OLD 30-iteration
-                                  # default, so this is headroom, not a sign the
-                                  # algorithm needed doubling everywhere -- every
-                                  # OTHER caller (the incremental heartbeat) keeps
-                                  # `_declump`'s own plain default.
+_PHYSICS_DECLUMP_ITERATIONS = 150  # started at 30 (graph_layout._declump's own
+                                  # default), doubled to 60 (live flake specimen,
+                                  # full-suite serial gate, e7cf6c59 follow-up: a
+                                  # hermetic 3-object all-unfiled population's
+                                  # Gaussian fog occasionally started a genuinely
+                                  # slow-converging small-N configuration, left a
+                                  # pair 14.24 units apart under the floor). THE
+                                  # RECURSIVE HIERARCHY FIX (fourth real migration
+                                  # attempt, 41b7bea6) then fixed the ~12,000-member
+                                  # project's own O(n)-scale convergence problem
+                                  # STRUCTURALLY, not by more iterations (measured:
+                                  # 7m24s at 200 iterations for that ONE project
+                                  # alone, still failed) -- once that landed, the
+                                  # remaining failures were genuine borderline
+                                  # convergence gaps on ordinary-sized populations
+                                  # (measured across repeat --verify-only runs
+                                  # against the live population: 14.08 and 14.462 of
+                                  # 15 units, both narrow misses, not the multi-unit
+                                  # gaps a structural bug produces). 150 verified
+                                  # clean on three consecutive live --verify-only
+                                  # runs (~2m50s-2m59s wall clock each, well inside
+                                  # the 10-minute acceptance) -- headroom for
+                                  # residual per-run variance (the live population
+                                  # itself shifts between runs), not a sign the
+                                  # algorithm needs doubling everywhere: every OTHER
+                                  # `_declump` caller (the incremental heartbeat)
+                                  # keeps its own plain 30-iteration default.
 _VERIFY_MAX_CANDIDATES = 2000  # a cell-pair candidate count above this is treated as
                                # an outright verification failure rather than paying
                                # for the full pairwise check -- this many points
@@ -564,20 +571,28 @@ def _level1_layout(
     return {pid: pos[i] for i, pid in enumerate(project_ids)}
 
 
-def _level2_raw_layout_for_project(
+_NOISE_COMMUNITY_KEY = -1  # local-community-id sentinel for "no real community for
+                           # THIS project" -- Leiden's own local ids start at 0, so
+                           # -1 never collides with a real one.
+
+
+def _level2_flat_raw_layout(
     pid: uuid.UUID, members: list[uuid.UUID], link_rows: list[asyncpg.Record],
     communities: dict[uuid.UUID, tuple[uuid.UUID, int]],
 ) -> dict[uuid.UUID, np.ndarray]:
-    """One project's own internal FR pass, RAW -- reuses `_build_physics_graph`
-    UNCHANGED (semantic springs, district/community gravity, THE COLLAPSED-
-    CONTAINER FIX's 1/member-count container weight), scoped to just
-    `[pid, *members]` so container and semantic edges outside this project are
-    dropped by that function's own `idx` membership check. The project's own
-    vertex is an ordinary participant, so its FINAL FR position -- not the origin --
-    is what the whole subgraph recentres on (`pos[0]` since `pid` is always first in
+    """One (project or community) population's own internal FR pass, RAW -- reuses
+    `_build_physics_graph` UNCHANGED (semantic springs, district/community gravity,
+    THE COLLAPSED-CONTAINER FIX's 1/member-count container weight), scoped to just
+    `[pid, *members]` so container and semantic edges outside this population are
+    dropped by that function's own `idx` membership check. `pid`'s own vertex is an
+    ordinary participant, so its FINAL FR position -- not the origin -- is what the
+    whole subgraph recentres on (`pos[0]` since `pid` is always first in
     `object_ids`), exactly mirroring how v7's flat layout let a container's own
-    position be "wherever the pull leaves it". Finished with a LOCAL `_declump`
-    pass at the full `_MIN_SEPARATION` floor (cheap at project scale) -- THE
+    position be "wherever the pull leaves it" (when called for a community bucket
+    from `_level2_raw_layout_for_project`, `pid` is still the PROJECT's own id --
+    every bucket recentres on the same project vertex, which is fine since only the
+    bucket's own MEMBER positions are ever read back out). Finished with a LOCAL
+    `_declump` pass at the full `_MIN_SEPARATION` floor (cheap at this scale) -- THE
     RESCALE COMPRESSION FIX (live specimen, first real migration attempt on
     e7cf6c59: two members landed 0.14-0.93 units apart): a single global
     percentile-based downward rescale in the OLD scheme could compress an already-
@@ -602,6 +617,110 @@ def _level2_raw_layout_for_project(
             member_pos, np.zeros((0, 2)), members, min_sep=_MIN_SEPARATION,
             iterations=_PHYSICS_DECLUMP_ITERATIONS)
     return {oid: member_pos[i] for i, oid in enumerate(members)}
+
+
+def _project_community_buckets(
+    pid: uuid.UUID, members: list[uuid.UUID],
+    communities: dict[uuid.UUID, tuple[uuid.UUID, int]],
+) -> dict[int, list[uuid.UUID]]:
+    """This project's own members, bucketed by detected community-local-id
+    (creation order preserved within each bucket) -- a member with no real
+    community for THIS project (small project, or a genuinely edgeless member)
+    collects under `_NOISE_COMMUNITY_KEY`."""
+    buckets: dict[int, list[uuid.UUID]] = defaultdict(list)
+    for oid in members:
+        c = communities.get(oid)
+        key = c[1] if c is not None and c[0] == pid else _NOISE_COMMUNITY_KEY
+        buckets[key].append(oid)
+    return dict(buckets)
+
+
+def _community_vertex_id(pid: uuid.UUID, community_key: int) -> uuid.UUID:
+    """A deterministic SYNTHETIC uuid (never a real object id -- `uuid5` over a
+    namespace derived from `pid` itself, so two different projects' own community
+    #0 never collide) letting `_level1_layout`'s already-generic (radius,
+    cross-edge) machinery get reused UNCHANGED one level deeper, for a project's
+    own communities exactly the way it's used for the whole graph's own projects."""
+    return uuid.uuid5(pid, f"community:{community_key}")
+
+
+def _intra_project_community_edges(
+    link_rows: list[asyncpg.Record], oid_community_vertex: dict[uuid.UUID, uuid.UUID],
+) -> dict[tuple[uuid.UUID, uuid.UUID], float]:
+    """One aggregated weighted edge per unordered (community_vertex_a,
+    community_vertex_b) pair, counting every live semantic link between a member of
+    one and a member of the other -- the SAME aggregation `_cross_project_edges`
+    does for the whole graph's own projects, one level deeper."""
+    counts: dict[tuple[uuid.UUID, uuid.UUID], int] = defaultdict(int)
+    for r in link_rows:
+        f, t, lt = r["from_id"], r["to_id"], r["type"]
+        if lt in CONTAINER_LINK_TYPES or lt in STRUCTURAL_LINK_TYPES:
+            continue
+        cf, ct = oid_community_vertex.get(f), oid_community_vertex.get(t)
+        if cf is None or ct is None or cf == ct:
+            continue
+        key = (cf, ct) if str(cf) <= str(ct) else (ct, cf)
+        counts[key] += 1
+    return {k: float(v) for k, v in counts.items()}
+
+
+def _level2_raw_layout_for_project(
+    pid: uuid.UUID, members: list[uuid.UUID], link_rows: list[asyncpg.Record],
+    communities: dict[uuid.UUID, tuple[uuid.UUID, int]],
+) -> dict[uuid.UUID, np.ndarray]:
+    """THE RECURSIVE HIERARCHY FIX (live specimen, fourth real migration attempt on
+    41b7bea6+): a project with ~12,000 members (nearly 7x the next-biggest) kept
+    failing `_verify_min_separation` no matter how high `_PHYSICS_DECLUMP_ITERATIONS`
+    went (measured: even 200 iterations, 7m24s wall clock for this ONE project
+    alone, still failed) -- `_level2_flat_raw_layout`'s single FR-plus-declump pass
+    over the WHOLE project doesn't scale to this population any better than v7's
+    OLD whole-GRAPH flat pass did, for the exact same reason (declump does bounded
+    LOCAL cleanup; it cannot fix macro-structure FR left too dense). The fix is the
+    SAME one that fixed the whole graph: stop letting sub-populations overlap by
+    construction, one level deeper.
+
+    A project with more than one real community bucket
+    (`_project_community_buckets`) gets its own MINI level-1/level-2 split: each
+    community's own members get `_level2_flat_raw_layout`'d independently (a
+    population of hundreds, not thousands), then `_level2_extent` measures each
+    community's own REAL spread, `_level1_layout` (reused UNCHANGED, via synthetic
+    `_community_vertex_id`s) lays the communities out with extent-aware separation
+    so they can never overlap, and each community's own raw layout is scaled UP
+    ONLY (never down, the same `_level2_finalize` guarantee) onto its own centroid.
+    A project with zero or one bucket (below `_COMMUNITY_MIN_MEMBERS`, or a small
+    project whose members never formed a real Leiden community) falls back to the
+    plain flat pass unchanged -- this recursion only ever engages where it's
+    measured necessary."""
+    buckets = _project_community_buckets(pid, members, communities)
+    if len(buckets) <= 1:
+        return _level2_flat_raw_layout(pid, members, link_rows, communities)
+
+    vertex_for = {key: _community_vertex_id(pid, key) for key in buckets}
+    oid_community_vertex = {
+        oid: vertex_for[key] for key, ms in buckets.items() for oid in ms}
+
+    sub_raws = {
+        key: _level2_flat_raw_layout(pid, ms, link_rows, communities)
+        for key, ms in buckets.items()
+    }
+    real_extents = {vertex_for[key]: _level2_extent(sub_raws[key]) for key in buckets}
+    nominal_radii = {
+        vertex_for[key]: _level1_radius(len(buckets[key])) for key in buckets}
+    radii = {
+        vid: max(nominal_radii[vid], real_extents[vid]) for vid in vertex_for.values()}
+
+    cross_edges = _intra_project_community_edges(link_rows, oid_community_vertex)
+    centroids = _level1_layout(list(vertex_for.values()), radii, cross_edges)
+
+    out: dict[uuid.UUID, np.ndarray] = {}
+    for key, vid in vertex_for.items():
+        sub_raw = sub_raws[key]
+        extent = real_extents[vid]
+        scale = max(nominal_radii[vid] / extent, 1.0) if extent > 1e-6 else 1.0
+        centroid = centroids[vid]
+        for oid, p in sub_raw.items():
+            out[oid] = p * scale + centroid
+    return out
 
 
 def _level2_extent(raw: dict[uuid.UUID, np.ndarray]) -> float:
@@ -872,6 +991,24 @@ async def _physics_positions(
             raw_layouts[pid], radii_nominal[pid], real_extents[pid], centroids[pid]))
 
     _apply_bridge_nudges(positions, link_rows, membership, centroids)
+    # THE POST-NUDGE DECLUMP (live specimen, fourth real migration attempt on
+    # 41b7bea6): a bridging member gets nudged INDEPENDENTLY of its own
+    # non-bridging project-mates -- each project's own raw layout was already
+    # floor-respecting (`_level2_raw_layout_for_project`'s own local declump), and
+    # `_level2_finalize`'s scale only ever grows, but a nudge applied AFTER that
+    # can still land a bridging member too close to a sibling who never moved.
+    # Re-settling HERE, while the population is still just projects+members (no
+    # unfiled, no hubs yet), catches that disruption close to where it was
+    # introduced instead of leaving it all to the one final global pass, which
+    # (live specimens 3 and 4) doesn't always finish every local pocket it's
+    # handed within its own iteration budget.
+    if len(positions) > 1:
+        ids_order = list(positions.keys())
+        pos_arr = np.array([positions[oid] for oid in ids_order])
+        pos_arr = _declump(
+            pos_arr, np.zeros((0, 2)), ids_order, min_sep=_MIN_SEPARATION,
+            iterations=_PHYSICS_DECLUMP_ITERATIONS)
+        positions = {oid: pos_arr[i] for i, oid in enumerate(ids_order)}
     positions.update(_place_unfiled(unfiled_ids, link_rows, positions))
 
     if hub_order:
@@ -915,16 +1052,28 @@ async def _memory_guard(actions: Actions, positions: np.ndarray) -> str | None:
     return None
 
 
-async def run_physics_migrate(actions: Actions) -> AsyncIterator[dict[str, Any]]:
+async def run_physics_migrate(
+    actions: Actions, *, verify_only: bool = False,
+) -> AsyncIterator[dict[str, Any]]:
     """THE PHYSICS LAYOUT's own migration door: a SINGLE global computation over the
     whole active population (never a batch loop -- see the module docstring for why),
     sharing `graph_layout._LAYOUT_LOCK_KEY` with the cron heartbeat and
     `run_layout_migrate` so nothing else touches graph_x/graph_y while this runs.
     Yields coarse stage receipts (not one per batch, since there are none) and a
-    final `{"done": True, "placed": N, "peak_rss_kb": N}` -- `_physics_positions`'s
-    own post-FR memory guard (THE COLLAPSED-CONTAINER FIX, Thoth mail 11111) can
-    raise `MemoryBudgetExceeded` instead, turned here into a single `{"error": ...}`
-    receipt with no write."""
+    final `{"done": True, "placed": N, "peak_rss_kb": N}` -- `_physics_positions` can
+    raise `MemoryBudgetExceeded` (THE COLLAPSED-CONTAINER FIX, Thoth mail 11111) or
+    `DeclumpVerificationFailed` (item 2, Thoth mail 11128), either turned here into a
+    single `{"error": ...}` receipt with no write.
+
+    `verify_only=True` (ruling 6befd2a5, Thoth mail 11178, added after the fourth
+    live migration attempt needed a fourth deploy-probe-diagnose cycle just to see
+    whether a fix actually worked): computes and verifies everything -- population,
+    hierarchical layout, declump, the min-sep verification -- WITHOUT ever reaching
+    the write step below (structurally, not by a flag check inside the write path --
+    the `return` two lines above the write loop is what actually guarantees it). A
+    verify-only run is read-only by construction, so unlike a real migration it MAY
+    run from an undeployed branch against the live population; only a run that
+    actually writes still needs deployed code (the migration-doors rule)."""
     async with actions.pool.acquire() as lock_conn:
         if not await _try_acquire_layout_lock(lock_conn):
             yield {"error": "the layout heartbeat (or a migrate run) currently holds "
@@ -934,8 +1083,11 @@ async def run_physics_migrate(actions: Actions) -> AsyncIterator[dict[str, Any]]
             yield {"stage": "computing"}
             try:
                 positions = await _physics_positions(actions)
-            except MemoryBudgetExceeded as exc:
+            except (MemoryBudgetExceeded, DeclumpVerificationFailed) as exc:
                 yield {"error": str(exc)}
+                return
+            if verify_only:
+                yield {"done": True, "verify_only": True, "placed": len(positions)}
                 return
             yield {"stage": "writing", "count": len(positions)}
             now = datetime.now(UTC)
