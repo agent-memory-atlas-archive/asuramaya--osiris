@@ -1,9 +1,11 @@
-"""THE PHYSICS LAYOUT (operator ruling d7d55257, Thoth mail 11047): springs for
-semantic edges, weak gravity for container edges, nested communities in big
-projects, hub re-centering, the existing declump floor -- all over the WHOLE active
-graph in one pass, never a batch loop."""
+"""THE PHYSICS LAYOUT (operator ruling d7d55257, Thoth mail 11047), now HIERARCHICAL
+(v8, Thoth mail 11128): a project-contracted level 1 (extent-aware separation so no
+two projects ever overlap) plus a per-project level 2 (springs, district gravity,
+the collapsed-container fix, rescaled onto its own level-1 disc), cross-project
+bridge nudges, unfiled-object placement, and a VERIFIED declump floor."""
 from __future__ import annotations
 
+import math
 import uuid
 from datetime import UTC, datetime
 
@@ -14,14 +16,22 @@ from src.orchestrator import graph_physics
 from src.orchestrator.graph_layout import _LAYOUT_VERSION, _MIN_SEPARATION, _grid_cells
 from src.orchestrator.graph_physics import (
     _PHYSICS_LAYOUT_VERSION,
+    DeclumpVerificationFailed,
+    _apply_bridge_nudges,
     _build_physics_graph,
+    _cross_project_edges,
     _detect_communities,
-    _fr_and_recenter,
+    _level1_layout,
+    _level1_radius,
+    _level2_layout_for_project,
     _memory_guard,
     _physics_positions,
+    _place_unfiled,
     _project_membership,
     _seed_positions,
     _semantic_weight,
+    _separate_extents,
+    _verify_min_separation,
     run_physics_migrate,
 )
 
@@ -223,23 +233,28 @@ async def test_physics_positions_places_every_active_object_with_no_exact_collis
     for x, y in positions.values():
         assert x == x and y == y  # not NaN
 
+    # tolerance matches `_verify_min_separation`'s own epsilon (already enforced
+    # inside `_physics_positions` itself, which would have raised
+    # DeclumpVerificationFailed otherwise) -- a bare 1e-6 assumed exact convergence,
+    # which the declump's own docstring already disclaims ("a few thousandths short
+    # after rounding"); this population's unfiled objects seed via a Gaussian fog
+    # (item 4) rather than the old deterministic sunflower scatter, so a near-exact
+    # residual after 30 iterations is expected, not a regression.
     pts = list(positions.values())
     for i in range(len(pts)):
         for j in range(i + 1, len(pts)):
             dist = ((pts[i][0] - pts[j][0]) ** 2 + (pts[i][1] - pts[j][1]) ** 2) ** 0.5
-            assert dist >= _MIN_SEPARATION - 1e-6
+            assert dist >= _MIN_SEPARATION - graph_physics._MIN_SEP_EPSILON
 
 
-async def test_fr_and_recenter_does_not_collapse_a_large_container_into_one_cell(
+async def test_level2_layout_does_not_collapse_a_large_project_into_one_cell(
     actions: Actions,
 ) -> None:
-    """THE COLLAPSED-CONTAINER FIX (Thoth mail 11111): a live specimen on the real
-    migration -- one grid cell held 6,131 post-FR points, all container-only
-    siblings of the SAME project with no semantic edge differentiating them.
-    Reproduced here at a smaller but still real scale (1,000 members, hermetic DB,
-    no semantic edges at all) -- container gravity scaled by 1/sqrt(member count)
-    should let sibling repulsion spread them out instead. Acceptance (Thoth's own
-    line): no post-FR cell holds more than roughly 50 points for any project."""
+    """THE COLLAPSED-CONTAINER FIX (Thoth mail 11111), re-checked against the
+    hierarchical scheme's own per-project FR pass -- 1,000 members, hermetic DB, no
+    semantic edges at all, so container gravity is the ONLY force differentiating
+    them. Acceptance (Thoth's own line): no post-FR cell holds more than roughly
+    50 points for any project."""
     proj = await actions.create_or_find_object(
         "SoftwareProject", "repo:gp-collapse-check", "test")
     now = datetime.now(UTC)
@@ -249,14 +264,14 @@ async def test_fr_and_recenter_does_not_collapse_a_large_container_into_one_cell
         await actions.create_link(m, proj, "in_repo", "test", now, 1.0)
         members.append(m)
 
-    object_ids = [proj, *members]
     link_rows = await graph_physics._live_link_rows(actions)
     membership = await _project_membership(actions)
-    communities = _detect_communities(link_rows, membership, set(object_ids))
-    g, vertex_ids = _build_physics_graph(object_ids, link_rows, communities)
-    hub_ids: set[uuid.UUID] = set()
+    communities = _detect_communities(link_rows, membership, {proj, *members})
+    radius = _level1_radius(len(members))
 
-    pos = _fr_and_recenter(g, vertex_ids, object_ids, hub_ids)
+    member_pos = _level2_layout_for_project(
+        proj, members, link_rows, communities, np.zeros(2), radius)
+    pos = np.array([member_pos[m] for m in members])
     cells = _grid_cells(pos, _MIN_SEPARATION)
     worst_cell = max(len(v) for v in cells.values())
     assert worst_cell <= 100, (
@@ -264,11 +279,166 @@ async def test_fr_and_recenter_does_not_collapse_a_large_container_into_one_cell
         "container gravity is still collapsing this project's own siblings")
 
 
+def test_level1_radius_grows_with_membership() -> None:
+    assert _level1_radius(4) < _level1_radius(400)
+    assert _level1_radius(0) >= _MIN_SEPARATION  # floored, never zero or negative
+
+
+def test_separate_extents_pushes_overlapping_discs_apart() -> None:
+    pos = np.array([[0.0, 0.0], [1.0, 0.0]])  # two discs, centroids 1 unit apart
+    radii = np.array([50.0, 50.0])  # each wants 100+gutter of clearance
+    out = _separate_extents(pos, radii, gutter=10.0, iterations=50)
+    dist = float(np.linalg.norm(out[0] - out[1]))
+    assert dist >= 110.0 - 1e-3
+
+
+def test_separate_extents_leaves_already_separated_discs_alone() -> None:
+    pos = np.array([[0.0, 0.0], [1000.0, 0.0]])
+    radii = np.array([10.0, 10.0])
+    out = _separate_extents(pos, radii, gutter=5.0, iterations=50)
+    assert np.allclose(out, pos)
+
+
+async def test_cross_project_edges_aggregates_by_unordered_project_pair(
+    actions: Actions,
+) -> None:
+    proj_a = await actions.create_or_find_object("SoftwareProject", "repo:gp-cross-a", "test")
+    proj_b = await actions.create_or_find_object("SoftwareProject", "repo:gp-cross-b", "test")
+    now = datetime.now(UTC)
+    m_a = await actions.create_or_find_object("Thread", "thread:gp-cross-ma", "test")
+    m_b1 = await actions.create_or_find_object("Thread", "thread:gp-cross-mb1", "test")
+    m_b2 = await actions.create_or_find_object("Thread", "thread:gp-cross-mb2", "test")
+    await actions.create_link(m_a, proj_a, "in_repo", "test", now, 1.0)
+    await actions.create_link(m_b1, proj_b, "in_repo", "test", now, 1.0)
+    await actions.create_link(m_b2, proj_b, "in_repo", "test", now, 1.0)
+    await actions.create_link(m_a, m_b1, "cites", "test", now, 1.0)
+    await actions.create_link(m_a, m_b2, "cites", "test", now, 1.0)
+
+    link_rows = await graph_physics._live_link_rows(actions)
+    membership = await _project_membership(actions)
+    edges = _cross_project_edges(link_rows, membership, {proj_a, proj_b})
+    key = (proj_a, proj_b) if str(proj_a) <= str(proj_b) else (proj_b, proj_a)
+    assert edges.get(key) == 2.0
+
+
+def test_level1_layout_places_a_single_project_at_the_origin_ish() -> None:
+    pid = uuid.uuid4()
+    out = _level1_layout([pid], {pid: 20.0}, {})
+    assert pid in out
+    assert out[pid].shape == (2,)
+
+
+def test_apply_bridge_nudges_moves_a_bridging_member_toward_the_other_centroid() -> None:
+    a, b, proj_a, proj_b = uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    positions = {a: np.array([0.0, 0.0]), b: np.array([100.0, 0.0])}
+    membership = {a: proj_a, b: proj_b}
+    centroids = {proj_a: np.array([0.0, 0.0]), proj_b: np.array([100.0, 0.0])}
+
+    class _Row(dict):
+        def __getitem__(self, key: str) -> object:
+            return dict.__getitem__(self, key)
+
+    link_rows = [_Row(from_id=a, to_id=b, type="cites")]
+    before = positions[a].copy()
+    _apply_bridge_nudges(positions, link_rows, membership, centroids)
+    assert positions[a][0] > before[0]  # nudged toward proj_b's centroid (positive x)
+
+
+def test_place_unfiled_with_neighbours_lands_at_their_mean_position() -> None:
+    a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    placed = {b: np.array([0.0, 0.0]), c: np.array([10.0, 0.0])}
+
+    class _Row(dict):
+        def __getitem__(self, key: str) -> object:
+            return dict.__getitem__(self, key)
+
+    link_rows = [_Row(from_id=a, to_id=b, type="cites"), _Row(from_id=a, to_id=c, type="cites")]
+    out = _place_unfiled([a], link_rows, placed)
+    assert np.allclose(out[a], [5.0, 0.0])
+
+
+def test_place_unfiled_edgeless_scatters_away_from_a_fixed_ring() -> None:
+    """The exact failure Thoth's own measurement flagged on v7 -- a fixed-radius
+    ring shell -- must NOT reproduce here: many edgeless unfiled objects should
+    land at a SPREAD of distances from the cloud centre, not all at one radius."""
+    placed = {uuid.uuid4(): np.array([float(i), 0.0]) for i in range(50)}
+    unfiled = [uuid.uuid4() for _ in range(200)]
+    out = _place_unfiled(unfiled, [], placed)
+    center = np.array(list(placed.values())).mean(axis=0)
+    radii = np.array([np.linalg.norm(out[oid] - center) for oid in unfiled])
+    assert radii.std() > 1.0  # a real spread, not one shared radius
+
+
+def test_verify_min_separation_passes_for_a_well_spread_population() -> None:
+    ids: list[uuid.UUID | None] = [uuid.uuid4() for _ in range(50)]
+    pos = _seed_positions(ids)
+    _verify_min_separation(pos, min_sep=_MIN_SEPARATION)  # no raise
+
+
+def test_verify_min_separation_raises_on_two_coincident_points() -> None:
+    pos = np.array([[0.0, 0.0], [0.001, 0.0]])
+    with pytest.raises(DeclumpVerificationFailed):
+        _verify_min_separation(pos, min_sep=_MIN_SEPARATION)
+
+
 async def test_physics_positions_empty_population_returns_empty(actions: Actions) -> None:
     # a fresh hermetic DB per test -- no active objects yet at this point isn't
     # guaranteed (other fixtures may seed some), so only assert the no-crash shape.
     positions = await _physics_positions(actions)
     assert isinstance(positions, dict)
+
+
+async def test_physics_positions_multi_project_end_to_end_acceptance(
+    actions: Actions,
+) -> None:
+    """THE HIERARCHICAL PHYSICS acceptance (Thoth mail 11128), at hermetic scale --
+    3 projects, ~40 members each, one cross-project bridge, one unfiled object.
+    v7's own live failure was every project's members spreading to ~1,000 units
+    while centroids sat only 82-224 apart; the acceptance line here is the direct
+    hermetic analogue -- every pair of project centroids at least as far apart as
+    the sum of their own radius budgets, which v7 never enforced at all."""
+    now = datetime.now(UTC)
+    projects = []
+    all_members: dict[uuid.UUID, list[uuid.UUID]] = {}
+    for p in range(3):
+        proj = await actions.create_or_find_object(
+            "SoftwareProject", f"repo:gp-e2e-{p}", "test")
+        projects.append(proj)
+        members = []
+        for i in range(40):
+            m = await actions.create_or_find_object("Thread", f"thread:gp-e2e-{p}-{i}", "test")
+            await actions.create_link(m, proj, "in_repo", "test", now, 1.0)
+            members.append(m)
+            if i > 0:
+                await actions.create_link(members[i - 1], m, "cites", "test", now, 1.0)
+        all_members[proj] = members
+    # one real cross-project bridge
+    await actions.create_link(
+        all_members[projects[0]][0], all_members[projects[1]][0], "cites", "test", now, 1.0)
+    unfiled = await actions.create_or_find_object("Thread", "thread:gp-e2e-unfiled", "test")
+    await actions.create_link(unfiled, all_members[projects[2]][0], "cites", "test", now, 1.0)
+
+    positions = await _physics_positions(actions)
+    for oid in [*projects, *[m for ms in all_members.values() for m in ms], unfiled]:
+        assert oid in positions
+
+    radii = {pid: graph_physics._level1_radius(len(all_members[pid])) for pid in projects}
+    for i in range(len(projects)):
+        for j in range(i + 1, len(projects)):
+            a, b = projects[i], projects[j]
+            dist = math.dist(positions[a], positions[b])
+            assert dist >= radii[a] + radii[b] - 1e-6, (
+                f"project centroids {dist:.1f} apart, under the "
+                f"{radii[a] + radii[b]:.1f} radius-sum floor -- projects overlap")
+
+    pts = np.array(list(positions.values()))
+    tree_dists = []
+    for i in range(len(pts)):
+        deltas = np.linalg.norm(pts - pts[i], axis=1)
+        deltas[i] = np.inf
+        tree_dists.append(float(deltas.min()))
+    p50 = float(np.percentile(tree_dists, 50))
+    assert p50 >= _MIN_SEPARATION - 1e-6  # the hard floor v7 failed to enforce at all
 
 
 async def test_run_physics_migrate_writes_every_active_object_at_the_current_version(
