@@ -232,6 +232,26 @@ _MIN_SEP_EPSILON = 0.5  # numerical slack `_verify_min_separation` allows below 
                         # iterations can leave a pair a few thousandths short even
                         # when it fully converged; this is tolerance for that, never
                         # a loophole for a real violation.
+_PHYSICS_DECLUMP_ITERATIONS = 60  # live flake specimen (full-suite serial gate,
+                                  # e7cf6c59 follow-up): a hermetic 3-object
+                                  # all-unfiled population -- `_place_unfiled`'s own
+                                  # Gaussian fog occasionally starts a genuinely slow-
+                                  # converging small-N configuration (simultaneous
+                                  # vectorized pushes among 2-3 mutually close points
+                                  # can overshoot and correct over several passes
+                                  # rather than settle in one) -- left a pair 14.24
+                                  # units apart after `_declump`'s own DEFAULT 30
+                                  # iterations, under the floor by more than
+                                  # `_MIN_SEP_EPSILON`. Double the budget for this
+                                  # migration's own final pass -- cheap (`_declump`'s
+                                  # real cost is near-O(n) per pass, negligible next
+                                  # to the FR phases) at any population size, and the
+                                  # real 50,317-object live migration already
+                                  # succeeded comfortably inside the OLD 30-iteration
+                                  # default, so this is headroom, not a sign the
+                                  # algorithm needed doubling everywhere -- every
+                                  # OTHER caller (the incremental heartbeat) keeps
+                                  # `_declump`'s own plain default.
 _VERIFY_MAX_CANDIDATES = 2000  # a cell-pair candidate count above this is treated as
                                # an outright verification failure rather than paying
                                # for the full pairwise check -- this many points
@@ -772,7 +792,8 @@ async def _physics_positions(
         raise MemoryBudgetExceeded(reason)
 
     declumped = _declump(
-        real_positions, np.zeros((0, 2)), object_ids, min_sep=_MIN_SEPARATION)
+        real_positions, np.zeros((0, 2)), object_ids, min_sep=_MIN_SEPARATION,
+        iterations=_PHYSICS_DECLUMP_ITERATIONS)
     _verify_min_separation(declumped)
 
     return {oid: (float(declumped[i, 0]), float(declumped[i, 1]))

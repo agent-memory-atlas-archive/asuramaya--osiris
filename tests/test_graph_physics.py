@@ -381,6 +381,26 @@ def test_verify_min_separation_raises_on_two_coincident_points() -> None:
         _verify_min_separation(pos, min_sep=_MIN_SEPARATION)
 
 
+def test_declump_then_verify_never_flakes_on_many_random_small_unfiled_populations() -> None:
+    """Live flake specimen (full-suite serial gate, e7cf6c59 follow-up): a hermetic
+    3-object all-unfiled population occasionally left one pair 14.24 units apart
+    after `_declump`'s own default 30 iterations, under the 15-unit floor by more
+    than `_verify_min_separation`'s epsilon. Reproduced here directly (no DB) over
+    many random small populations -- `_place_unfiled`'s own Gaussian fog is exactly
+    what generated the flaky starting configuration -- to confirm
+    `_PHYSICS_DECLUMP_ITERATIONS` actually closes the gap rather than just moving
+    it to a rarer seed."""
+    for _trial in range(300):
+        for n in (2, 3, 4):
+            ids = [uuid.uuid4() for _ in range(n)]
+            out = graph_physics._place_unfiled(ids, [], {})
+            pos = np.array([out[oid] for oid in ids])
+            declumped = graph_physics._declump(
+                pos, np.zeros((0, 2)), ids, min_sep=_MIN_SEPARATION,
+                iterations=graph_physics._PHYSICS_DECLUMP_ITERATIONS)
+            _verify_min_separation(declumped)  # raises on failure -- the assertion
+
+
 def test_place_hubs_in_zone_spreads_hubs_at_least_min_sep_apart() -> None:
     """THE HUB ZONE fix (live specimen, first bcc6b3f3 migration attempt): the old
     "jitter by 1 unit around the centroid" scheme packed every hub into a 2-unit
