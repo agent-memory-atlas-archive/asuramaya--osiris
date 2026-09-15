@@ -237,6 +237,35 @@ def test_declump_60000_random_points_completes_fast_with_bounded_memory() -> Non
     assert out.shape == (n, 2)
 
 
+def test_declump_one_dense_cluster_of_6000_coincident_points_stays_fast() -> None:
+    """THE DENSE-CELL FIX (Thoth mail 11109/11110): a live specimen on THE PHYSICS
+    LAYOUT's real migration -- one grid cell held 6,131 post-FR points (many
+    container-only siblings pulled to the same weak-gravity target with no semantic
+    edge differentiating them), 634 million candidate pair checks on the FIRST
+    declump iteration alone in the old per-pair Python loop, climbing past 6 GB
+    before it was stopped by hand. This reproduces the SHAPE of that population
+    directly (one cluster, not a spread scatter -- the 60,000-point test above
+    covers the sparse case, this covers the dense one) and must both finish fast
+    and actually separate every point to the floor."""
+    n = 6000
+    ids = [uuid.uuid4() for _ in range(n)]
+    rng = np.random.default_rng(7)
+    # ALL points within a tiny radius of one spot -- one dense grid cell, not many
+    pos = rng.uniform(-0.5, 0.5, size=(n, 2))
+
+    start = time.monotonic()
+    out = _declump(pos, np.zeros((0, 2)), ids, min_sep=_MIN_SEPARATION)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 30.0, f"declump over one 6,000-point dense cluster took {elapsed:.1f}s"
+    # spot-check a real sample of pairs, not all 18M -- every checked pair meets the floor
+    sample = rng.integers(0, n, size=(500, 2))
+    for a, b in sample:
+        if a == b:
+            continue
+        assert math.dist(out[a], out[b]) >= _MIN_SEPARATION - 1e-6
+
+
 def test_relax_never_leaves_two_strongly_attracted_nodes_stacked() -> None:
     """The exact regression Thoth's mail described: strong mutual attraction (many
     shared edges, tight ideal length) used to be able to collapse two nodes onto
