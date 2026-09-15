@@ -10,6 +10,17 @@ controls move off the table drawer's bottom edge. Mirrors the existing static-so
 convention -- no browser test harness exists in this repo; the live render (before/after at
 fit and at one cluster) was verified via claude-in-chrome and reported on thread 71c4ca0d,
 not re-proven here.
+
+AMENDED (operator via Thoth mail 10726, ruling amending e1cb9e3b) before this tip even
+shipped its first review: (1) a single CLICK on a node is the WHOLE gesture -- select,
+inspector, hide, fit, one act; no double-click, no Enter, click on empty canvas clears;
+(2) the hidden/fitted state renders within 100ms of the click from the client-side edge
+index, the inspector fetch fills in after and never gates the visual; (3) the lens is
+upstream by default until roots (no depth cap), downstream is a toggle off by default,
+grounded_by/decided_in/answers added to the walk; (4) an EGO RELAYOUT while focused --
+focused object at centre, ancestors ranked leftward by hop (roots farthest left), siblings
+spread within their rank, spacing in screen pixels converted to world at the current zoom,
+temporary, Clear restores the real stored positions.
 """
 from __future__ import annotations
 
@@ -106,9 +117,10 @@ def test_focus_uses_a_per_instance_visibility_flag_not_a_dim_scalar() -> None:
 
 
 def test_a_focused_node_with_no_semantic_edges_still_lights_its_structural_neighbours() -> None:
-    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:1600]
+    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:2200]
     assert "if (pathReachable.size <= 1) {" in body
-    assert "if (e.source === id) pathReachable.add(e.target);" in body
+    assert 'if (e.edgeClass !== "structural") continue;' in body
+    assert "pathReachable.add(other);" in body
 
 
 def test_base_edge_layer_hides_edges_touching_an_invisible_node() -> None:
@@ -130,15 +142,13 @@ def test_the_in_canvas_find_a_node_box_is_gone() -> None:
     assert "searchDd" not in _SPACE_JS
 
 
-def test_header_omnibox_graph_hits_select_on_click_and_focus_on_enter() -> None:
-    body = _CONSOLE_JS.split("const graphHits = hits.filter", 1)[1][:600]
-    assert "run: () => { switchSurface('browse').then(() => selectFromOmni(h.id)); }" in body
-    assert "runFocus: () => { switchSurface('browse'); focus(h.id); }" in body
-    assert "async function selectFromOmni(id)" in _CONSOLE_JS
-    # Enter (not a plain click) is the only path that reaches runFocus.
-    assert "execOmniItem(OMNI_SEL, true)" in _CONSOLE_JS
-    exec_body = _CONSOLE_JS.split("function execOmniItem(idx, enterKey)", 1)[1][:200]
-    assert "if (enterKey && item.runFocus) item.runFocus();" in exec_body
+def test_header_omnibox_graph_hits_always_focus() -> None:
+    # SUPERSEDED by THE LEGIBILITY PASS TIP 1's own amendment (mail 10726): select-vs-focus
+    # (click selects, Enter focuses) is retired -- a Graph hit focuses either way now.
+    body = _CONSOLE_JS.split("const graphHits = hits.filter", 1)[1][:400]
+    assert "run: () => { switchSurface('browse'); focus(h.id); }" in body
+    assert "selectFromOmni" not in _CONSOLE_JS
+    assert "runFocus" not in _CONSOLE_JS
 
 
 def test_header_type_filters_and_the_legend_drive_the_same_visibility_flag() -> None:
@@ -167,3 +177,77 @@ def test_canvas_controls_sit_at_the_top_not_colliding_with_the_drawer() -> None:
 def test_status_line_and_legend_panel_moved_off_the_drawers_bottom_band() -> None:
     assert "#space-status-line { position: absolute; bottom: 44px;" in _INDEX_HTML
     assert ".legend-panel { position: absolute; top: 52px; right: 14px;" in _INDEX_HTML
+
+
+# --- AMENDMENT item 1: a single click is the whole gesture --------------------------------
+
+def test_click_on_empty_canvas_still_clears() -> None:
+    click_body = _SPACE_JS.split('addEventListener("click", (ev) => {', 1)[1][:300]
+    assert "else clearFocus();" in click_body
+
+
+# --- AMENDMENT item 2: the 100ms budget -- client-side, inspector fetch never gates it -----
+
+def test_the_visual_work_is_synchronous_the_inspector_fetch_is_awaited_last() -> None:
+    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1]
+    # every `await` inside focusObject's own body must be the final `await inspect(id);` --
+    # no earlier await (a network call) can gate the synchronous select/hide/fit work above.
+    fn_body = body.split("\n  async function inspect(id)", 1)[0]
+    awaits = [ln.strip() for ln in fn_body.splitlines() if "await " in ln]
+    assert awaits, "expected at least one await in focusObject"
+    assert awaits[-1] == "await inspect(id);"
+    assert len(awaits) == 1  # the ONLY await is the trailing inspector fetch
+
+
+# --- AMENDMENT item 3: upstream until roots, downstream a toggle off by default -----------
+
+def test_depth_is_unlimited_by_default_until_roots() -> None:
+    assert "const FOCUS_DEPTH_DEFAULT = Infinity;" in _SPACE_JS
+
+
+def test_downstream_is_a_toggle_off_by_default() -> None:
+    assert "let includeDownstream = false;" in _SPACE_JS
+    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:900]
+    assert "includeDownstream ? bfsHops(inAdjPath, id, focusDepth) : new Map([[id, 0]])" in body
+    btn_body = _SPACE_JS.split("if (downstreamBtn) {", 1)[1][:500]
+    assert "includeDownstream = !includeDownstream;" in btn_body
+    assert 'downstreamBtn.textContent = "Downstream: off";' in _SPACE_JS
+
+
+# --- AMENDMENT item 4: ego relayout while focused, temporary, restored on clear -----------
+
+def test_ego_relayout_exists_and_ranks_ancestors_leftward_roots_farthest() -> None:
+    assert "function applyEgoLayout(focusId, hopsUp, hopsDown)" in _SPACE_JS
+    body = _SPACE_JS.split("function applyEgoLayout(focusId, hopsUp, hopsDown)", 1)[1][:1200]
+    # ancestors (hopsUp) get a NEGATIVE signed rank -- more hops (closer to root) = further
+    # negative = further left; downstream (hopsDown) gets a positive rank, mirrored right.
+    assert "(byRank.get(-hop) || (byRank.set(-hop, []), byRank.get(-hop))).push(id);" in body
+    assert "(byRank.get(hop) || (byRank.set(hop, []), byRank.get(hop))).push(id);" in body
+    assert "const x = cx + signedHop * colW;" in body
+
+
+def test_ego_layout_spacing_is_screen_pixels_converted_to_world_at_current_zoom() -> None:
+    assert "const EGO_COL_SPACING_PX = 150;" in _SPACE_JS
+    assert "const EGO_ROW_SPACING_PX = 34;" in _SPACE_JS
+    body = _SPACE_JS.split("function applyEgoLayout(focusId, hopsUp, hopsDown)", 1)[1][:500]
+    assert "const wpp = worldPerPx();" in body
+    assert "const colW = EGO_COL_SPACING_PX * wpp, rowH = EGO_ROW_SPACING_PX * wpp;" in body
+
+
+def test_ego_layout_is_temporary_clear_restores_the_stored_positions() -> None:
+    assert "function restoreEgoLayout()" in _SPACE_JS
+    restore_body = _SPACE_JS.split("function restoreEgoLayout()", 1)[1].split("\n  }\n", 1)[0]
+    assert "nd.x = pos.x; nd.y = pos.y;" in restore_body
+    clear_body = _SPACE_JS.split("function clearFocus()", 1)[1][:400]
+    assert "restoreEgoLayout();" in clear_body
+    apply_body = _SPACE_JS.split("function applyEgoLayout(focusId, hopsUp, hopsDown)", 1)[1][:200]
+    assert "restoreEgoLayout();" in apply_body  # a fresh focus never layers onto a stale one
+
+
+def test_ego_layout_moves_only_gpu_instances_for_the_moved_nodes_not_a_full_rebuild() -> None:
+    # O(moved), never O(49k) -- the perf discipline this whole arc has held since mail 10581.
+    assert "function syncMovedInstancePositions(movedIds)" in _SPACE_JS
+    body = _SPACE_JS.split("function syncMovedInstancePositions(movedIds)", 1)[1][:700]
+    assert "if (!movedIds.has(nd.id)) continue;" in body
+    assert "mesh.setMatrixAt(i, dummy.matrix);" in body
+    assert "pickMesh.setMatrixAt(i, dummy.matrix);" in body

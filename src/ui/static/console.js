@@ -927,7 +927,7 @@ function stepBackBreadcrumb() {
 // NAVIGABLE SPACE, INTEGRATION (mail 10550): focus() used to fetch a fresh one-hop
 // neighborhood and merge it into the cytoscape board — now the whole graph is already
 // loaded client-side in space.js, so "focus a node" is exactly space's own focusObject:
-// walk upstream, dim the rest, zoom-to-fit, open the inspector. No REST round-trip, no
+// walk upstream, hide the rest, zoom-to-fit, open the inspector. No REST round-trip, no
 // board to clear. Falls back to the plain inspector fetch if space hasn't finished
 // mounting yet (a cold click right at page load).
 async function focus(id, fromBreadcrumb) {
@@ -937,18 +937,12 @@ async function focus(id, fromBreadcrumb) {
   if (space) await space.focusObject(id); else await inspect(id);
   if (!fromBreadcrumb) pushBreadcrumb(id, id.slice(0, 8));
 }
-// SELECT half of the omnibox's own select-vs-focus split (TIP 1(e)) -- the same shape as
-// focus() above but pans without walking a path, mirroring inspectOnly's own select branch.
-async function selectFromOmni(id) {
-  FOCUS = id; postConsole({ focused_object_id: id });
-  if (ACTIVE_SURFACE !== 'browse') await switchSurface('browse');
-  const space = window.OsirisSpace || (window.__spaceReady && await window.__spaceReady);
-  if (space) await space.selectObject(id, { pan: true }); else await inspect(id);
-}
-// the graph's own in-canvas "Find a node" box is gone (TIP 1(e), ruling e1cb9e3b) -- the
-// header omnibox (runOmniSearch/execOmniItem above) drives the canvas directly now, the only
-// search left. "expand/collapse one hop" doesn't apply to a renderer that already shows
-// every positioned object at once -- both superseded, not migrated.
+// TIP 1 AMENDMENT (operator via Thoth mail 10726, ruling amending e1cb9e3b): select-vs-focus
+// is retired -- "select, inspector, hide, fit, one gesture." The old select-only helper and
+// space's own selectObject primitive are both gone; every click-through (omnibox, table
+// row, canvas) now calls focus()/focusObject directly. The graph's own in-canvas
+// "Find a node" box stays gone (TIP 1(e)) -- the header omnibox is the only search, and a
+// hit always focuses regardless of click vs Enter.
 async function inspect(id) {
   FOCUS = id;
   var obj = await fetch('/objects/' + id).then(function(r){return r.json();}).catch(function(){return null;});
@@ -1009,14 +1003,12 @@ function inspectOnly(id) {
     badge.textContent = "Inspect: " + id.slice(0, 8) + "";
   }
   // a table-drawer row click "shares the selection" with the space canvas (mail 10550) —
-  // selectObject/focusObject also open the inspector, so this replaces the plain inspect(id)
-  // call whenever the canvas is actually mounted and visible (browse). Ordinarily a table
-  // click is SELECT (pans the graph to it, per part C's "harmony" — no dim, no path walk);
-  // but while a real focus is already active, part C's own "its rows select and focus"
-  // means a row click walks a fresh path from that row instead, same as a canvas double-click.
+  // focusObject also opens the inspector, so this replaces the plain inspect(id) call
+  // whenever the canvas is actually mounted and visible (browse). TIP 1 AMENDMENT (mail
+  // 10726): select-vs-focus is retired -- a row click is the same one gesture a canvas
+  // click is now, always a real focus.
   var space = ACTIVE_SURFACE === 'browse' ? window.OsirisSpace : null;
-  if (space && space.pathFocusId) space.focusObject(id);
-  else if (space) space.selectObject(id, { pan: true });
+  if (space) space.focusObject(id);
   else inspect(id);
 }
 async function openAsSet(oid, type, dir, label) {
@@ -1208,15 +1200,13 @@ function runOmniSearch(q) {
     } catch (e) { hits = []; }
     if (myToken !== OMNI_SEARCH_TOKEN) return; // a newer keystroke already superseded this
     // THE LEGIBILITY PASS, TIP 1(e) (ruling e1cb9e3b): ONE search -- the graph's own
-    // in-canvas "Find a node" box is gone, this omnibox drives it directly. A click (or
-    // Enter with no explicit focus intent) SELECTS and pans, matching a table row click's
-    // own select-vs-focus split (harmony, part C); Enter on a Graph hit specifically FOCUSES
-    // -- execOmniItem's second arg carries that, runFocus is the Graph-only escalation.
+    // in-canvas "Find a node" box is gone, this omnibox drives it directly. TIP 1 AMENDMENT
+    // (mail 10726): "one gesture" -- a Graph hit always focuses now, click or Enter, matching
+    // the canvas's own single-click-is-focus (select-vs-focus is retired outright).
     const graphHits = hits.filter(h => h && h.id).map(h => ({
       label: h.display_label || h.label || h.name || h.canonical || h.id,
       hint: h.type || '', cat: 'Graph',
-      run: () => { switchSurface('browse').then(() => selectFromOmni(h.id)); },
-      runFocus: () => { switchSurface('browse'); focus(h.id); },
+      run: () => { switchSurface('browse'); focus(h.id); },
     }));
     OMNI_ITEMS = toolHits.concat(compHits, graphHits).slice(0, 16);
     OMNI_SEL = Math.min(OMNI_SEL, OMNI_ITEMS.length - 1);
@@ -1225,10 +1215,8 @@ function runOmniSearch(q) {
 }
 function renderOmniList(q) { const list = $('omni-list'); if (!list) return; if (!OMNI_ITEMS.length) { list.innerHTML = '<div class="dd-empty">No matches for "' + esc(q) + '".</div>'; return; } let html = '', lastCat = null; OMNI_ITEMS.forEach((c, i) => { const cat = c.cat || 'Tools'; if (cat !== lastCat) { html += '<div class="omni-cat">' + esc(cat) + '</div>'; lastCat = cat; } html += '<div class="omni-row' + (i === OMNI_SEL ? ' sel' : '') + '" data-i="' + i + '" onclick="execOmniItem(' + i + ')"><span class="omni-label">' + esc(c.label) + '</span>' + (c.hint ? '<span class="omni-hint">' + esc(c.hint) + '</span>' : '') + '</div>'; }); list.innerHTML = html; list.querySelectorAll('[data-i]').forEach(el => el.onmouseenter = () => { OMNI_SEL = +el.dataset.i; paintOmniSel(); }); paintOmniSel(); }
 function paintOmniSel() { document.querySelectorAll('#omni-list .omni-row').forEach(el => el.classList.toggle('sel', +el.dataset.i === OMNI_SEL)); const sel = document.querySelector('#omni-list .sel'); if (sel) sel.scrollIntoView({ block: 'nearest' }); }
-function omniKey(e) { const dd = $('omni-dropdown'), isOpen = dd && dd.style.display === 'flex'; if (e.key === 'ArrowDown') { e.preventDefault(); if (!isOpen) { runOmniSearch(e.target.value); return; } OMNI_SEL = Math.min(OMNI_SEL + 1, OMNI_ITEMS.length - 1); paintOmniSel(); } else if (e.key === 'ArrowUp') { e.preventDefault(); if (!isOpen) return; OMNI_SEL = Math.max(OMNI_SEL - 1, 0); paintOmniSel(); } else if (e.key === 'Enter') { if (isOpen && OMNI_ITEMS[OMNI_SEL]) { e.preventDefault(); execOmniItem(OMNI_SEL, true); } } else if (e.key === 'Escape') { e.preventDefault(); closeAllDropdowns(); } }
-// `enterKey` is true only for the Enter-key path -- a Graph hit's own `runFocus` (TIP 1(e))
-// only fires there, never on a plain click, matching "a hit selects and pans, Enter focuses".
-function execOmniItem(idx, enterKey) { const item = OMNI_ITEMS[idx]; if (!item) return; closeAllDropdowns(); if (enterKey && item.runFocus) item.runFocus(); else item.run(); }
+function omniKey(e) { const dd = $('omni-dropdown'), isOpen = dd && dd.style.display === 'flex'; if (e.key === 'ArrowDown') { e.preventDefault(); if (!isOpen) { runOmniSearch(e.target.value); return; } OMNI_SEL = Math.min(OMNI_SEL + 1, OMNI_ITEMS.length - 1); paintOmniSel(); } else if (e.key === 'ArrowUp') { e.preventDefault(); if (!isOpen) return; OMNI_SEL = Math.max(OMNI_SEL - 1, 0); paintOmniSel(); } else if (e.key === 'Enter') { if (isOpen && OMNI_ITEMS[OMNI_SEL]) { e.preventDefault(); execOmniItem(OMNI_SEL); } } else if (e.key === 'Escape') { e.preventDefault(); closeAllDropdowns(); } }
+function execOmniItem(idx) { const item = OMNI_ITEMS[idx]; if (!item) return; closeAllDropdowns(); item.run(); }
 function openPalette() { $('search').focus(); $('global-search-box').classList.add('expanded'); runOmniSearch($('search').value || ' '); }
 async function openOmniSearch(val) { runOmniSearch(val); }
 

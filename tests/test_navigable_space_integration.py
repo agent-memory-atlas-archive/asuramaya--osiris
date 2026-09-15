@@ -77,12 +77,11 @@ def test_space_onfocus_hook_repaints_the_table_selection() -> None:
 
 
 def test_a_table_row_click_highlights_the_canvas_too() -> None:
-    # THE READING LAYER, part B (ruling c5953bb1) split click into SELECT vs FOCUS, and
-    # part C ("harmony") made an ordinary table row click select-and-pan (see
-    # test_reading_layer_focus_path.py's own tests for the fuller select-vs-focus story) --
-    # still sharing selection with the canvas either way.
+    # THE READING LAYER, part B/C built select-vs-focus for a table row click; THE
+    # LEGIBILITY PASS TIP 1's own amendment (mail 10726) retired that split outright -- a
+    # row click always focuses now, still sharing selection with the canvas either way.
     body = _CONSOLE_JS.split("function inspectOnly(id)", 1)[1].split("\n}\n", 1)[0]
-    assert "space.selectObject(id, { pan: true })" in body
+    assert "if (space) space.focusObject(id);" in body
 
 
 def test_search_around_and_omni_picks_delegate_to_the_mounted_space_instance() -> None:
