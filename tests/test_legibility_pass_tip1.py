@@ -42,7 +42,9 @@ def test_node_radius_is_computed_in_world_units_not_pixels() -> None:
 
 
 def test_screen_floor_and_cap_exist_and_are_reasonable() -> None:
-    assert "const NODE_MIN_SCREEN_PX = 1.5;" in _SPACE_JS
+    # TIP 4 (operator ruling "DENSITY NOT DISCS", mail 11011): the floor is a literal 1px
+    # now -- every object draws at every zoom as a point, never fully vanishing.
+    assert "const NODE_MIN_SCREEN_PX = 1;" in _SPACE_JS
     assert "const NODE_MAX_SCREEN_PX = 48;" in _SPACE_JS
 
 
@@ -122,9 +124,9 @@ def test_base_edge_layer_hides_edges_touching_an_invisible_node() -> None:
     # own per-instance flag — an edge touching a project-hidden node must not still draw.
     assert "hiddenProjects.has(nd.project)" in body
     assert "pathReachable.has(nd.id)" in body
-    # TIP 3 (Thoth mail 10930) renamed the parameter rawEdgeList -- buildEdgeLines now
-    # applies its own zoom-tier edge budget to it before this filtering runs.
-    build_body = _SPACE_JS.split("function buildEdgeLines(nodes, rawEdgeList)", 1)[1][:700]
+    # TIP 4 (operator ruling "DENSITY NOT DISCS", mail 11011) reverted the parameter back
+    # to edgeList -- there's no more zoom-tier edge budget for it to apply first.
+    build_body = _SPACE_JS.split("function buildEdgeLines(nodes, edgeList)", 1)[1][:700]
     assert "nodeVisible(byId.get(e.source))" in build_body
     assert "nodeVisible(byId.get(e.target))" in build_body
 
