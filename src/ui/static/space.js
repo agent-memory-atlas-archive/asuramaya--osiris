@@ -178,8 +178,6 @@ function resolveContainer(container) {
     labelsEl: (container && container.labels) || byId("labels"),
     statusEl: (container && container.status) || byId("status-line"),
     levelBadge: (container && container.levelBadge) || byId("graph-level-badge"),
-    searchInput: (container && container.searchInput) || byId("graph-search"),
-    searchDd: (container && container.searchDd) || byId("graph-search-dd"),
     rightRail: (container && container.rightRail) || byId("right"),
     fitBtn: (container && container.fitBtn) || byId("fit-btn"),
     upBtn: (container && container.upBtn) || byId("up-btn"),
@@ -192,7 +190,7 @@ function resolveContainer(container) {
 }
 
 export async function initSpace(container) {
-  const { wrap, labelsEl, statusEl, levelBadge, searchInput, searchDd, rightRail, fitBtn, upBtn,
+  const { wrap, labelsEl, statusEl, levelBadge, rightRail, fitBtn, upBtn,
     legendBtn, legendPanel, backBtn, widenBtn, onFocus } =
     resolveContainer(container);
   function setStatus(text) { statusEl.textContent = text; }
@@ -297,7 +295,11 @@ export async function initSpace(container) {
 
   let mesh = null, pickMesh = null, edgeLines = null;
   let meshUniforms = null, pickUniforms = null;
+  let visibleAttr = null;
   let idToNode = [];
+  // TIP 1(e): header taxonomy-pill type filters hide instances through the same per-instance
+  // aVisible flag focus uses (1(d)) — empty means nothing filtered, everything shown.
+  let hiddenNodeTypes = new Set();
   // THE READING LAYER, part B: FOCUS = PATH LENS (ruling c5953bb1, Thoth DM 10596). SELECT
   // (a plain click) and FOCUS (double-click, Enter, or the inspector's Focus button) are now
   // two different acts — selectedId just shows the inspector; pathFocusId/pathReachable are
@@ -318,52 +320,59 @@ export async function initSpace(container) {
     mesh = pickMesh = edgeLines = null;
   }
 
-  // SIZE: a category base (agent > plain object) x a narrow 1x-3x asymptotic multiplier
-  // off the object's own live link degree — bounded in SCREEN PIXELS, converted to world
-  // units against the current viewSize so a node reads the same visual size across a zoom
-  // range (rescaleForZoom, called on every wheel step).
+  // THE LEGIBILITY PASS (ruling e1cb9e3b, Thoth DM 10708), TIP 1(a)+(b): SIZE now lives in
+  // WORLD UNITS, not screen pixels. The old scheme (aRadiusPx * uWorldPerPx) kept every node
+  // the SAME pixel size regardless of zoom — Thoth's own live measurement at fit found that
+  // read as a solid pink mass (9 world units/px, median nearest-neighbour 19 units = 2px,
+  // average node radius 8.4px = 75 world units — each node covering ~60 neighbours). A real
+  // object should shrink as you zoom out and grow as you zoom in, same as everything else in
+  // the scene; the floor/cap below exist only so it never vanishes or swallows the screen.
   //
-  // The divisor was originally guessed (20) and the operator correctly called it out as
-  // not really working — MEASURED against the real distribution instead (48,997 objects):
-  // p50=3, p75=4, p90=4, p95=6, p99=23, max=20,295. A divisor of 20 barely moves the curve
-  // for the 90% of objects sitting at degree 3-4 (~1.15-1.33x), so almost everything looked
-  // the same size. Retuned to 14 so degree=6 (p95, "clearly above average") already reads
-  // ~1.6x and true hubs (p99+, 20+) approach the 3x cap, while the P50-P90 bulk (3-4) still
-  // stays a modest ~1.3-1.4x — distinguishable without every ordinary node looking inflated.
-  const CATEGORY_BASE_PX = { agent: 8, object: 5 };
-  const DEGREE_CURVE_DIVISOR = 14;
+  // Degree curve: LOG-scale, not the old asymptotic 1x-3x (which made a 20k-edge hub read
+  // almost the same size as a leaf — the operator's own complaint). factor = 1 + k*log2(d/d0)
+  // clamped at 0, tuned against Thoth's own anchors (degree 3 -> ~1x, 30 -> ~2x, 300 -> ~3.5x,
+  // 20,000 -> ~6x): k=0.43, d0=6 fits all four within a few percent.
+  const CATEGORY_BASE_WORLD = { agent: 8, object: 5 };
+  const DEGREE_LOG_K = 0.43;
+  const DEGREE_LOG_D0 = 6;
+  const NODE_MIN_SCREEN_PX = 1.5; // floor — never render smaller than this, however far zoomed out
+  const NODE_MAX_SCREEN_PX = 48; // cap — never render bigger than this, however far zoomed in
   function categoryOf(nd) { return nd.type === "Agent" ? "agent" : "object"; }
   function degreeFactor(nd) {
-    const signal = nd.degree || 0;
-    return 1 + 2 * (1 - 1 / (1 + signal / DEGREE_CURVE_DIVISOR)); // asymptotic 1x -> 3x
+    const d = nd.degree || 0;
+    return 1 + Math.max(0, DEGREE_LOG_K * Math.log2(Math.max(d, 1e-9) / DEGREE_LOG_D0));
   }
-  function nodeRadiusPx(nd) { return CATEGORY_BASE_PX[categoryOf(nd)] * degreeFactor(nd); }
+  function nodeRadiusWorld(nd) { return CATEGORY_BASE_WORLD[categoryOf(nd)] * degreeFactor(nd); }
   function worldPerPx() { return viewSize / wrap.clientHeight; }
 
-  // SCREEN-CONSTANT SIZE ON THE GPU (Thoth's own live measurement, mail 10581): a node's
-  // pixel radius must stay constant across zoom, but rewriting 49,019 instance matrices
-  // (getMatrixAt/decompose/setMatrixAt on BOTH meshes, two ~3MB buffer re-uploads) on every
-  // single wheel event measured at 18.6ms JS for one tick — a real scroll gesture is 20-60
-  // events, so seconds of main-thread stall plus a GPU upload storm per scroll. Fixed by
-  // moving the per-frame-varying part (worldPerPx) into a material uniform and the
-  // per-node-but-frame-CONSTANT part (radiusPx) into a static instanced attribute: the
-  // vertex shader multiplies them together at draw time, so a zoom step touches exactly one
-  // float per material (two total) no matter how many nodes are on screen, and the instance
-  // matrices only ever hold translation (+ the existing degree z-bias), set once at build
-  // time and never rewritten again until the data itself changes.
+  // SCREEN-BOUNDED WORLD SIZE ON THE GPU: a node's WORLD radius is fixed at build time (one
+  // static instanced attribute, aRadiusWorld — set once, never rewritten until the data
+  // itself changes); the floor/cap are expressed in world units too (screen px * worldPerPx,
+  // recomputed on zoom) so the vertex shader can clamp with nothing but a per-material
+  // uniform — a zoom step still only ever touches two floats per material (min/max), never a
+  // per-instance rewrite, same GPU-uniform discipline as the old pixel-constant scheme (Thoth
+  // mail 10581). aVisible (also a static instanced attribute, TIP 1(d)/(e)) hides a node
+  // outright — collapses it to zero size — when it's filtered by type or unreachable during
+  // an active focus; shared by the pick mesh via the same geometry, so a hidden node is
+  // neither drawn nor clickable.
   function makeInstancedCircleMaterial() {
-    const uniforms = { uWorldPerPx: { value: worldPerPx() } };
+    const uniforms = {
+      uMinRadiusWorld: { value: NODE_MIN_SCREEN_PX * worldPerPx() },
+      uMaxRadiusWorld: { value: NODE_MAX_SCREEN_PX * worldPerPx() },
+    };
     const mat = new THREE.MeshBasicMaterial({ vertexColors: true });
     mat.onBeforeCompile = (shader) => {
-      shader.uniforms.uWorldPerPx = uniforms.uWorldPerPx;
+      shader.uniforms.uMinRadiusWorld = uniforms.uMinRadiusWorld;
+      shader.uniforms.uMaxRadiusWorld = uniforms.uMaxRadiusWorld;
       shader.vertexShader =
-        "attribute float aRadiusPx;\nuniform float uWorldPerPx;\n" + shader.vertexShader;
+        "attribute float aRadiusWorld;\nattribute float aVisible;\n" +
+        "uniform float uMinRadiusWorld;\nuniform float uMaxRadiusWorld;\n" + shader.vertexShader;
       shader.vertexShader = shader.vertexShader.replace(
         "#include <begin_vertex>",
-        "#include <begin_vertex>\n\ttransformed *= (aRadiusPx * uWorldPerPx);"
+        "#include <begin_vertex>\n\ttransformed *= clamp(aRadiusWorld, uMinRadiusWorld, uMaxRadiusWorld) * aVisible;"
       );
     };
-    mat.customProgramCacheKey = () => "circleInstancedUniformScale";
+    mat.customProgramCacheKey = () => "circleInstancedWorldRadius";
     return { material: mat, uniforms };
   }
 
@@ -419,9 +428,22 @@ export async function initSpace(container) {
   // opts back into seeing it without needing to focus a specific node.
   const hiddenEdgeClasses = new Set(["structural"]);
   const hiddenEdgeTypes = new Set();
+  // TIP 1(d): "focus HIDES unreachable nodes AND EDGES" — an edge whose endpoint is
+  // currently invisible (focus-unreachable or type-filtered, same aVisible flag applyDim
+  // maintains) is dropped from the base layer too, not just faded; the bright path overlay
+  // (updatePathEdges) draws the reachable ones on top regardless.
+  function nodeVisible(nd) {
+    if (!nd) return false;
+    if (hiddenNodeTypes.has(nd.type)) return false;
+    if (pathFocusId && nd.id !== pathFocusId && !pathReachable.has(nd.id)) return false;
+    return true;
+  }
   function buildEdgeLines(nodes, edgeList) {
     if (edgeLines) { scene.remove(edgeLines); edgeLines.geometry.dispose(); edgeLines.material.dispose(); edgeLines = null; }
-    const visible = edgeList.filter((e) => !hiddenEdgeClasses.has(e.edgeClass) && !hiddenEdgeTypes.has(e.type));
+    const byId = new Map(nodes.map((nd) => [nd.id, nd]));
+    const visible = edgeList.filter((e) =>
+      !hiddenEdgeClasses.has(e.edgeClass) && !hiddenEdgeTypes.has(e.type) &&
+      nodeVisible(byId.get(e.source)) && nodeVisible(byId.get(e.target)));
     const positions = new Float32Array(visible.length * 6);
     const otherPositions = new Float32Array(visible.length * 6);
     const edgeColors = new Float32Array(visible.length * 6);
@@ -451,20 +473,23 @@ export async function initSpace(container) {
     edgeGeo.setAttribute("color", new THREE.BufferAttribute(edgeColors.subarray(0, vi), 3));
     edgeLines = new THREE.LineSegments(edgeGeo, makeEdgeFadeMaterial());
     scene.add(edgeLines);
-    renderLegend(edgeList);
+    renderLegend(edgeList, nodes);
     markDirty();
   }
 
   // legend: lists every class + type actually present in the loaded data, checkbox per
   // row, toggling straight into hiddenEdgeClasses/hiddenEdgeTypes and rebuilding the edge
-  // geometry — a legend toggle is a rare, deliberate act, never a per-frame cost.
-  function renderLegend(edgeList) {
+  // geometry — a legend toggle is a rare, deliberate act, never a per-frame cost. TIP 1(e):
+  // node types sit alongside edge classes now, driving the same aVisible flag the header
+  // taxonomy pills drive (setHiddenTypes) — either control moves the one underlying filter.
+  function renderLegend(edgeList, nodeList) {
     if (!legendPanel) return;
     const classOf = new Map();
     for (const e of edgeList) classOf.set(e.type, e.edgeClass);
     const byClass = { semantic: [], structural: [] };
     for (const [type, cls] of classOf) (byClass[cls] || (byClass[cls] = [])).push(type);
     for (const k of Object.keys(byClass)) byClass[k].sort();
+    const nodeTypes = [...new Set((nodeList || []).map((nd) => nd.type))].sort();
 
     const classRow = (cls) => {
       const checked = hiddenEdgeClasses.has(cls) ? "" : "checked";
@@ -476,10 +501,25 @@ export async function initSpace(container) {
       const esc = String(type).replace(/"/g, "&quot;");
       return `<label class="legend-row legend-type"><input type="checkbox" data-legend-type="${esc}" ${checked} /> <span class="legend-swatch" style="background:${colorForEdgeType(type)}"></span>${esc}</label>`;
     };
+    const nodeTypeRow = (type) => {
+      const checked = hiddenNodeTypes.has(type) ? "" : "checked";
+      const esc = String(type).replace(/"/g, "&quot;");
+      return `<label class="legend-row legend-node-type"><input type="checkbox" data-legend-node-type="${esc}" ${checked} /> <span class="legend-swatch" style="background:${typeColors.get(type) || "#6e7681"}"></span>${esc}</label>`;
+    };
     legendPanel.innerHTML =
+      `<div class="legend-row legend-class"><strong>node types</strong></div>` +
+      nodeTypes.map(nodeTypeRow).join("") +
       classRow("semantic") + (byClass.semantic || []).map(typeRow).join("") +
       classRow("structural") + (byClass.structural || []).map(typeRow).join("");
 
+    legendPanel.querySelectorAll("[data-legend-node-type]").forEach((el) => {
+      el.addEventListener("change", () => {
+        const type = el.dataset.legendNodeType;
+        if (el.checked) hiddenNodeTypes.delete(type); else hiddenNodeTypes.add(type);
+        applyDim();
+        buildEdgeLines(idToNode, edges);
+      });
+    });
     legendPanel.querySelectorAll("[data-legend-class]").forEach((el) => {
       el.addEventListener("change", () => {
         const cls = el.dataset.legendClass;
@@ -512,7 +552,9 @@ export async function initSpace(container) {
     geo.setAttribute("color", new THREE.Float32BufferAttribute(
       new Float32Array(geo.attributes.position.count * 3).fill(1), 3));
     const radiusAttr = new THREE.InstancedBufferAttribute(new Float32Array(Math.max(n, 1)), 1);
-    geo.setAttribute("aRadiusPx", radiusAttr); // shared by mesh + pickMesh, same geometry instance
+    geo.setAttribute("aRadiusWorld", radiusAttr); // shared by mesh + pickMesh, same geometry instance
+    visibleAttr = new THREE.InstancedBufferAttribute(new Float32Array(Math.max(n, 1)).fill(1), 1);
+    geo.setAttribute("aVisible", visibleAttr); // TIP 1(d)/(e): per-instance hide, updated in place by applyDim
 
     const built = makeInstancedCircleMaterial();
     const mat = built.material;
@@ -531,14 +573,15 @@ export async function initSpace(container) {
     const idColor = new THREE.Color();
     for (let i = 0; i < n; i++) {
       const nd = nodes[i];
-      nd.radiusPx = nodeRadiusPx(nd);
-      radiusAttr.setX(i, nd.radiusPx);
+      nd.radiusWorld = nodeRadiusWorld(nd);
+      radiusAttr.setX(i, nd.radiusWorld);
+      visibleAttr.setX(i, 1);
       // "sizing more intuitive where high-degree nodes stand out without obfuscating
       // smaller nodes" — a bigger circle can still sit BEHIND a smaller one drawn later
       // in the same z-plane; give every node a tiny z bias proportional to its own radius
       // so the important (bigger) ones are always nearer the camera and never occluded.
-      // Scale stays 1 here deliberately — the shader (aRadiusPx * uWorldPerPx) owns sizing.
-      dummy.position.set(nd.x || 0, nd.y || 0, nd.radiusPx * 0.002);
+      // Scale stays 1 here deliberately — the shader (aRadiusWorld, clamped) owns sizing.
+      dummy.position.set(nd.x || 0, nd.y || 0, nd.radiusWorld * 0.002);
       dummy.scale.setScalar(1);
       dummy.updateMatrix();
       mesh.setMatrixAt(i, dummy.matrix);
@@ -560,29 +603,39 @@ export async function initSpace(container) {
     markDirty();
   }
 
-  // SELECT (a plain click) never dims the graph — only FOCUS does, and only focus dims
-  // "to near invisible" (ruling c5953bb1's own wording, stronger than the old 0.12 factor):
-  // a real path lens has to actually read as a lens, not a faint tint.
-  const FOCUS_DIM_FACTOR = 0.03;
+  // TIP 1(d): focus HIDES unreachable nodes outright (per-instance aVisible flag), not a
+  // dim — "no dim" per Thoth's own dispatch. Reachable-but-not-focused nodes stay visible at
+  // their normal type colour (still legible as part of the path); the focused node alone
+  // gets the accent colour. A type hidden via the header/legend filter (hiddenNodeTypes,
+  // TIP 1(e)) is invisible regardless of focus state.
   function applyDim() {
     if (!mesh) return;
     const color = new THREE.Color();
     const focused = !!pathFocusId;
     for (let i = 0; i < idToNode.length; i++) {
       const nd = idToNode[i];
+      const typeHidden = hiddenNodeTypes.has(nd.type);
+      const focusHidden = focused && nd.id !== pathFocusId && !pathReachable.has(nd.id);
+      visibleAttr.setX(i, (typeHidden || focusHidden) ? 0 : 1);
       color.set(typeColors.get(nd.type) || "#6e7681");
-      if (focused) {
-        if (nd.id === pathFocusId) color.set("#58a6ff");
-        else if (!pathReachable.has(nd.id)) color.multiplyScalar(FOCUS_DIM_FACTOR);
-        // else: reachable-but-not-focused nodes keep their normal type colour — still
-        // legible as part of the path, the focused node alone gets the accent colour.
-      } else if (nd.id === selectedId) {
-        color.set("#58a6ff");
-      }
+      if (focused && nd.id === pathFocusId) color.set("#58a6ff");
+      else if (!focused && nd.id === selectedId) color.set("#58a6ff");
       mesh.instanceColor.setXYZ(i, color.r, color.g, color.b);
     }
     mesh.instanceColor.needsUpdate = true;
+    visibleAttr.needsUpdate = true;
     markDirty();
+  }
+
+  // TIP 1(e): the header taxonomy pills' own type filter (SELECTED_ENTITY_TYPES in
+  // console.js) drives this — called with the full set of types that should stay HIDDEN
+  // (console.js translates its own allowlist semantics before calling). The legend's own
+  // node-type checkboxes (renderLegend, below) call this too, so both controls drive the
+  // exact same aVisible flag rather than two independent mechanisms.
+  function setHiddenTypes(types) {
+    hiddenNodeTypes = new Set(types || []);
+    applyDim();
+    buildEdgeLines(idToNode, edges);
   }
 
   async function loadTypeColors() {
@@ -745,13 +798,15 @@ export async function initSpace(container) {
     scheduleLabelPick();
   });
 
-  // O(1) regardless of node count now — sizing lives in the shader (aRadiusPx * uniform,
-  // see makeInstancedCircleMaterial), so a zoom step only ever writes two floats (the draw
-  // mesh's and pick mesh's own uWorldPerPx) instead of rewriting 49,019 instance matrices.
+  // O(1) regardless of node count now — sizing lives in the shader (aRadiusWorld clamped by
+  // a uniform min/max, see makeInstancedCircleMaterial), so a zoom step only ever writes
+  // four floats (the draw mesh's and pick mesh's own min/max) instead of rewriting 49,019
+  // instance matrices.
   function rescaleForZoom() {
     const wpp = worldPerPx();
-    if (meshUniforms) meshUniforms.uWorldPerPx.value = wpp;
-    if (pickUniforms) pickUniforms.uWorldPerPx.value = wpp;
+    const lo = NODE_MIN_SCREEN_PX * wpp, hi = NODE_MAX_SCREEN_PX * wpp;
+    if (meshUniforms) { meshUniforms.uMinRadiusWorld.value = lo; meshUniforms.uMaxRadiusWorld.value = hi; }
+    if (pickUniforms) { pickUniforms.uMinRadiusWorld.value = lo; pickUniforms.uMaxRadiusWorld.value = hi; }
     // no edge-style call here any more — the edge-fade shader (makeEdgeFadeMaterial) reads
     // screen length straight off projectionMatrix/modelViewMatrix every render, already
     // current every frame with zero extra work on a zoom step.
@@ -832,6 +887,41 @@ export async function initSpace(container) {
     if (hit) focusObject(hit.id);
   });
 
+  // TIP 1(c): the hover card shows the label line plus type and project — the inspector
+  // (click) has the rest. Debounced like the label pick (not every mousemove — pickAt is a
+  // real render-target pass, cheap once, not something to run at full mouse-event rate) and
+  // skipped entirely while dragging so it never fights a pan.
+  let hoverNode = null;
+  let hoverTimer = null;
+  const hoverEl = document.createElement("div");
+  hoverEl.className = "hover-card";
+  hoverEl.hidden = true;
+  wrap.appendChild(hoverEl);
+  function updateHoverCard(nd) {
+    hoverEl.innerHTML = `<div class="hover-label">${labelTextFor(nd)}</div>` +
+      `<div class="hover-meta">${nd.type}${nd.project ? " · " + nd.project : ""}</div>`;
+  }
+  function positionHoverCard(clientX, clientY) {
+    const rect = wrap.getBoundingClientRect();
+    hoverEl.style.left = `${clientX - rect.left + 14}px`;
+    hoverEl.style.top = `${clientY - rect.top + 14}px`;
+  }
+  renderer.domElement.addEventListener("mousemove", (ev) => {
+    if (dragging) { hoverEl.hidden = true; hoverNode = null; return; }
+    positionHoverCard(ev.clientX, ev.clientY);
+    clearTimeout(hoverTimer);
+    hoverTimer = setTimeout(() => {
+      const hit = pickAt(ev.clientX, ev.clientY);
+      hoverNode = hit || null;
+      if (hit) { updateHoverCard(hit); hoverEl.hidden = false; } else { hoverEl.hidden = true; }
+    }, 80);
+  });
+  renderer.domElement.addEventListener("mouseleave", () => {
+    clearTimeout(hoverTimer);
+    hoverEl.hidden = true;
+    hoverNode = null;
+  });
+
   function clearFocus() {
     selectedId = null;
     pathFocusId = null;
@@ -893,7 +983,7 @@ export async function initSpace(container) {
   }
 
   // ---- FOCUS = PATH LENS (ruling c5953bb1): walks upstream+downstream over the curated
-  // provenance edge types, dims everything unreachable to near invisible, draws the
+  // provenance edge types, hides everything unreachable (TIP 1(d), no more dim), draws the
   // reachable path bright with direction, fits the camera to the reachable set, labels the
   // path, reveals the focused object's own structural edges. Never a data reload — the
   // whole graph is already loaded, this only ever changes what's highlighted.
@@ -903,6 +993,18 @@ export async function initSpace(container) {
     pathFocusId = id;
     focusDepth = options.depth || FOCUS_DEPTH_DEFAULT;
     pathReachable = walkPath(outAdjPath, inAdjPath, id, focusDepth);
+    // TIP 1(d): "focus is never empty" — Thoth's own live measurement found a degree-8
+    // Decision with no PATH_EDGE_TYPES links reaching only itself and collapsing the camera
+    // fit to a point. When the semantic walk finds nothing beyond the focused node itself,
+    // widen one hop over its own STRUCTURAL edges instead — still just this node's real
+    // neighbours, never a synthetic minimum.
+    if (pathReachable.size <= 1) {
+      for (const e of edges) {
+        if (e.edgeClass !== "structural") continue;
+        if (e.source === id) pathReachable.add(e.target);
+        else if (e.target === id) pathReachable.add(e.source);
+      }
+    }
     if (!options.skipStackPush) pushFocusStack(id);
     if (onFocus) onFocus(id); // shares the selection with an embedding table (console.js)
 
@@ -969,46 +1071,53 @@ export async function initSpace(container) {
     if (selectedId) focusObject(selectedId);
   });
 
-  // ---- search (stays HTML) -----------------------------------------------------------
-  let searchTimer = null, searchToken = 0;
-  searchInput.addEventListener("input", () => {
-    clearTimeout(searchTimer);
-    const q = searchInput.value.trim();
-    if (!q) { searchDd.style.display = "none"; return; }
-    const myToken = ++searchToken;
-    searchTimer = setTimeout(async () => {
-      const res = await fetch(`/search?q=${encodeURIComponent(q)}&limit=8`).then((r) => r.json());
-      if (myToken !== searchToken) return;
-      const hits = Array.isArray(res.hits) ? res.hits : [];
-      searchDd.innerHTML = "";
-      searchDd.style.display = hits.length ? "block" : "none";
-      for (const h of hits) {
-        const row = document.createElement("div");
-        row.className = "dd-item";
-        row.textContent = h.label || h.id;
-        row.addEventListener("click", async () => {
-          searchDd.style.display = "none";
-          searchInput.value = "";
-          await focusObject(h.id); // zoom-to-fit reads the lit set's own bbox, no x/y needed here
-        });
-        searchDd.appendChild(row);
-      }
-    }, 200);
-  });
+  // TIP 1(e): ONE search — the in-canvas "Find a node" box is gone; the header omnibox
+  // (console.js's own runOmniSearch/execOmniItem) drives the graph directly now (a hit
+  // selects+pans, Enter focuses), so there is no second search box left to wire here.
 
-  // ---- labels: WHICH ones (debounced, expensive nearest-N) vs WHERE they sit (every
-  // frame, cheap) — the split that fixes the lag the operator caught. ------------------
-  // "show node ids, agent names, project names... things that are short, let expansion
-  // happen in the inspector" — resolve_label() already returns a short display name for
-  // most types (Agent/SoftwareProject/etc), but for Decision/Thread it falls back to the
-  // FULL summary text, which is exactly the "wall of garbage text" in the screenshot.
-  // Never truncate-with-ellipsis (a chopped sentence still reads as garbage) — fall back
-  // to a clean type + short id instead, the same shape a real "node id" reads as.
-  const SHORT_LABEL_MAX = 26;
-  function shortLabel(nd) {
-    const label = nd.label || "";
-    if (label && label.length <= SHORT_LABEL_MAX) return label;
-    return `${nd.type} ${nd.id.slice(0, 8)}`;
+  // TIP 1(c): LABELS ARE NAMES — Agent by handle/name, SoftwareProject by repo name, Person
+  // by name, everything else type + short title. One line, hard-truncated at 40 chars with
+  // an ellipsis (never a paragraph — the old "wall of garbage text" bug was Decision/Thread
+  // falling through to a full summary property). Until Khnum's tip 2 ships a labels source
+  // on the wire header, names are read from the existing /objects/{id} endpoint (the same
+  // one `inspect()` already calls) for the labelled nearest-N only — never the whole graph,
+  // cached per id so a node's name is fetched at most once per session.
+  const LABEL_MAX = 40;
+  const NAME_TYPES = new Set(["Agent", "SoftwareProject", "Person"]);
+  function truncateLabel(s) {
+    const flat = String(s || "").replace(/\s+/g, " ").trim();
+    return flat.length <= LABEL_MAX ? flat : flat.slice(0, LABEL_MAX - 1) + "…";
+  }
+  function fallbackLabel(nd) { return `${nd.type} ${nd.id.slice(0, 8)}`; }
+  const _labelCache = new Map(); // id -> resolved text
+  const _labelInFlight = new Set();
+  async function fetchNodeLabel(nd) {
+    let text;
+    try {
+      const obj = await fetch(`/objects/${nd.id}`).then((r) => r.json());
+      const title = (obj && (obj.title || obj.name)) || "";
+      text = title
+        ? (NAME_TYPES.has(nd.type) ? title : `${nd.type}: ${title}`)
+        : fallbackLabel(nd);
+    } catch {
+      text = fallbackLabel(nd);
+    }
+    return truncateLabel(text);
+  }
+  function labelTextFor(nd) {
+    const cached = _labelCache.get(nd.id);
+    if (cached) return cached;
+    if (!_labelInFlight.has(nd.id)) {
+      _labelInFlight.add(nd.id);
+      fetchNodeLabel(nd).then((text) => {
+        _labelCache.set(nd.id, text);
+        _labelInFlight.delete(nd.id);
+        const div = labelDivs.get(nd);
+        if (div) div.textContent = text;
+        if (hoverNode === nd) updateHoverCard(nd);
+      });
+    }
+    return fallbackLabel(nd);
   }
 
   const N_LABELS = 40;
@@ -1038,7 +1147,7 @@ export async function initSpace(container) {
       if (labelDivs.has(nd)) continue;
       const div = document.createElement("div");
       div.className = "lbl";
-      div.textContent = shortLabel(nd);
+      div.textContent = labelTextFor(nd); // fallback text now, swapped for the real name async
       labelsEl.appendChild(div);
       labelDivs.set(nd, div);
     }
@@ -1091,12 +1200,12 @@ export async function initSpace(container) {
   markDirty();
 
   const api = {
-    focusObject, selectObject, clearFocus, inspect, pause, resume, goBack,
+    focusObject, selectObject, clearFocus, inspect, pause, resume, goBack, setHiddenTypes,
     get idToNode() { return idToNode; },
     get pathReachable() { return pathReachable; },
     get pathFocusId() { return pathFocusId; },
     get selectedId() { return selectedId; },
-    camera, pickAt, mesh: () => mesh, worldPerPx, nodeRadiusPx, renderer,
+    camera, pickAt, mesh: () => mesh, worldPerPx, nodeRadiusWorld, renderer,
     // debug/test hooks only (same convention as window.__space always being exposed) —
     // zoomAt bypasses the rAF-coalesced wheel path for direct exercise; forceRender skips
     // the dirty check for a synchronous frame.

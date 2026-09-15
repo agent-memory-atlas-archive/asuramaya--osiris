@@ -19,7 +19,7 @@
   #status-line { position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
                  font-size: 11px; color: #8b949e; z-index: 10; }
   aside#right.rail { width: 340px; flex: none; overflow-y: auto; }
-  .legend-panel { position: absolute; bottom: 56px; left: 14px; z-index: 11; max-height: 60%;
+  .legend-panel { position: absolute; top: 52px; right: 14px; z-index: 11; max-height: 60%;
                    overflow-y: auto; background: rgba(13,18,25,0.92); backdrop-filter: blur(8px);
                    border: 1px solid var(--border2); border-radius: 6px; padding: 8px 10px;
                    font-size: 11px; min-width: 200px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
@@ -29,6 +29,13 @@
   .legend-row.legend-class { color: var(--text); font-size: 11px; margin-top: 6px; }
   .legend-row.legend-class:first-child { margin-top: 0; }
   .legend-swatch { display: inline-block; width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  .hover-card { position: absolute; z-index: 12; pointer-events: none; max-width: 260px;
+                background: rgba(13,18,25,0.92); backdrop-filter: blur(8px);
+                border: 1px solid var(--border2); border-radius: 6px; padding: 6px 8px;
+                box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
+  .hover-label { font-size: 11px; color: #f0f6fc; font-weight: 600; white-space: nowrap;
+                 overflow: hidden; text-overflow: ellipsis; }
+  .hover-meta { font-size: 10px; color: var(--muted); margin-top: 2px; }
 </style>
 </head>
 <body>
@@ -45,10 +52,6 @@
       <button class="iconbtn" id="legend-btn">Legend</button>
     </div>
     <div id="legend-panel" class="legend-panel" hidden></div>
-    <div class="graph-search-row">
-      <input id="graph-search" class="filter" placeholder="Find a node…" autocomplete="off" />
-      <div id="graph-search-dd" class="dd-list" style="display:none"></div>
-    </div>
     <div id="status-line">loading…</div>
   </div>
   <aside id="right" class="rail"><div class="insp-empty" id="insp"><div style="font-weight:700;font-size:13px;letter-spacing:0.5px;text-transform:uppercase;color:var(--text);margin-bottom:8px">Provenance Inspector</div>Click any object to inspect its evidence grade and relationships.</div></aside>

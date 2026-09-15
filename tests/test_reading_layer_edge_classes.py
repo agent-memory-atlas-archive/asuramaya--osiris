@@ -88,6 +88,9 @@ def test_legend_toggle_button_shows_and_hides_the_panel() -> None:
 
 
 def test_legend_checkboxes_rebuild_edge_lines_on_change() -> None:
-    body = _SPACE_JS.split("function renderLegend(edgeList)", 1)[1]
-    # one call for class-row toggles, one for type-row toggles
-    assert body.count("buildEdgeLines(idToNode, edges);") == 2
+    # THE LEGIBILITY PASS, TIP 1(e) (ruling e1cb9e3b) added a third checkbox group (node
+    # types, alongside edge class/type) to the same legend panel — all three still rebuild.
+    body = _SPACE_JS.split("function renderLegend(edgeList, nodeList)", 1)[1]
+    # three legend checkbox groups (node type, class, type) plus setHiddenTypes' own call
+    # (the header taxonomy pills' entry point, TIP 1(e)) — four call sites total.
+    assert body.count("buildEdgeLines(idToNode, edges);") == 4

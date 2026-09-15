@@ -1733,12 +1733,18 @@ select.field:focus, input.field:focus { border-color: var(--border-focus); }
   background: var(--bg);
 }
 
+/* THE LEGIBILITY PASS, TIP 1(f) (ruling e1cb9e3b): moved from bottom-left to the top strip,
+   opposite the breadcrumbs — Thoth's own screenshot caught these colliding with the table
+   drawer's handle at the old bottom:14px (the drawer owns the bottom edge outright now). */
 .graph-canvas-controls {
   position: absolute;
-  bottom: 14px;
-  left: 14px;
+  top: 14px;
+  right: 14px;
   z-index: 10;
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  max-width: 70%;
   gap: 6px;
   background: rgba(13, 18, 25, 0.85);
   backdrop-filter: blur(8px);
@@ -1760,30 +1766,6 @@ select.field:focus, input.field:focus { border-color: var(--border-focus); }
   background: var(--chip);
 }
 
-/* WAVE A item 6: the graph's own find-a-node box + breadcrumb trail — top-right of the
-   board, out of the way of the canvas controls (bottom-left) and the fit/re-layout/clear
-   buttons they already own. */
-.graph-search-row {
-  position: absolute;
-  top: 14px;
-  right: 14px;
-  z-index: 10;
-  width: 220px;
-}
-.graph-search-row .filter {
-  width: 100%;
-  background: rgba(13, 18, 25, 0.85);
-  backdrop-filter: blur(8px);
-}
-.graph-search-row .dd-list {
-  margin-top: 4px;
-  background: var(--panel);
-  border: 1px solid var(--border2);
-  border-radius: 6px;
-  max-height: 240px;
-  overflow-y: auto;
-  box-shadow: 0 8px 24px rgba(0,0,0,0.5);
-}
 .graph-breadcrumbs {
   position: absolute;
   top: 14px;
@@ -1792,7 +1774,9 @@ select.field:focus, input.field:focus { border-color: var(--border-focus); }
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
-  max-width: 60%;
+  /* narrowed from 60% now that the canvas controls sit top-right (TIP 1(f)) rather than
+     bottom-left — leaves room for both rows to wrap independently on a normal viewport. */
+  max-width: 45%;
 }
 .graph-breadcrumbs .crumb {
   background: rgba(13, 18, 25, 0.85);

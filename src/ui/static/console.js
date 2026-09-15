@@ -297,7 +297,19 @@ function renderEntityToolbar() {
     return '<button class="tax-tab' + sel + '" onclick="toggleEntityType(\'' + t + '\')"><span class="tax-title">' + esc(dl) + '</span><span class="tax-count">' + count.toLocaleString() + '</span></button>';
   }).join('');
 }
-function toggleEntityType(t) { if (t === 'All') SELECTED_ENTITY_TYPES.clear(); else { if (SELECTED_ENTITY_TYPES.has(t)) SELECTED_ENTITY_TYPES.delete(t); else SELECTED_ENTITY_TYPES.add(t); } renderEntityExplorer(); }
+function toggleEntityType(t) { if (t === 'All') SELECTED_ENTITY_TYPES.clear(); else { if (SELECTED_ENTITY_TYPES.has(t)) SELECTED_ENTITY_TYPES.delete(t); else SELECTED_ENTITY_TYPES.add(t); } renderEntityExplorer(); syncSpaceTypeFilter(); }
+// THE LEGIBILITY PASS, TIP 1(e) (ruling e1cb9e3b): the header taxonomy pills drive the
+// canvas through the same per-instance visibility flag the legend's own node-type
+// checkboxes use (space.js's setHiddenTypes) -- SELECTED_ENTITY_TYPES is an ALLOWLIST
+// (empty = show all) so it's translated to a hidden-set (everything present, minus the
+// allowlist) before handing it to the graph, which speaks "hidden" not "allowed".
+function syncSpaceTypeFilter() {
+  const space = window.OsirisSpace; if (!space || !space.setHiddenTypes) return;
+  if (SELECTED_ENTITY_TYPES.size === 0) { space.setHiddenTypes(new Set()); return; }
+  const present = new Set(space.idToNode.map(n => n.type));
+  const hidden = new Set([...present].filter(t => !SELECTED_ENTITY_TYPES.has(t)));
+  space.setHiddenTypes(hidden);
+}
 function filterEntitySearch(q) { ENTITY_SEARCH_QUERY = q; renderEntityExplorer(); }
 function toggleTableSort(col) { TABLE_SORT_DIR = TABLE_SORT_COL === col ? (TABLE_SORT_DIR === 'asc' ? 'desc' : 'asc') : 'asc'; TABLE_SORT_COL = col; renderEntityExplorerStage(); }
 function inspectAndToggleRow(id) { inspectOnly(id); EXPANDED_ROWS.has(id) ? EXPANDED_ROWS.delete(id) : EXPANDED_ROWS.add(id); renderEntityExplorerStage(); }
@@ -859,9 +871,18 @@ async function focus(id, fromBreadcrumb) {
   if (space) await space.focusObject(id); else await inspect(id);
   if (!fromBreadcrumb) pushBreadcrumb(id, id.slice(0, 8));
 }
-// the graph-search/-dd box inside #cy is now wired directly by space.js's own initSpace()
-// (same ids, its own listener) — "expand/collapse one hop" doesn't apply to a renderer that
-// already shows every positioned object at once; both superseded, not migrated.
+// SELECT half of the omnibox's own select-vs-focus split (TIP 1(e)) -- the same shape as
+// focus() above but pans without walking a path, mirroring inspectOnly's own select branch.
+async function selectFromOmni(id) {
+  FOCUS = id; postConsole({ focused_object_id: id });
+  if (ACTIVE_SURFACE !== 'browse') await switchSurface('browse');
+  const space = window.OsirisSpace || (window.__spaceReady && await window.__spaceReady);
+  if (space) await space.selectObject(id, { pan: true }); else await inspect(id);
+}
+// the graph's own in-canvas "Find a node" box is gone (TIP 1(e), ruling e1cb9e3b) -- the
+// header omnibox (runOmniSearch/execOmniItem above) drives the canvas directly now, the only
+// search left. "expand/collapse one hop" doesn't apply to a renderer that already shows
+// every positioned object at once -- both superseded, not migrated.
 async function inspect(id) {
   FOCUS = id;
   var obj = await fetch('/objects/' + id).then(function(r){return r.json();}).catch(function(){return null;});
@@ -1120,10 +1141,16 @@ function runOmniSearch(q) {
       hits = Array.isArray(res.hits) ? res.hits : (Array.isArray(res) ? res : []);
     } catch (e) { hits = []; }
     if (myToken !== OMNI_SEARCH_TOKEN) return; // a newer keystroke already superseded this
+    // THE LEGIBILITY PASS, TIP 1(e) (ruling e1cb9e3b): ONE search -- the graph's own
+    // in-canvas "Find a node" box is gone, this omnibox drives it directly. A click (or
+    // Enter with no explicit focus intent) SELECTS and pans, matching a table row click's
+    // own select-vs-focus split (harmony, part C); Enter on a Graph hit specifically FOCUSES
+    // -- execOmniItem's second arg carries that, runFocus is the Graph-only escalation.
     const graphHits = hits.filter(h => h && h.id).map(h => ({
       label: h.display_label || h.label || h.name || h.canonical || h.id,
       hint: h.type || '', cat: 'Graph',
-      run: () => { switchSurface('browse'); focus(h.id); },
+      run: () => { switchSurface('browse').then(() => selectFromOmni(h.id)); },
+      runFocus: () => { switchSurface('browse'); focus(h.id); },
     }));
     OMNI_ITEMS = toolHits.concat(compHits, graphHits).slice(0, 16);
     OMNI_SEL = Math.min(OMNI_SEL, OMNI_ITEMS.length - 1);
@@ -1132,8 +1159,10 @@ function runOmniSearch(q) {
 }
 function renderOmniList(q) { const list = $('omni-list'); if (!list) return; if (!OMNI_ITEMS.length) { list.innerHTML = '<div class="dd-empty">No matches for "' + esc(q) + '".</div>'; return; } let html = '', lastCat = null; OMNI_ITEMS.forEach((c, i) => { const cat = c.cat || 'Tools'; if (cat !== lastCat) { html += '<div class="omni-cat">' + esc(cat) + '</div>'; lastCat = cat; } html += '<div class="omni-row' + (i === OMNI_SEL ? ' sel' : '') + '" data-i="' + i + '" onclick="execOmniItem(' + i + ')"><span class="omni-label">' + esc(c.label) + '</span>' + (c.hint ? '<span class="omni-hint">' + esc(c.hint) + '</span>' : '') + '</div>'; }); list.innerHTML = html; list.querySelectorAll('[data-i]').forEach(el => el.onmouseenter = () => { OMNI_SEL = +el.dataset.i; paintOmniSel(); }); paintOmniSel(); }
 function paintOmniSel() { document.querySelectorAll('#omni-list .omni-row').forEach(el => el.classList.toggle('sel', +el.dataset.i === OMNI_SEL)); const sel = document.querySelector('#omni-list .sel'); if (sel) sel.scrollIntoView({ block: 'nearest' }); }
-function omniKey(e) { const dd = $('omni-dropdown'), isOpen = dd && dd.style.display === 'flex'; if (e.key === 'ArrowDown') { e.preventDefault(); if (!isOpen) { runOmniSearch(e.target.value); return; } OMNI_SEL = Math.min(OMNI_SEL + 1, OMNI_ITEMS.length - 1); paintOmniSel(); } else if (e.key === 'ArrowUp') { e.preventDefault(); if (!isOpen) return; OMNI_SEL = Math.max(OMNI_SEL - 1, 0); paintOmniSel(); } else if (e.key === 'Enter') { if (isOpen && OMNI_ITEMS[OMNI_SEL]) { e.preventDefault(); execOmniItem(OMNI_SEL); } } else if (e.key === 'Escape') { e.preventDefault(); closeAllDropdowns(); } }
-function execOmniItem(idx) { const item = OMNI_ITEMS[idx]; if (!item) return; closeAllDropdowns(); item.run(); }
+function omniKey(e) { const dd = $('omni-dropdown'), isOpen = dd && dd.style.display === 'flex'; if (e.key === 'ArrowDown') { e.preventDefault(); if (!isOpen) { runOmniSearch(e.target.value); return; } OMNI_SEL = Math.min(OMNI_SEL + 1, OMNI_ITEMS.length - 1); paintOmniSel(); } else if (e.key === 'ArrowUp') { e.preventDefault(); if (!isOpen) return; OMNI_SEL = Math.max(OMNI_SEL - 1, 0); paintOmniSel(); } else if (e.key === 'Enter') { if (isOpen && OMNI_ITEMS[OMNI_SEL]) { e.preventDefault(); execOmniItem(OMNI_SEL, true); } } else if (e.key === 'Escape') { e.preventDefault(); closeAllDropdowns(); } }
+// `enterKey` is true only for the Enter-key path -- a Graph hit's own `runFocus` (TIP 1(e))
+// only fires there, never on a plain click, matching "a hit selects and pans, Enter focuses".
+function execOmniItem(idx, enterKey) { const item = OMNI_ITEMS[idx]; if (!item) return; closeAllDropdowns(); if (enterKey && item.runFocus) item.runFocus(); else item.run(); }
 function openPalette() { $('search').focus(); $('global-search-box').classList.add('expanded'); runOmniSearch($('search').value || ' '); }
 async function openOmniSearch(val) { runOmniSearch(val); }
 
