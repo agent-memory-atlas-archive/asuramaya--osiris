@@ -1604,7 +1604,11 @@ TOOL_CONTRACT_EXPECTED_COUNT = 87
 # a thread annotation when osiris-worker finishes), a genuine caller-visible behavior
 # change on an existing param set, not prose creep. Trimmed once before raising. No new
 # @mcp.tool(), tool count unchanged. Measured exact (137,863).
-TOOL_CONTRACT_CEILING_CHARS = 138621
+# -> 139260 (2026-09-15, Khnum, thread 92dde6cc): retire_object gained a fourth kind
+# ('object', a bare-junk-object retirement door) — a genuine new capability documented
+# in its existing docstring, no new @mcp.tool(), tool count unchanged. Measured exact
+# (139,260).
+TOOL_CONTRACT_CEILING_CHARS = 139260
 
 def test_ceiling_has_exactly_one_executable_assignment() -> None:
     """THE RATCHET'S OWN GUARD (thread c655c757). This file used to carry every historical

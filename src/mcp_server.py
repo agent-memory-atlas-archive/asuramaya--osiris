@@ -7251,12 +7251,14 @@ async def _retire_object_impl(
     kind: str, target: str, *, because: str, override_live: bool, ctx: Context | None,
 ) -> dict[str, Any]:
     """Shared body behind `retire_object` and its three hidden single-purpose aliases
-    (retire_seat/retire_project/retire_agent) — one code path, four names. Each kind
-    below is copied verbatim from what was that alias's own top-level function body
-    before the fold. Deliberately does NOT cover self-scoped `retire()` (no target
-    param, different auth shape entirely) or `retire_assertion` (a genuinely unrelated
-    5-field shape, not a target+reason act) — see the wave-3 proposal (decision
-    1ddf8e1c) for why those two stay out."""
+    (retire_seat/retire_project/retire_agent) — one code path, five names now
+    (kind='object' added for thread 92dde6cc, no alias of its own — the generic
+    door needed no deprecated single-purpose predecessor to fold). Each of the
+    first three kinds below is copied verbatim from what was that alias's own
+    top-level function body before the fold. Deliberately does NOT cover
+    self-scoped `retire()` (no target param, different auth shape entirely) or
+    `retire_assertion` (a genuinely unrelated 5-field shape, not a target+reason
+    act) — see the wave-3 proposal (decision 1ddf8e1c) for why those two stay out."""
     ident = await _ident_for(ctx)
     if ident is None:
         return {"error": f"mount first — retiring {'a' if kind != 'agent' else 'an'} "
@@ -7274,7 +7276,11 @@ async def _retire_object_impl(
         return await _retire_agent(Actions(await _pool_get()), agent_id=target,
                                    actor=ident.agent_id, because=because,
                                    override_live=override_live)
-    return {"error": f"unknown kind {kind!r} — one of seat/project/agent"}
+    if kind == "object":
+        from src.orchestrator.retirement import retire_bare_object as _retire_bare_object
+        return await _retire_bare_object(Actions(await _pool_get()), ref=target,
+                                         because=because, actor=ident.agent_id)
+    return {"error": f"unknown kind {kind!r} — one of seat/project/agent/object"}
 
 
 @mcp.tool()
@@ -7282,10 +7288,10 @@ async def retire_object(
     kind: str, target: str, because: str = "", override_live: bool = False,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
-    """Third-party retirement of a named Seat/SoftwareProject/Agent — one door, three
-    `kind`s, never a fourth. DISTINCT from self-scoped `retire()` (no target param,
-    retires the CALLING agent's own live session/turn) and from `retire_assertion` (a
-    cross-source supersede, an unrelated shape) — neither folds into this door.
+    """Third-party retirement of a named Seat/SoftwareProject/Agent/bare object — one
+    door, four `kind`s, never a fifth. DISTINCT from self-scoped `retire()` (no target
+    param, retires the CALLING agent's own live session/turn) and from `retire_assertion`
+    (a cross-source supersede, an unrelated shape) — neither folds into this door.
 
     `kind='seat'` — mark a Seat permanently CLOSED: a genuinely dead role, no successor,
     no merge target. Refuses on an unknown or already-inactive seat, or an ACTIVE
@@ -7303,7 +7309,16 @@ async def retire_object(
     name any target; `actor` is attribution, not authority. ALWAYS releases the target's
     held seat and mount rows on success. Refuses LOUDLY on: blank `because`; an unknown/
     non-active agent; a target that reads LIVE (seen within 15 min) unless
-    `override_live=True`. `override_live` is ignored for the other two kinds."""
+    `override_live=True`. `override_live` is ignored for the other three kinds.
+
+    `kind='object'` (thread 92dde6cc) — retire an arbitrary ACTIVE object of no other
+    kind: the shape a stray script or a mis-minted stub leaves behind, none of the
+    three doors above cover. `target` resolves via the generic resolve_ref (UUID,
+    short-id, canonical, or name — any object type). Refuses LOUDLY on: blank
+    `because`; an unresolved or already-non-active object; any live link touching it
+    in EITHER direction; or any current assertion from a source other than the
+    layout heartbeat's own bookkeeping (graph_x/graph_y/graph_layout_v are exempt —
+    real content from any other source refuses)."""
     return await _retire_object_impl(
         kind, target, because=because, override_live=override_live, ctx=ctx)
 
