@@ -21,6 +21,7 @@ from typing import Any
 
 from src.actions.core import ActionError, Actions
 from src.orchestrator.compositions import resolve_ref
+from src.orchestrator.graph_layout import GRAPH_LAYOUT_SOURCE
 from src.parsers.base import EvidenceClass
 from src.parsers.evidence import confidence_for
 
@@ -217,3 +218,65 @@ async def retire_link(
                          f"{to_ref!r} — nothing to retire (check the refs and the type)"}
     return {"retired": {"from": from_ref, "to": to_ref, "type": link_type, "count": n},
            "because": because}
+
+
+async def retire_bare_object(
+    actions: Actions, *, ref: str, because: str, actor: str,
+) -> dict[str, Any]:
+    """THE TOOLING GAP (thread 92dde6cc, opened on Khnum's own debug-script
+    artifacts): retire_object(kind=...) covers only seat/project/agent -- no door
+    existed for an arbitrary ACTIVE object of no other kind, the exact shape a stray
+    script or a mis-minted stub leaves behind. `ref` resolves via the SAME
+    resolve_ref every other generic door here uses (UUID, short-id, canonical, or
+    name) -- any object type, not scoped like retire_project's own
+    SoftwareProject-only resolution.
+
+    Refuses LOUDLY (an error dict, nothing written) when: `because` is blank; `ref`
+    doesn't resolve; the object is already non-active; ANY live link touches it in
+    EITHER direction (a bare object is one nothing else references and that
+    references nothing -- a live edge is direct evidence something still depends on
+    it, the same signal retire_project's own "any open Thread pointing in" checks
+    for, generalized here to any link/any direction since a truly bare object has
+    none at all); or it carries a current assertion from any source OTHER than the
+    layout heartbeat's own GRAPH_LAYOUT_SOURCE. That one exemption is deliberate,
+    not an oversight: graph_x/graph_y/graph_layout_v are bookkeeping the heartbeat
+    stamps on EVERY active object regardless of meaning -- this door's own founding
+    specimens (thread:dbg-cl-a-member/-b-member) carry nothing else, so refusing on
+    them would make this door unable to ever retire the exact objects it exists for.
+    Any OTHER source (a name, a summary, a real property) is genuine evidence of
+    content and refuses, the same law retire_project already holds for commits and
+    open threads.
+
+    Same compensating-event mechanism as retire_project (`Actions.set_status`) --
+    never a DELETE."""
+    because = (because or "").strip()
+    if not because:
+        return {"error": "because is required — retiring a bare object is a "
+                         "deliberate act on the record"}
+    pool = actions.pool
+    object_id = await resolve_ref(pool, ref)
+    if object_id is None:
+        return {"error": f"no object matches {ref!r}"}
+    row = await pool.fetchrow(
+        "SELECT id, type, canonical, status FROM objects WHERE id=$1", object_id)
+    if row is None:
+        return {"error": f"no object matches {ref!r}"}
+    if row["status"] != "active":
+        return {"error": f"{row['canonical']} is already {row['status']} — nothing to "
+                         "retire"}
+    live_links = await pool.fetchval(
+        "SELECT count(*) FROM links WHERE (from_id=$1 OR to_id=$1) "
+        "AND (valid_until IS NULL OR valid_until > now())", object_id)
+    if live_links:
+        return {"error": f"{row['canonical']} has {live_links} live link(s) touching it "
+                         "— live signal, retire_bare_object refuses"}
+    other_sources = await pool.fetchval(
+        "SELECT count(*) FROM current_assertions WHERE object_id=$1 AND source_id <> $2",
+        object_id, GRAPH_LAYOUT_SOURCE)
+    if other_sources:
+        return {"error": f"{row['canonical']} carries {other_sources} assertion(s) from a "
+                         "non-layout source — real evidence of content, retire_bare_object "
+                         "refuses"}
+    await actions.set_status(object_id, "retired", because, actor)
+    return {"retired_object": row["canonical"], "id": str(object_id)[:8],
+           "type": row["type"], "because": because}

@@ -6433,6 +6433,47 @@ async def cmd_retire_project(
     return 0
 
 
+async def cmd_retire_object(
+    ref: str, because: str, *, actor: str, pool: asyncpg.Pool | None = None,
+) -> int:
+    """osiris retire-object <ref> <because> [--actor W] — the console-script door
+    onto orchestrator.retirement.retire_bare_object, the SAME function the
+    retire_object(kind='object') MCP tool wraps (thread 92dde6cc). Retires an
+    arbitrary ACTIVE object of no other kind (not a Seat/SoftwareProject/Agent)."""
+    from src.actions.core import Actions
+    from src.orchestrator.retirement import retire_bare_object as _retire_bare_object
+
+    owns_pool = pool is None
+    if pool is None:
+        from src.config.dev_env import apply_dev_fallback
+        from src.config.settings import get_settings
+        from src.db.pool import create_pool
+
+        apply_dev_fallback()
+        settings = get_settings()
+        try:
+            pool = await create_pool(
+                settings.database_url, min_size=1, max_size=4,
+                application_name="osiris-cli:retire-object")
+        except Exception as exc:  # noqa: BLE001 - the CLI boundary: report, no raw traceback
+            print(f"osiris retire-object: could not reach postgres at "
+                  f"{settings.database_url} — {exc}. Set DATABASE_URL, or start the dev "
+                  "instance.", file=sys.stderr)
+            return 1
+    try:
+        out = await _retire_bare_object(Actions(pool), ref=ref, actor=actor, because=because)
+    finally:
+        if owns_pool:
+            await pool.close()
+    if "error" in out:
+        print(f"osiris retire-object: refused — {out['error']}", file=sys.stderr)
+        return 1
+    print(f"retired object {ref!r}")
+    for k, v in out.items():
+        print(f"  {k}: {v}")
+    return 0
+
+
 async def cmd_fork_project(
     project: str, fork_into: str, because: str, *, direction: str = "fork", actor: str,
     pool: asyncpg.Pool | None = None,
@@ -6524,7 +6565,7 @@ COMMANDS, GROUPED BY WHAT YOU'RE TRYING TO DO:
                         establish-office, resync-seat-house, reconcile-seat-identity,
                         create-project, rename-project, retire-project, fork-project,
                         set-project-tag, proposal, settings, retire-assertion,
-                        retire-link, cite
+                        retire-link, retire-object, cite
   operate               deploy, migrate, seed, bootstrap, retention, rematerialize,
                         fleet-reconcile, fleet-prune, backfill, layout
 
@@ -7864,6 +7905,20 @@ def _build_parser() -> argparse.ArgumentParser:
                                   help=f"who is performing this act — defaults to "
                                        f"{_CONSOLE_ACTOR!r}")
 
+    p_retire_object = sub.add_parser(
+        "retire-object", description=_d(
+            "retire an arbitrary ACTIVE object of no other kind (not a Seat/"
+            "SoftwareProject/Agent) — the console-script door onto "
+            "orchestrator.retirement.retire_bare_object, the SAME function the "
+            "retire_object(kind='object') MCP tool wraps (thread 92dde6cc)"),
+        epilog="example: osiris retire-object thread:dbg-cl-a-member "
+               "\"debug-script artifact\"")
+    p_retire_object.add_argument("ref", help="UUID, short id, canonical, or name")
+    p_retire_object.add_argument("because", help="why this object is being retired")
+    p_retire_object.add_argument("--actor", default=_CONSOLE_ACTOR,
+                                 help=f"who is performing this act — defaults to "
+                                      f"{_CONSOLE_ACTOR!r}")
+
     p_fork_project = sub.add_parser(
         "fork-project", description=_d(
             "declare (or reverse) a fork relationship between two ALREADY-active "
@@ -8134,6 +8189,8 @@ def main(argv: list[str] | None = None) -> int:
             args.project, args.tag, args.because, actor=args.actor))
     if args.command == "retire-project":
         return asyncio.run(cmd_retire_project(args.project, args.because, actor=args.actor))
+    if args.command == "retire-object":
+        return asyncio.run(cmd_retire_object(args.ref, args.because, actor=args.actor))
     if args.command == "fork-project":
         return asyncio.run(cmd_fork_project(
             args.project, args.fork_into, args.because, direction=args.direction,

@@ -10,10 +10,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from src.actions.core import Actions
+from src.orchestrator.graph_layout import GRAPH_LAYOUT_SOURCE
 from src.orchestrator.retirement import (
     list_assertions,
     repair_stale_current_flags,
     retire_assertion,
+    retire_bare_object,
     retire_link,
     stale_current_flags,
 )
@@ -443,6 +445,121 @@ async def test_retire_link_mcp_tool_refuses_when_unmounted(actions: Actions) -> 
     try:
         out = await srv.retire_link(from_ref="agent:linkj", to_ref="agent:linkk",
                                     link_type="works_in", because="test")
+    finally:
+        srv._pool = saved_pool
+    assert "error" in out
+    assert "mount first" in out["error"]
+
+
+# --- retire_bare_object: THE TOOLING GAP (thread 92dde6cc) -----------------------------
+
+
+async def test_retire_bare_object_requires_because(actions: Actions) -> None:
+    oid = await actions.create_or_find_object("Thread", "thread:bare-no-because", "test")
+    out = await retire_bare_object(actions, ref=str(oid), because="  ", actor="test")
+    assert "error" in out
+
+
+async def test_retire_bare_object_unresolved_ref_is_an_honest_error(actions: Actions) -> None:
+    out = await retire_bare_object(
+        actions, ref="thread:does-not-exist-at-all", because="cleanup", actor="test")
+    assert "error" in out
+
+
+async def test_retire_bare_object_refuses_when_already_non_active(actions: Actions) -> None:
+    oid = await actions.create_or_find_object("Thread", "thread:bare-inactive", "test")
+    await actions.set_status(oid, "retired", "already gone", "test")
+    out = await retire_bare_object(actions, ref=str(oid), because="cleanup", actor="test")
+    assert "error" in out
+
+
+async def test_retire_bare_object_refuses_on_a_live_outgoing_link(actions: Actions) -> None:
+    a = await actions.create_or_find_object("Thread", "thread:bare-out-a", "test")
+    b = await actions.create_or_find_object("Thread", "thread:bare-out-b", "test")
+    await actions.create_link(a, b, "cites", "test", NOW, 1.0)
+    out = await retire_bare_object(actions, ref=str(a), because="cleanup", actor="test")
+    assert "error" in out
+    assert "live link" in out["error"]
+
+
+async def test_retire_bare_object_refuses_on_a_live_incoming_link(actions: Actions) -> None:
+    a = await actions.create_or_find_object("Thread", "thread:bare-in-a", "test")
+    b = await actions.create_or_find_object("Thread", "thread:bare-in-b", "test")
+    await actions.create_link(a, b, "cites", "test", NOW, 1.0)
+    out = await retire_bare_object(actions, ref=str(b), because="cleanup", actor="test")
+    assert "error" in out
+    assert "live link" in out["error"]
+
+
+async def test_retire_bare_object_refuses_on_a_non_layout_assertion(actions: Actions) -> None:
+    """A real property (a name, a summary — anything from a source other than the
+    layout heartbeat) is genuine evidence of content, not bare junk."""
+    oid = await actions.create_or_find_object("Thread", "thread:bare-real-content", "test")
+    await actions.assert_property(oid, "name", "a real thread", "test", NOW, 0.9)
+    out = await retire_bare_object(actions, ref=str(oid), because="cleanup", actor="test")
+    assert "error" in out
+    assert "non-layout source" in out["error"]
+
+
+async def test_retire_bare_object_exempts_layout_bookkeeping_assertions(
+    actions: Actions,
+) -> None:
+    """THE FOUNDING SPECIMEN: an object carrying ONLY graph_x/graph_y/graph_layout_v
+    from the layout heartbeat (the exact shape this door's own two motivating
+    objects had) must still be retirable -- refusing on the heartbeat's own
+    bookkeeping would make this door unable to ever retire what it exists for."""
+    oid = await actions.create_or_find_object("Thread", "thread:bare-layout-only", "test")
+    await actions.assert_property(oid, "graph_x", 1.0, GRAPH_LAYOUT_SOURCE, NOW, 0.9)
+    await actions.assert_property(oid, "graph_y", 2.0, GRAPH_LAYOUT_SOURCE, NOW, 0.9)
+    await actions.assert_property(oid, "graph_layout_v", 5, GRAPH_LAYOUT_SOURCE, NOW, 0.9)
+    out = await retire_bare_object(actions, ref=str(oid), because="cleanup", actor="test")
+    assert "error" not in out
+    assert out["retired_object"] == "thread:bare-layout-only"
+
+
+async def test_retire_bare_object_flips_status_via_a_compensating_event(
+    actions: Actions,
+) -> None:
+    oid = await actions.create_or_find_object("Thread", "thread:bare-happy", "test")
+    out = await retire_bare_object(
+        actions, ref=str(oid), because="debug-script artifact", actor="agent:cleaner")
+    assert out["retired_object"] == "thread:bare-happy"
+    assert out["type"] == "Thread"
+    status = await actions.pool.fetchval("SELECT status FROM objects WHERE id=$1", oid)
+    assert status == "retired"
+    # NEVER A DELETE: the object row is still there
+    exists = await actions.pool.fetchval(
+        "SELECT count(*) FROM objects WHERE id=$1", oid)
+    assert exists == 1
+    event_payload = await actions.pool.fetchval(
+        "SELECT payload FROM object_events WHERE object_id=$1 "
+        "AND event_type='status_change' ORDER BY id DESC LIMIT 1", oid)
+    assert event_payload["justification"] == "debug-script artifact"
+
+
+async def test_retire_bare_object_is_idempotent_a_second_call_refuses(
+    actions: Actions,
+) -> None:
+    oid = await actions.create_or_find_object("Thread", "thread:bare-twice", "test")
+    first = await retire_bare_object(actions, ref=str(oid), because="cleanup", actor="test")
+    assert "error" not in first
+    second = await retire_bare_object(
+        actions, ref=str(oid), because="cleanup again", actor="test")
+    assert "error" in second
+
+
+async def test_retire_object_kind_object_dispatches_to_retire_bare_object(
+    actions: Actions,
+) -> None:
+    """The MCP door: retire_object(kind='object', ...) reaches the same function
+    directly, unmounted refuses cleanly."""
+    from src import mcp_server as srv
+
+    oid = await actions.create_or_find_object("Thread", "thread:bare-mcp", "test")
+    saved_pool = srv._pool
+    srv._pool = actions.pool
+    try:
+        out = await srv.retire_object(kind="object", target=str(oid), because="test")
     finally:
         srv._pool = saved_pool
     assert "error" in out

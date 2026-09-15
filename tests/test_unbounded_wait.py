@@ -91,7 +91,10 @@ _SUBPROCESS_BASELINE: dict[str, int] = {
     # 82 -> 83 (2026-09-14, Khnum, THE MIGRATION DOOR, Thoth mail 10609): one new
     # dispatch line, `asyncio.run(cmd_layout(...))`, same false-positive class as
     # every comment above — not a genuine new unbounded subprocess call.
-    "src/cli.py": 83,
+    # 83 -> 84 (2026-09-15, Khnum, thread 92dde6cc): one new dispatch line,
+    # `asyncio.run(cmd_retire_object(...))`, same false-positive class as every
+    # comment above — not a genuine new unbounded subprocess call.
+    "src/cli.py": 84,
     "src/ingest/files.py": 3,
     "src/ingest/gitlog.py": 3,
     "src/ingest/sessions.py": 3,

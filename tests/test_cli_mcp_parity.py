@@ -477,6 +477,17 @@ MCP_ONLY_PARAMS = {
         "triangle's server-side text mode has no terminal-side counterpart to be missing.",
     ("inbox", "render"): "same reason as backlog's own entry above — the read triangle's "
         "server-side text mode has no terminal-side counterpart to be missing.",
+    ("retire_object", "kind"): "two DIFFERENT CLI doors reach this one MCP tool now "
+        "(retire-agent for kind='agent', retire-object for kind='object', thread "
+        "92dde6cc) — each CLI door is single-purpose (its own kind hardcoded in the "
+        "call, same shape retire-project's own CLI door already has for kind="
+        "'project'), so `kind` itself is never a CLI-side flag to be missing.",
+    ("retire_object", "override_live"): "only kind='agent' ever reads this flag "
+        "(retire-agent's own CLI door already lacks it too — see its own RENAMED_PARAMS "
+        "entry, this MCP-only pairing just needed a name to check itself against); "
+        "kind='object' (retire-object) has its own liveness signal (live links/"
+        "non-layout assertions) with no override, by design — a bare junk object has "
+        "no session to be 'live'.",
     ("inbox", "peek"): "the CLI console door (thread 68f1bafa/3703a3a9) is ALWAYS a peek "
         "-- a human glancing from a terminal never leases mail, same reasoning as `desk`'s "
         "own always-peek design above (read_desk). Not a gap: peek=True is simply never a "
@@ -566,6 +577,14 @@ RENAMED_PARAMS = {
         "through it; only kind='seat' also gained a seat(action='retire') door).",
     # ("heal-seat-transcript", "seat", ...) DELETED, same reason as heal-seat-anchor
     # above — covered by NO_MCP_EQUIVALENT instead.
+    ("retire-object", "ref", "retire_object", "target"):
+        "thread 92dde6cc: retire_object(kind='object') added for a bare junk object "
+        "with no other kind's door to cover it. The CLI door calls "
+        "retirement.retire_bare_object directly (its own `ref` param, matching "
+        "resolve_ref's own naming used throughout retirement.py) rather than the MCP "
+        "tool's shared `target` — same dual-door shape retire-project/retire-agent "
+        "above already establish, this entry just needs a name pair to check itself "
+        "against.",
 }
 
 # LANE 3 (Thoth dispatch, msg 6438): the drift detector above walks ONE direction only —

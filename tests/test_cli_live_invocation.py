@@ -96,6 +96,7 @@ from src.cli import (
     cmd_retire_agent,
     cmd_retire_assertion,
     cmd_retire_link,
+    cmd_retire_object,
     cmd_retire_project,
     cmd_retire_seat,
     cmd_roster,
@@ -276,6 +277,8 @@ NO_WRITE_INVOCATIONS: dict[str, Any] = {
         "no-such-seat-anywhere", "some-house", "test", actor="operator", pool=a.pool),
     "retire-project": lambda a: cmd_retire_project(
         "no-such-project-anywhere", "test", actor="operator", pool=a.pool),
+    "retire-object": lambda a: cmd_retire_object(
+        "no-such-object-anywhere", "test", actor="operator", pool=a.pool),
     "fork-project": lambda a: cmd_fork_project(
         "no-such-project-anywhere", "still-no-such-project-anywhere", "test",
         actor="operator", pool=a.pool),
