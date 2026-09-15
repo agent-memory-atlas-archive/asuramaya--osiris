@@ -521,28 +521,20 @@ export async function initSpace(container) {
     if (pathFocusId && nd.id !== pathFocusId && !pathReachable.has(nd.id)) return false;
     return true;
   }
-  // TIP 3, EDGE BUDGET (Thoth mail 10930): "only cluster_edges far, strongest N semantic
-  // per node mid, all near." "Strongest" has no real weight on the wire yet -- every edge in
-  // the snapshot is unweighted -- so first-N by array order stands in as the honest default
-  // until a real weight exists, chosen and noted rather than silently passed off as true
-  // ranking. Far returns nothing here since that tier draws buildClusterEdgeLines' own
-  // separate project-centroid lines instead of per-object edges at all.
-  const EDGE_BUDGET_PER_NODE_MID = 5;
+  // TIP 3, EDGE BUDGET (Thoth mail 10930, revised by TIP 3b flaw #2, mail 10953): far draws
+  // buildClusterEdgeLines' own separate project-centroid lines, never per-object edges. Mid
+  // ORIGINALLY kept a capped-per-node subset of real per-object edges here too -- Thoth's own
+  // live review found that this drew as "the solid green cobweb" behind the type glyphs,
+  // reading as noise at a scale where individual objects aren't even shown any more. Her own
+  // instruction: "at mid draw the aggregated (project,type) edges or nothing, never
+  // per-object lines." No (project,type)-pair aggregate exists on the wire (Khnum's own
+  // cluster_edges are project-pair only) -- building one would need a new server aggregate,
+  // out of this tip's own scope -- so mid draws nothing, the documented "or nothing" half of
+  // her own instruction, until that aggregate exists.
   function applyEdgeBudget(edgeList) {
     const tier = zoomLOD();
-    if (tier === "far") return [];
     if (tier === "near") return edgeList;
-    const seenCount = new Map();
-    const budgeted = [];
-    for (const e of edgeList) {
-      if (e.edgeClass !== "semantic") continue;
-      const sc = seenCount.get(e.source) || 0, tc = seenCount.get(e.target) || 0;
-      if (sc >= EDGE_BUDGET_PER_NODE_MID && tc >= EDGE_BUDGET_PER_NODE_MID) continue;
-      seenCount.set(e.source, sc + 1);
-      seenCount.set(e.target, tc + 1);
-      budgeted.push(e);
-    }
-    return budgeted;
+    return []; // far and mid: no per-object edges, ever
   }
   function buildEdgeLines(nodes, rawEdgeList) {
     if (edgeLines) { scene.remove(edgeLines); edgeLines.geometry.dispose(); edgeLines.material.dispose(); edgeLines = null; }
@@ -811,6 +803,10 @@ export async function initSpace(container) {
   function glyphScreenRadiusPx(count) {
     return Math.min(GLYPH_MAX_PX, GLYPH_BASE_PX + GLYPH_COUNT_PX * Math.sqrt(count));
   }
+  // TIP 3b flaw #1 (Thoth mail 10953): glyph labels collided at far (small projects pile in
+  // the centre) and at mid (type glyphs) -- the .lod-glyph-label box, a bit roomier than a
+  // plain node .lbl (bigger font, bold).
+  const GLYPH_LABEL_W = 130, GLYPH_LABEL_H = 22, GLYPH_LABEL_GAP = 4;
   const projectGlyphGroup = new THREE.Group(), typeGlyphGroup = new THREE.Group();
   scene.add(projectGlyphGroup); scene.add(typeGlyphGroup);
   let projectGlyphMeshes = [], typeGlyphMeshes = [];
@@ -828,6 +824,13 @@ export async function initSpace(container) {
     const glyphGeo = new THREE.CircleGeometry(1, 24);
     for (const agg of projectAggregates) {
       const name = projectNames[agg.project] || "unfiled";
+      // TIP 3b flaw #4 (Thoth mail 10953): "the unfiled glyph competes with the projects at
+      // far; render unfiled as the halo it is, not a glyph" -- unfiled is a real bucket
+      // (no in_repo link), not a project a reader chose to look at, and its raw count (often
+      // close to the whole graph's own unlinked remainder) dwarfed every real project glyph
+      // it sat beside. No glyph/label for it at far; its own connected members still read
+      // through the ordinary at-fit halo (buildHalo) same as everything else.
+      if (name === "unfiled") continue;
       const m = new THREE.Mesh(glyphGeo,
         new THREE.MeshBasicMaterial({ color: 0x58a6ff, transparent: true, opacity: 0.28 }));
       m.position.set(agg.cx, agg.cy, 0.01);
@@ -867,26 +870,44 @@ export async function initSpace(container) {
   // its own Vector3 rather than the label-picker's shared `_v` below -- this runs from the
   // initial load path, before that `const` further down the file has executed.
   const _aggV = new THREE.Vector3();
+  // TIP 3b flaw #1 (Thoth mail 10953): "screen-space de-overlap, largest count first,
+  // colliding labels hidden until zoomed" -- same greedy declutter shape positionLabels()
+  // already uses for node labels (_placed/overlapsPlaced below), applied here to the glyph
+  // labels instead: sort each group by its own count descending so the biggest cluster
+  // always wins its spot, then skip any label whose screen box collides with one already
+  // placed this frame. Runs every render (called from positionLabels), so panning/zooming
+  // apart naturally reveals labels that were hidden by a collision a moment ago.
+  const _aggPlaced = [];
+  function aggOverlapsPlaced(x, y) {
+    const x0 = x - GLYPH_LABEL_W / 2, x1 = x + GLYPH_LABEL_W / 2, y0 = y - GLYPH_LABEL_H, y1 = y;
+    for (const b of _aggPlaced) {
+      if (x0 < b[2] + GLYPH_LABEL_GAP && x1 > b[0] - GLYPH_LABEL_GAP &&
+        y0 < b[3] + GLYPH_LABEL_GAP && y1 > b[1] - GLYPH_LABEL_GAP) return true;
+    }
+    return false;
+  }
+  function placeGlyphLabels(meshes, divs, show) {
+    if (!show) { divs.forEach((d) => { d.hidden = true; }); return; }
+    const order = meshes.map((_, i) => i).sort((a, b) => meshes[b].userData.agg.count - meshes[a].userData.agg.count);
+    for (const i of order) {
+      const m = meshes[i], div = divs[i];
+      _aggV.set(m.position.x, m.position.y, 0).project(camera);
+      const x = (_aggV.x * 0.5 + 0.5) * wrap.clientWidth;
+      const y = (-_aggV.y * 0.5 + 0.5) * wrap.clientHeight;
+      if (aggOverlapsPlaced(x, y)) { div.hidden = true; continue; }
+      div.hidden = false;
+      div.style.left = `${x}px`;
+      div.style.top = `${y}px`;
+      _aggPlaced.push([x - GLYPH_LABEL_W / 2, y - GLYPH_LABEL_H, x + GLYPH_LABEL_W / 2, y]);
+    }
+  }
   function positionAggregateLabels(tier) {
     const showProject = tier === "far", showType = tier === "mid";
     projectGlyphGroup.visible = showProject;
     typeGlyphGroup.visible = showType;
-    projectGlyphMeshes.forEach((m, i) => {
-      const div = projectLabelDivs[i];
-      div.hidden = !showProject;
-      if (!showProject) return;
-      _aggV.set(m.position.x, m.position.y, 0).project(camera);
-      div.style.left = `${(_aggV.x * 0.5 + 0.5) * wrap.clientWidth}px`;
-      div.style.top = `${(-_aggV.y * 0.5 + 0.5) * wrap.clientHeight}px`;
-    });
-    typeGlyphMeshes.forEach((m, i) => {
-      const div = typeLabelDivs[i];
-      div.hidden = !showType;
-      if (!showType) return;
-      _aggV.set(m.position.x, m.position.y, 0).project(camera);
-      div.style.left = `${(_aggV.x * 0.5 + 0.5) * wrap.clientWidth}px`;
-      div.style.top = `${(-_aggV.y * 0.5 + 0.5) * wrap.clientHeight}px`;
-    });
+    _aggPlaced.length = 0;
+    placeGlyphLabels(projectGlyphMeshes, projectLabelDivs, showProject);
+    placeGlyphLabels(typeGlyphMeshes, typeLabelDivs, showType);
   }
   // a click at far/mid picks the nearest glyph the point actually falls inside (world-space
   // distance vs. the glyph's own current world radius, cheap: at most a few dozen
