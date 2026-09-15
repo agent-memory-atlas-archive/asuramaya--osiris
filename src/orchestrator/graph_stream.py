@@ -64,6 +64,42 @@ THE LEGIBILITY PASS, Khnum tip 2 (ruling e1cb9e3b, operator 2026-09-14 evening):
   7. `cluster_edges` (tip 2j) -- one record per (project pair, link class) with a live
      edge count, for the far-zoom aggregated-edges view -- computed from the same
      edge_src/edge_dst/project_code arrays already built, no extra query.
+
+DENSITY NOT DISCS (ruling 6f866d9d, tip (h), thread 2397dac3) plus two follow-ups the
+operator flagged for "another day" (Thoth mail 10892's own thread, folded into the
+same tip since all three ship together here):
+  8. `edge_weight` -- a new index-aligned Float32 array parallel to edge_src/edge_dst/
+     edge_type_code (added to `_ARRAY_ORDER`, a real wire-format change agreed with
+     Seshat by DM before commit, mail 11014/11016). RAW, never a pre-normalised 0-1
+     curve -- Seshat's own steer: she already log2-normalises client-side for
+     cluster_edges' color-brightness mix, and raw keeps that flexibility rather than
+     baking one curve into the wire. Flat 1.0 for every individual link for now: her
+     own live tip (off Thoth mail 11011) retires "strongest N" edge filtering
+     entirely -- every edge now draws at every zoom, alpha scaled by on-screen
+     count -- so there is no live consumer asking this array to differentiate
+     individual edges yet. The field exists on the wire because the dispatch asked
+     for it and a future consumer may want it; `type_pair_edges`' own `count` below
+     is Seshat's actual next real-weight consumer.
+  9. `type_pair_edges` -- one record per ((project,type) bucket pair, link class) with
+     a live count, the SAME shape as `cluster_edges` one level finer: cluster_edges is
+     project-to-project only (same-project pairs excluded), this is bucket-to-bucket
+     (same-BUCKET pairs excluded, but same-project-different-type IS included) --
+     Thoth's own "the mid tier now draws no edges because the stream has no
+     (project,type)-pair aggregate" follow-up (mail 10892's thread, second note).
+     `count` doubles as this record's own weight (a live edge count is already a real
+     ranking, unlike the individual-edge case `edge_weight` above exists to fix).
+ 10. THE NAMELESS-AGENT LABEL FIX (Thoth mail 10892's thread, first follow-up,
+     ruling e1cb9e3b(c)): an Agent with no `handle` assertion used to fall through to
+     `type_name + canonical` ("Agent agent:b5f0f4b4...") -- the exact "labels show
+     ids" shape the whole legibility pass was meant to kill, just for the one type
+     that can genuinely lack a name (an anonymous swarm session that never
+     `claim_name`'d). Fixed per the ruling's own rule: lineage handle + generation
+     when the Agent's OWN lineage currently holds a Seat (`seats.held_seat`, the same
+     door orient()/mount() use), else "Agent · <model> in <project>" (source_model
+     assertion; first live works_in target's own canonical, repo: prefix stripped) --
+     never the id either way. Resolved for the SMALL handle-less-Agent subset only
+     (Thoth's own live count: 49,712 of 49,766 labels already read as titles), not a
+     query added to every row.
 """
 from __future__ import annotations
 
@@ -86,7 +122,7 @@ _LABEL_MAX_CHARS = 40
 
 def _short_label(
     type_name: str, canonical: str, handle: str | None, name: str | None,
-    title: str | None,
+    title: str | None, *, agent_fallback: str | None = None,
 ) -> str:
     """THE LEGIBILITY PASS (ruling e1cb9e3b, tip 2g/2c): the client never guesses a
     label. Agent by handle (never the id), SoftwareProject by its own repo name
@@ -103,9 +139,19 @@ def _short_label(
     embedded newline/whitespace run collapsed to a single space -- a Decision's own
     summary is often multi-line prose), hard-truncated at 40 characters with an
     ellipsis, matching Seshat's own tip 1c formatting rule exactly so the two
-    renderings never disagree."""
+    renderings never disagree.
+
+    `agent_fallback` (THE NAMELESS-AGENT LABEL FIX, ruling e1cb9e3b(c)): a caller-
+    resolved "lineage handle + generation" or "Agent · <model> in <project>" string
+    for a handle-less Agent (see `fetch_snapshot`'s own resolution -- a Seat lookup
+    and a couple of assertion reads this pure function has no pool to make itself).
+    Tried BEFORE the generic title/canonical fallback chain so a nameless Agent never
+    reads its own summary/subject assertion (it wouldn't have one) or, worse,
+    canonical -- the exact id-shaped label this whole rule exists to kill."""
     if type_name == "Agent" and handle:
         label = handle
+    elif type_name == "Agent" and agent_fallback:
+        label = agent_fallback
     elif type_name == "SoftwareProject":
         label = canonical.removeprefix("repo:") or canonical
     elif type_name == "Person" and name:
@@ -134,7 +180,7 @@ _ARRAY_ORDER: tuple[tuple[str, str], ...] = (
     ("x", "f"), ("y", "f"),
     ("type_code", "H"), ("project_code", "H"),
     ("weight", "f"), ("status_flag", "B"),
-    ("edge_src", "I"), ("edge_dst", "I"), ("edge_type_code", "B"),
+    ("edge_src", "I"), ("edge_dst", "I"), ("edge_type_code", "B"), ("edge_weight", "f"),
 )
 
 
@@ -143,12 +189,14 @@ def encode_snapshot(
     object_ids: list[str], x: list[float], y: list[float],
     type_code: list[int], project_code: list[int], weight: list[float],
     status_flag: list[int], edge_src: list[int], edge_dst: list[int],
-    edge_type_code: list[int], types: list[str], projects: list[str],
-    edge_types: list[str], link_type_class: list[str], labels: list[str],
+    edge_type_code: list[int], edge_weight: list[float], types: list[str],
+    projects: list[str], edge_types: list[str], link_type_class: list[str],
+    labels: list[str],
     watermark: int = 0,
     project_aggregates: list[dict[str, Any]] | None = None,
     type_aggregates: list[dict[str, Any]] | None = None,
     cluster_edges: list[dict[str, Any]] | None = None,
+    type_pair_edges: list[dict[str, Any]] | None = None,
 ) -> bytes:
     """Pure function, no DB: builds the exact wire bytes from already-resolved
     columns -- the DB-facing half (`fetch_snapshot`) is the only caller that ever
@@ -159,12 +207,13 @@ def encode_snapshot(
         "x": x, "y": y, "type_code": type_code, "project_code": project_code,
         "weight": weight, "status_flag": status_flag,
         "edge_src": edge_src, "edge_dst": edge_dst, "edge_type_code": edge_type_code,
+        "edge_weight": edge_weight,
     }
     for name in ("x", "y", "type_code", "project_code", "weight", "status_flag"):
         if len(arrays[name]) != count:
             raise ValueError(
                 f"{name} has {len(arrays[name])} entries, expected {count} (count)")
-    for name in ("edge_src", "edge_dst", "edge_type_code"):
+    for name in ("edge_src", "edge_dst", "edge_type_code", "edge_weight"):
         if len(arrays[name]) != edge_count:
             raise ValueError(
                 f"{name} has {len(arrays[name])} entries, expected {edge_count} "
@@ -191,6 +240,7 @@ def encode_snapshot(
         "project_aggregates": project_aggregates or [],
         "type_aggregates": type_aggregates or [],
         "cluster_edges": cluster_edges or [],
+        "type_pair_edges": type_pair_edges or [],
         "arrays": offsets,
     }
     header_bytes = json.dumps(header).encode()
@@ -208,13 +258,55 @@ def decode_snapshot(data: bytes) -> dict[str, Any]:
         k: header[k] for k in
         ("schema_version", "count", "edge_count", "types", "projects", "edge_types",
          "link_type_class", "object_ids", "labels", "watermark",
-         "project_aggregates", "type_aggregates", "cluster_edges")
+         "project_aggregates", "type_aggregates", "cluster_edges", "type_pair_edges")
     }
     for name, meta in header["arrays"].items():
         code = str(meta["dtype"])
         n = int(meta["length"])
         off = int(meta["offset"])
         out[name] = list(struct.unpack_from(f"<{n}{code}", body, off))
+    return out
+
+
+async def _nameless_agent_fallbacks(
+    pool: asyncpg.Pool, rows: list[asyncpg.Record],
+) -> dict[uuid.UUID, str]:
+    """THE NAMELESS-AGENT LABEL FIX (ruling e1cb9e3b(c)): resolved ONLY for the small
+    handle-less-Agent subset of `rows` -- a per-id Seat lookup plus a couple of
+    assertion reads this module has no reason to pay for every ordinary, already-
+    named object. Lineage handle + generation when the Agent's OWN lineage currently
+    holds a Seat, else "Agent · <model> in <project>" -- never the id."""
+    nameless = [r for r in rows if r["type"] == "Agent" and not r["handle"]]
+    if not nameless:
+        return {}
+    from src.orchestrator.agents import _generation, _to_roman
+    from src.orchestrator.seats import held_seat
+
+    ids = [r["id"] for r in nameless]
+    detail_rows = await pool.fetch(
+        "SELECT o.id, "
+        "  (SELECT a.value #>> '{}' FROM current_assertions a WHERE a.object_id=o.id "
+        "   AND a.name='source_model' "
+        "   ORDER BY a.confidence DESC, a.observed_at DESC LIMIT 1) AS model, "
+        "  (SELECT t.canonical FROM links l JOIN objects t ON t.id=l.to_id "
+        "   WHERE l.from_id=o.id AND l.type='works_in' "
+        "     AND (l.valid_until IS NULL OR l.valid_until > now()) "
+        "   ORDER BY l.id LIMIT 1) AS project "
+        "FROM objects o WHERE o.id = ANY($1::uuid[])", ids)
+    model_by_id = {r["id"]: r["model"] for r in detail_rows}
+    project_by_id = {r["id"]: r["project"] for r in detail_rows}
+
+    out: dict[uuid.UUID, str] = {}
+    for r in nameless:
+        oid, canonical = r["id"], r["canonical"]
+        seat = await held_seat(pool, canonical)
+        if seat and seat.get("handle"):
+            gen = _generation(canonical)[1]
+            out[oid] = f"{seat['handle']} {_to_roman(gen)}" if gen > 1 else seat["handle"]
+        else:
+            model = model_by_id.get(oid) or "?"
+            project = (project_by_id.get(oid) or "unfiled").removeprefix("repo:")
+            out[oid] = f"Agent · {model} in {project}"
     return out
 
 
@@ -267,6 +359,7 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
         "    WHERE valid_until IS NULL OR valid_until > now()"
         ") x GROUP BY node")
     weight_by_id: dict[uuid.UUID, int] = {r["node"]: int(r["n"]) for r in weight_rows}
+    agent_fallback_by_id = await _nameless_agent_fallbacks(pool, rows)
 
     type_index: dict[str, int] = {}
     project_index: dict[str, int] = {}
@@ -291,8 +384,9 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
         project_codes.append(project_index.setdefault(project_key, len(project_index)))
         weights.append(float(weight_by_id.get(oid, 0)))
         statuses.append(STATUS_CONTESTED if r["contested"] else 0)
-        labels.append(
-            _short_label(r["type"], r["canonical"], r["handle"], r["name"], r["title"]))
+        labels.append(_short_label(
+            r["type"], r["canonical"], r["handle"], r["name"], r["title"],
+            agent_fallback=agent_fallback_by_id.get(oid)))
 
     edge_src: list[int] = []
     edge_dst: list[int] = []
@@ -312,6 +406,18 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
             edge_dst.append(id_index[t])
             edge_type_codes.append(
                 edge_type_index.setdefault(r["type"], len(edge_type_index)))
+
+    # DENSITY NOT DISCS tip (h), item 8: a flat per-edge weight -- RAW, not a
+    # pre-normalised 0-1 curve (Seshat, mail 11016: she already log2-normalises
+    # client-side for cluster_edges' own color-brightness mix, and raw keeps that
+    # flexibility rather than baking one curve into the wire). 1.0 for every
+    # individual link for now -- her own live tip off Thoth mail 11011 retires
+    # "strongest N" filtering entirely (every edge draws at every zoom, alpha
+    # scaled by on-screen count instead), so there is no live consumer asking this
+    # array to differentiate individual edges yet; a real per-edge count/weight is
+    # exactly what `type_pair_edges`' own `count` field already provides one level
+    # up, which she names as her actual next consumer.
+    edge_weights: list[float] = [1.0 for _ in edge_src]
 
     types = [name for name, _ in sorted(type_index.items(), key=lambda kv: kv[1])]
     projects = [name for name, _ in sorted(project_index.items(), key=lambda kv: kv[1])]
@@ -355,14 +461,35 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
         for (a, b, cls), n in cluster_counts.items()
     ]
 
+    # DENSITY NOT DISCS tip (h), item 9: one record per (project,type)-bucket pair,
+    # the SAME shape one level finer -- same-BUCKET pairs excluded (a self-loop has
+    # nothing to draw a mid-tier line between), but a same-project different-type
+    # pair IS included (unlike cluster_edges' cross-project-only rule), since the
+    # mid tier needs edges BETWEEN type clusters within one project too.
+    type_pair_counts: dict[tuple[tuple[int, int], tuple[int, int], str], int] = defaultdict(int)
+    for i in range(len(edge_src)):
+        b1 = (project_codes[edge_src[i]], type_codes[edge_src[i]])
+        b2 = (project_codes[edge_dst[i]], type_codes[edge_dst[i]])
+        if b1 == b2:
+            continue
+        bucket_a, bucket_b = (b1, b2) if b1 <= b2 else (b2, b1)
+        type_pair_counts[(bucket_a, bucket_b, link_type_class[edge_type_codes[i]])] += 1
+    type_pair_edges = [
+        {"a": {"project": bucket_a[0], "type": bucket_a[1]},
+         "b": {"project": bucket_b[0], "type": bucket_b[1]},
+         "class": cls, "count": n}
+        for (bucket_a, bucket_b, cls), n in type_pair_counts.items()
+    ]
+
     return encode_snapshot(
         object_ids=object_ids, x=xs, y=ys, type_code=type_codes,
         project_code=project_codes, weight=weights, status_flag=statuses,
         edge_src=edge_src, edge_dst=edge_dst, edge_type_code=edge_type_codes,
+        edge_weight=edge_weights,
         types=types, projects=projects, edge_types=edge_types,
         link_type_class=link_type_class, labels=labels, watermark=watermark,
         project_aggregates=project_aggregates, type_aggregates=type_aggregates,
-        cluster_edges=cluster_edges,
+        cluster_edges=cluster_edges, type_pair_edges=type_pair_edges,
     )
 
 

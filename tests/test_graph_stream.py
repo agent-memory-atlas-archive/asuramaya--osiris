@@ -46,11 +46,14 @@ def test_snapshot_round_trips_through_the_decoder_with_the_exact_count() -> None
         object_ids=["a", "b", "c"], x=[1.0, 2.0, 3.0], y=[4.0, 5.0, 6.0],
         type_code=[0, 1, 0], project_code=[0, 0, 1], weight=[2.0, 0.0, 5.0],
         status_flag=[0, 2, 0], edge_src=[0, 1], edge_dst=[1, 2], edge_type_code=[0, 1],
+        edge_weight=[0.5, 1.0],
         types=["Thread", "Decision"], projects=["repo:x", "repo:y"],
         edge_types=["cites", "in_repo"], link_type_class=["semantic", "structural"],
         labels=["Thread abc", "Decision def", "Thread ghi"],
         project_aggregates=[{"project": 0, "count": 2, "cx": 1.5, "cy": 4.5, "radius": 1.0}],
         cluster_edges=[{"a": 0, "b": 1, "class": "semantic", "count": 1}],
+        type_pair_edges=[{"a": {"project": 0, "type": 0}, "b": {"project": 0, "type": 1},
+                           "class": "semantic", "count": 1}],
     )
     out = decode_snapshot(data)
     assert out["count"] == 3
@@ -65,6 +68,9 @@ def test_snapshot_round_trips_through_the_decoder_with_the_exact_count() -> None
         {"project": 0, "count": 2, "cx": 1.5, "cy": 4.5, "radius": 1.0}]
     assert out["type_aggregates"] == []
     assert out["cluster_edges"] == [{"a": 0, "b": 1, "class": "semantic", "count": 1}]
+    assert out["type_pair_edges"] == [
+        {"a": {"project": 0, "type": 0}, "b": {"project": 0, "type": 1},
+         "class": "semantic", "count": 1}]
     assert out["x"] == pytest.approx([1.0, 2.0, 3.0])
     assert out["y"] == pytest.approx([4.0, 5.0, 6.0])
     assert out["type_code"] == [0, 1, 0]
@@ -74,12 +80,14 @@ def test_snapshot_round_trips_through_the_decoder_with_the_exact_count() -> None
     assert out["edge_src"] == [0, 1]
     assert out["edge_dst"] == [1, 2]
     assert out["edge_type_code"] == [0, 1]
+    assert out["edge_weight"] == pytest.approx([0.5, 1.0])
 
 
 def test_snapshot_with_no_edges_still_round_trips() -> None:
     data = encode_snapshot(
         object_ids=["only"], x=[0.0], y=[0.0], type_code=[0], project_code=[0],
         weight=[0.0], status_flag=[0], edge_src=[], edge_dst=[], edge_type_code=[],
+        edge_weight=[],
         types=["Thread"], projects=["unfiled"], edge_types=[], link_type_class=[],
         labels=["Thread only"],
     )
@@ -87,9 +95,11 @@ def test_snapshot_with_no_edges_still_round_trips() -> None:
     assert out["count"] == 1
     assert out["edge_count"] == 0
     assert out["edge_src"] == []
+    assert out["edge_weight"] == []
     assert out["project_aggregates"] == []
     assert out["type_aggregates"] == []
     assert out["cluster_edges"] == []
+    assert out["type_pair_edges"] == []
 
 
 def test_encode_snapshot_rejects_a_mismatched_node_column_length() -> None:
@@ -97,8 +107,8 @@ def test_encode_snapshot_rejects_a_mismatched_node_column_length() -> None:
         encode_snapshot(
             object_ids=["a", "b"], x=[1.0], y=[1.0, 2.0], type_code=[0, 0],
             project_code=[0, 0], weight=[0.0, 0.0], status_flag=[0, 0],
-            edge_src=[], edge_dst=[], edge_type_code=[], types=[], projects=[],
-            edge_types=[], link_type_class=[], labels=["a", "b"],
+            edge_src=[], edge_dst=[], edge_type_code=[], edge_weight=[], types=[],
+            projects=[], edge_types=[], link_type_class=[], labels=["a", "b"],
         )
 
 
@@ -107,8 +117,8 @@ def test_encode_snapshot_rejects_a_mismatched_edge_column_length() -> None:
         encode_snapshot(
             object_ids=["a"], x=[1.0], y=[1.0], type_code=[0], project_code=[0],
             weight=[0.0], status_flag=[0], edge_src=[0, 0], edge_dst=[0],
-            edge_type_code=[0, 0], types=[], projects=[], edge_types=[],
-            link_type_class=[], labels=["a"],
+            edge_type_code=[0, 0], edge_weight=[0.0, 0.0], types=[], projects=[],
+            edge_types=[], link_type_class=[], labels=["a"],
         )
 
 
@@ -117,8 +127,8 @@ def test_encode_snapshot_rejects_a_mismatched_labels_length() -> None:
         encode_snapshot(
             object_ids=["a", "b"], x=[1.0, 2.0], y=[1.0, 2.0], type_code=[0, 0],
             project_code=[0, 0], weight=[0.0, 0.0], status_flag=[0, 0],
-            edge_src=[], edge_dst=[], edge_type_code=[], types=[], projects=[],
-            edge_types=[], link_type_class=[], labels=["only-one"],
+            edge_src=[], edge_dst=[], edge_type_code=[], edge_weight=[], types=[],
+            projects=[], edge_types=[], link_type_class=[], labels=["only-one"],
         )
 
 
@@ -261,6 +271,90 @@ async def test_fetch_snapshot_labels_use_the_real_title_not_the_canonical(
     ):
         idx = out["object_ids"].index(str(oid))
         assert out["labels"][idx] == expected
+
+
+async def test_fetch_snapshot_nameless_agent_falls_back_to_seat_handle_and_generation(
+    actions: Actions,
+) -> None:
+    """THE NAMELESS-AGENT LABEL FIX (ruling e1cb9e3b(c)): a handle-less Agent whose
+    lineage holds an active Seat labels as "<seat handle> <generation>", never its
+    own canonical id."""
+    now = datetime.now(UTC)
+    seat = await actions.create_or_find_object("Seat", "seat:gs-nameless-a", "test")
+    await actions.assert_property(seat, "handle", "Nefer", "test", now, 0.9)
+    agent = await actions.create_or_find_object("Agent", "agent:gs-nameless-a-g1", "test")
+    await actions.create_link(agent, seat, "holds", "test", now, 1.0)
+
+    await layout_batch(actions, limit=1000)
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    idx = out["object_ids"].index(str(agent))
+    assert out["labels"][idx] == "Nefer"
+
+
+async def test_fetch_snapshot_nameless_agent_without_a_seat_falls_back_to_model_and_project(
+    actions: Actions,
+) -> None:
+    """THE NAMELESS-AGENT LABEL FIX: no handle, no held Seat -- "Agent · <model> in
+    <project>", never the id."""
+    now = datetime.now(UTC)
+    project = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gs-nameless-b", "test")
+    agent = await actions.create_or_find_object("Agent", "agent:gs-nameless-b", "test")
+    await actions.assert_property(agent, "source_model", "claude-sonnet-5", "test", now, 0.9)
+    await actions.create_link(agent, project, "works_in", "test", now, 1.0)
+
+    await layout_batch(actions, limit=1000)
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    idx = out["object_ids"].index(str(agent))
+    assert out["labels"][idx] == "Agent · claude-sonnet-5 in gs-nameless-b"
+
+
+async def test_fetch_snapshot_edge_weight_is_raw_flat_for_now(actions: Actions) -> None:
+    """DENSITY NOT DISCS tip (h), item 8 (Seshat, mail 11016): edge_weight is RAW,
+    never a pre-normalised curve -- flat 1.0 for every individual link today, since
+    her own live tip has no per-edge-weight consumer yet (she log2-normalises
+    client-side when she does need a curve, from a raw value this array provides)."""
+    now = datetime.now(UTC)
+    a = await actions.create_or_find_object("Thread", "thread:gs-ew-a", "test")
+    b = await actions.create_or_find_object("Thread", "thread:gs-ew-b", "test")
+    await actions.create_link(a, b, "cites", "test", now, 1.0)
+
+    await layout_batch(actions, limit=1000)
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    assert out["edge_count"] >= 1
+    assert all(w == pytest.approx(1.0) for w in out["edge_weight"])
+
+
+async def test_fetch_snapshot_type_pair_edges_covers_same_project_cross_type(
+    actions: Actions,
+) -> None:
+    """DENSITY NOT DISCS tip (h), item 9: unlike cluster_edges (cross-project only),
+    type_pair_edges includes a same-project, different-type pair."""
+    now = datetime.now(UTC)
+    project = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gs-tpe", "test")
+    person = await actions.create_or_find_object("Person", "principal:gs-tpe-person", "test")
+    thread_obj = await actions.create_or_find_object("Thread", "thread:gs-tpe-thread", "test")
+    for oid in (person, thread_obj):
+        await actions.create_link(oid, project, "in_repo", "test", now, 1.0)
+    await actions.create_link(person, thread_obj, "cites", "test", now, 1.0)
+
+    await layout_batch(actions, limit=1000)
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+
+    pcode = out["project_code"][out["object_ids"].index(str(person))]
+    tcode_person = out["type_code"][out["object_ids"].index(str(person))]
+    tcode_thread = out["type_code"][out["object_ids"].index(str(thread_obj))]
+    bucket_a = {"project": pcode, "type": tcode_person}
+    bucket_b = {"project": pcode, "type": tcode_thread}
+    found = [
+        r for r in out["type_pair_edges"]
+        if {tuple(sorted(r["a"].items())), tuple(sorted(r["b"].items()))} ==
+           {tuple(sorted(bucket_a.items())), tuple(sorted(bucket_b.items()))}
+    ]
+    assert found and found[0]["count"] >= 1
+    # cluster_edges must NOT carry this same-project pair (its own cross-project rule)
+    assert not any(e["a"] == e["b"] == pcode for e in out["cluster_edges"])
 
 
 async def test_fetch_snapshot_aggregates_carry_every_placed_object(
