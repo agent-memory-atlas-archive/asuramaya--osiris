@@ -401,6 +401,20 @@ export async function initSpace(container) {
   let pathFocusId = null;
   let pathReachable = new Set();
   let focusStack = []; // ids, most recent last — back() pops, Escape/Clear focus wipes the overlay
+  // THE DRILL: cross-project anchor click targets. Declared here (not next to
+  // buildProjectObjectIndex/buildProjectAnchors further down) because buildScene calls
+  // buildProjectObjectIndex() on every load -- a `let` declared below buildScene's own
+  // call site is still in its temporal dead zone at that point, a real crash-on-every-load
+  // bug THE LAST RENDERER's live verification caught (ReferenceError: Cannot access
+  // 'projectObjectByName' before initialization).
+  let projectObjectByName = new Map(); // "repo:foo" -> that SoftwareProject object's own id
+  // shared world->screen scratch vector for every per-frame div-positioning pass (labels,
+  // drill entries, project anchors, project stubs) -- same TDZ reasoning as
+  // projectObjectByName above: positionDrillDivs/positionProjectAnchors/
+  // positionProjectStubs are all reachable during a container focus called well before a
+  // declaration placed down near positionLabels would have run. One shared instance is
+  // also just correct: it's pure per-call scratch, never carries state between calls.
+  const _screenV = new THREE.Vector3();
 
   function disposeCurrent() {
     for (const m of [mesh, pickMesh, edgeLines]) {
@@ -1095,9 +1109,9 @@ export async function initSpace(container) {
   function positionDrillDivs() {
     for (const entry of drillNodeEntries) {
       if (!entry.div) continue;
-      _tierV.set(entry.x, entry.y, 0).project(camera);
-      entry.div.style.left = `${(_tierV.x * 0.5 + 0.5) * wrap.clientWidth}px`;
-      entry.div.style.top = `${(-_tierV.y * 0.5 + 0.5) * wrap.clientHeight}px`;
+      _screenV.set(entry.x, entry.y, 0).project(camera);
+      entry.div.style.left = `${(_screenV.x * 0.5 + 0.5) * wrap.clientWidth}px`;
+      entry.div.style.top = `${(-_screenV.y * 0.5 + 0.5) * wrap.clientHeight}px`;
     }
   }
   // "top 50 by degree then recency" -- recency isn't on the wire (fetchStreamSnapshot's own
@@ -1214,7 +1228,6 @@ export async function initSpace(container) {
     for (const e of projectAnchorEntries) e.div.remove();
     projectAnchorEntries = [];
   }
-  let projectObjectByName = new Map(); // "repo:foo" -> that SoftwareProject object's own id
   function buildProjectObjectIndex() {
     projectObjectByName = new Map();
     for (const nd of idToNode) {
@@ -1248,9 +1261,9 @@ export async function initSpace(container) {
   }
   function positionProjectAnchors() {
     for (const e of projectAnchorEntries) {
-      _tierV.set(e.x, e.y, 0).project(camera);
-      e.div.style.left = `${(_tierV.x * 0.5 + 0.5) * wrap.clientWidth}px`;
-      e.div.style.top = `${(-_tierV.y * 0.5 + 0.5) * wrap.clientHeight}px`;
+      _screenV.set(e.x, e.y, 0).project(camera);
+      e.div.style.left = `${(_screenV.x * 0.5 + 0.5) * wrap.clientWidth}px`;
+      e.div.style.top = `${(-_screenV.y * 0.5 + 0.5) * wrap.clientHeight}px`;
     }
   }
 
@@ -1259,6 +1272,16 @@ export async function initSpace(container) {
   // project's part of the path without unhiding the project." Computed once per filter
   // change (setHiddenProjects calls buildProjectStubs), never per-frame -- a full edge
   // scan is a rare, deliberate act's cost, not a render one.
+  //
+  // MAX_PROJECT_STUBS: THE LAST RENDERER's own live verification (repo:osiris filtered
+  // to itself, mail 11222) caught a real freeze here -- osiris's own cross-project fan-out
+  // (works_in: 8,363 edges) produced 12,273 distinct (node, hiddenProject) boundary pairs,
+  // one real DOM div EACH, repositioned via positionProjectStubs() on EVERY render frame.
+  // That's the same declutter problem labels already solve (pickLabels' own top-N-by-
+  // degree-in-viewport): keep the biggest, most-informative stubs, drop the rest, same as
+  // the doc comment above already promises ("a small counted stub") but the code never
+  // actually bounded.
+  const MAX_PROJECT_STUBS = 80;
   let projectStubEntries = []; // [{nodeId, hiddenProject, count, div}]
   function disposeProjectStubs() {
     for (const e of projectStubEntries) e.div.remove();
@@ -1290,11 +1313,14 @@ export async function initSpace(container) {
       byProj.set(hiddenNd.project, (byProj.get(hiddenNd.project) || 0) + 1);
       stubs.set(visible.id, byProj);
     }
+    const all = [];
     for (const [nodeId, byProj] of stubs) {
       for (const [hiddenProject, count] of byProj) {
-        projectStubEntries.push({ nodeId, hiddenProject, count, div: null });
+        all.push({ nodeId, hiddenProject, count, div: null });
       }
     }
+    all.sort((a, b) => b.count - a.count);
+    projectStubEntries = all.slice(0, MAX_PROJECT_STUBS);
     buildProjectStubDivs();
   }
   function positionProjectStubs() {
@@ -1303,9 +1329,9 @@ export async function initSpace(container) {
       const nd = idById.get(entry.nodeId);
       entry.div.hidden = !nd || !nodeVisible(nd);
       if (entry.div.hidden) continue;
-      _tierV.set(nd.x || 0, nd.y || 0, 0).project(camera);
-      entry.div.style.left = `${(_tierV.x * 0.5 + 0.5) * wrap.clientWidth}px`;
-      entry.div.style.top = `${(-_tierV.y * 0.5 + 0.5) * wrap.clientHeight}px`;
+      _screenV.set(nd.x || 0, nd.y || 0, 0).project(camera);
+      entry.div.style.left = `${(_screenV.x * 0.5 + 0.5) * wrap.clientWidth}px`;
+      entry.div.style.top = `${(-_screenV.y * 0.5 + 0.5) * wrap.clientHeight}px`;
     }
   }
   // reveals just the one hidden-project neighbourhood a stub named -- adds those specific
@@ -1804,7 +1830,6 @@ export async function initSpace(container) {
   // label unless its screen box would overlap one already placed this frame — keeps the
   // closest/most-relevant labels and silently drops the rest, rather than stacking dozens
   // of overlapping strings into an unreadable wall of text.
-  const _v = new THREE.Vector3();
   const _placed = []; // [x0,y0,x1,y1] boxes already shown this frame
   const LABEL_W = 90, LABEL_H = 16, LABEL_GAP = 4;
   function overlapsPlaced(x, y) {
@@ -1821,9 +1846,9 @@ export async function initSpace(container) {
     for (const nd of labeledNodes) {
       const div = labelDivs.get(nd);
       if (!div) continue;
-      _v.set(nd.x || 0, nd.y || 0, 0).project(camera);
-      const x = (_v.x * 0.5 + 0.5) * wrap.clientWidth;
-      const y = (-_v.y * 0.5 + 0.5) * wrap.clientHeight;
+      _screenV.set(nd.x || 0, nd.y || 0, 0).project(camera);
+      const x = (_screenV.x * 0.5 + 0.5) * wrap.clientWidth;
+      const y = (-_screenV.y * 0.5 + 0.5) * wrap.clientHeight;
       const lit = nd.id === pathFocusId || pathReachable.has(nd.id) || nd.id === selectedId;
       // lit/focused labels always win their spot (never declutter the thing you asked to
       // see); ordinary labels yield to anything already placed.

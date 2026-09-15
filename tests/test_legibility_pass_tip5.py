@@ -10,8 +10,21 @@ the existing per-instance aVisible hide mechanism rather than a literal second T
 -- see the WIP decision for that interpretation call) keeps THE DRILL's own container/
 anchor/stub model, reframed to work without the tier system. Mirrors the repo's existing
 static-source-guard convention: string/substring proofs against the served JS, no browser
-harness. Live verification is explicitly DEFERRED per Thoth's own instruction, pending
-Khnum's physics layout landing -- these tests prove the code shape, not a rendered frame.
+harness (these tests prove the code shape, not a rendered frame).
+
+Live-verified over Khnum's physics layout (main 39a31702, mail 11222) via claude-in-chrome
+against a real local server on the ~50k-node/134k-edge graph: whole-graph load at fit, the
+tone-map saturation cap (max channel 254/255, zero pure-white pixels), a repo:osiris
+container focus (14 nodes total, inspector follows focus), the header repo dropdown closing
+on pick, and the osiris project filter. That pass caught three real bugs invisible to the
+smaller fixtures every other test in this repo runs against -- each fixed and covered by a
+test below: a TDZ crash on every page load (projectObjectByName declared after buildScene's
+own call site), an undefined-variable crash in every drill/anchor/stub position call
+(_tierV, a leftover from the retired tier system, never renamed), and an unbounded
+DOM-stub-per-frame freeze under a project filter on a high-fan-out hub (12,273 real divs
+repositioned every render frame). The table-drawer-reads-0 gap survives live-verification
+too, unchanged -- see the DM report; it is a console.js/SET architecture gap outside this
+tip's own canvas-rendering scope, not something introduced or fixed here.
 """
 from __future__ import annotations
 
@@ -248,3 +261,56 @@ def test_the_inspector_follows_a_container_focus_too() -> None:
     # the ordinary focusObject's own trailing inspect(id) call.
     body = _SPACE_JS.split("async function renderContainerDrill(id, opts)", 1)[1][:4000]
     assert "await inspect(id);" in body
+
+
+# --- three real bugs live verification caught (mail 11222), invisible to every other test
+# in this file since none of them ever execute the JS against real data at real scale -----
+
+def test_project_object_index_is_declared_before_build_scene_ever_calls_it() -> None:
+    # a genuine crash-on-every-load: buildScene() (called synchronously right after the
+    # init fetch, long before this file's own tier-label-era declarations) calls
+    # buildProjectObjectIndex(), which assigns to projectObjectByName -- a `let` that used
+    # to sit far below, still in its own temporal dead zone at that point. Moved next to
+    # the rest of the early top-level state (pathReachable, focusStack) so it is
+    # initialized before buildScene's own call site, not after.
+    early_state = _SPACE_JS.split("let focusStack = [];", 1)[1][:600]
+    assert "let projectObjectByName = new Map();" in early_state
+    build_scene_call = _SPACE_JS.index("buildProjectObjectIndex(); // THE DRILL")
+    declaration = _SPACE_JS.index("let projectObjectByName = new Map();")
+    assert declaration < build_scene_call
+    # and not re-declared a second time further down where the old TDZ bug lived
+    assert _SPACE_JS.count("let projectObjectByName = new Map();") == 1
+
+
+def test_screen_projection_scratch_vector_is_shared_not_an_undefined_leftover() -> None:
+    # a second, unconditional crash: positionDrillDivs/positionProjectAnchors/
+    # positionProjectStubs referenced `_tierV` -- a variable belonging to TIP 3/4's own
+    # retired tier-label system that was never declared anywhere in THE LAST RENDERER's own
+    # rewrite, a leftover from copy-pasting the old tier-positioning code. Every container
+    # drill, project anchor, or project-filter stub crashed positioning outright. Unified
+    # onto one shared, early-declared scratch vector (_screenV) reused by every per-frame
+    # world->screen positioning pass, including positionLabels' own (no separate `_v`).
+    assert "_tierV" not in _SPACE_JS
+    assert "let _v " not in _SPACE_JS and "const _v " not in _SPACE_JS
+    early_state = _SPACE_JS.split("let focusStack = [];", 1)[1][:1300]
+    assert "const _screenV = new THREE.Vector3();" in early_state
+    for fn in ("function positionDrillDivs", "function positionProjectAnchors",
+               "function positionProjectStubs", "function positionLabels"):
+        body = _SPACE_JS.split(fn, 1)[1][:900]
+        assert "_screenV" in body
+
+
+def test_project_stubs_are_capped_not_one_dom_div_per_boundary_node() -> None:
+    # a real freeze, not just a slow render: filtering to repo:osiris alone (the deployed
+    # graph's own biggest hub, works_in fan-out 8,363) produced 12,273 distinct
+    # (node, hiddenProject) boundary pairs -- 12,273 real DOM divs, each repositioned via
+    # positionProjectStubs() on EVERY render frame (style.left/top writes forcing layout on
+    # thousands of nodes, 60 times a second), hanging the tab hard enough that even a
+    # trivial CDP Runtime.evaluate timed out. THE LAST RENDERER's own labels already solve
+    # exactly this declutter problem (pickLabels' top-N-by-degree-in-viewport); stubs now
+    # get the same bounded-and-sorted treatment -- keep the biggest, most-informative
+    # counts, drop the rest, same "small counted stub" the doc comment always promised.
+    assert "const MAX_PROJECT_STUBS = 80;" in _SPACE_JS
+    body = _SPACE_JS.split("function buildProjectStubs()", 1)[1][:1400]
+    assert "all.sort((a, b) => b.count - a.count);" in body
+    assert "projectStubEntries = all.slice(0, MAX_PROJECT_STUBS);" in body
