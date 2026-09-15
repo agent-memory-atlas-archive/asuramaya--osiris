@@ -42,12 +42,36 @@ places `status NOT IN ('archived','merged','retired')` objects (graph_layout.py)
 so bit0 reads 0 for every object this endpoint can currently return. The bit is
 reserved, not wired to anything live yet, exactly the same population boundary every
 other /graph endpoint already draws.
+
+THE LEGIBILITY PASS, Khnum tip 2 (ruling e1cb9e3b, operator 2026-09-14 evening):
+  5. `labels` -- an index-aligned array of short display strings (tip 2g), CHOSEN as a
+     header table over a batched GET /graph/labels?ids= endpoint: every object in the
+     snapshot needs a label on first paint regardless, so a table costs one field on a
+     payload the client already fetches rather than a second N-object round trip (or a
+     second endpoint's own pagination/caching story) for data with the exact same
+     lifetime as the snapshot itself. Built by `_short_label`, matching Seshat's own
+     tip 1c formatting rule exactly (Agent by handle, SoftwareProject by repo name,
+     Person by name, else type + a short title, 40 chars hard-truncated with an
+     ellipsis) so the two renderings never disagree.
+  6. `project_aggregates` / `type_aggregates` (tip 2i) -- level-of-detail summaries,
+     computed in Python from the SAME positions already resident in memory (no extra
+     query): per project, and per (project, type), a centroid, member count, and a
+     radius (the MAX member distance from that centroid -- a tight, exact bound, a
+     documented choice over a percentile estimate). `type` here is genuinely the
+     object's own TYPE, unlike placement (THE LEGIBILITY PASS's tip 2h killed type
+     rings there) -- Seshat's own tip 3k LOD plan draws "type glyphs" at mid zoom, a
+     display grouping independent of how objects are actually laid out.
+  7. `cluster_edges` (tip 2j) -- one record per (project pair, link class) with a live
+     edge count, for the far-zoom aggregated-edges view -- computed from the same
+     edge_src/edge_dst/project_code arrays already built, no extra query.
 """
 from __future__ import annotations
 
 import json
+import math
 import struct
 import uuid
+from collections import defaultdict
 from typing import Any
 
 import asyncpg
@@ -58,6 +82,41 @@ from src.orchestrator.capture import CONTESTED_SQL
 SCHEMA_VERSION = 1
 STATUS_RETIRED = 1 << 0
 STATUS_CONTESTED = 1 << 1
+_LABEL_MAX_CHARS = 40
+
+def _short_label(
+    type_name: str, canonical: str, handle: str | None, name: str | None,
+) -> str:
+    """THE LEGIBILITY PASS (ruling e1cb9e3b, tip 2g): the client never guesses a
+    label. Agent by handle (never the id), SoftwareProject by its own repo name
+    (canonical minus the 'repo:' scheme), Person by name, everything else its own
+    type plus canonical as a short title -- no dedicated 'title' property exists on
+    every object type, so canonical (already this codebase's own universal
+    human-legible identifier) stands in; a documented choice, not a guess. One line,
+    hard-truncated at 40 characters with an ellipsis, matching Seshat's own tip 1c
+    formatting rule exactly so the two renderings never disagree."""
+    if type_name == "Agent" and handle:
+        label = handle
+    elif type_name == "SoftwareProject":
+        label = canonical.removeprefix("repo:") or canonical
+    elif type_name == "Person" and name:
+        label = name
+    else:
+        label = f"{type_name} {canonical}"
+    if len(label) > _LABEL_MAX_CHARS:
+        label = label[:_LABEL_MAX_CHARS - 1] + "…"
+    return label
+
+
+def _centroid_and_radius(points: list[tuple[float, float]]) -> tuple[float, float, float]:
+    """A group's own centroid plus the MAX member distance from it -- a tight, exact
+    bound (never a percentile estimate) so a client-drawn LOD circle always fully
+    contains every real member, per tip 2i."""
+    cx = sum(p[0] for p in points) / len(points)
+    cy = sum(p[1] for p in points) / len(points)
+    radius = max(math.hypot(px - cx, py - cy) for px, py in points)
+    return cx, cy, radius
+
 
 # name -> struct format code; order here IS the wire order.
 _ARRAY_ORDER: tuple[tuple[str, str], ...] = (
@@ -74,7 +133,11 @@ def encode_snapshot(
     type_code: list[int], project_code: list[int], weight: list[float],
     status_flag: list[int], edge_src: list[int], edge_dst: list[int],
     edge_type_code: list[int], types: list[str], projects: list[str],
-    edge_types: list[str], link_type_class: list[str], watermark: int = 0,
+    edge_types: list[str], link_type_class: list[str], labels: list[str],
+    watermark: int = 0,
+    project_aggregates: list[dict[str, Any]] | None = None,
+    type_aggregates: list[dict[str, Any]] | None = None,
+    cluster_edges: list[dict[str, Any]] | None = None,
 ) -> bytes:
     """Pure function, no DB: builds the exact wire bytes from already-resolved
     columns -- the DB-facing half (`fetch_snapshot`) is the only caller that ever
@@ -99,6 +162,8 @@ def encode_snapshot(
         raise ValueError(
             f"link_type_class has {len(link_type_class)} entries, expected "
             f"{len(edge_types)} (len(edge_types))")
+    if len(labels) != count:
+        raise ValueError(f"labels has {len(labels)} entries, expected {count} (count)")
     body = bytearray()
     offsets: dict[str, dict[str, int | str]] = {}
     for name, code in _ARRAY_ORDER:
@@ -111,7 +176,11 @@ def encode_snapshot(
         "schema_version": SCHEMA_VERSION, "count": count, "edge_count": edge_count,
         "types": types, "projects": projects, "edge_types": edge_types,
         "link_type_class": link_type_class, "object_ids": object_ids,
-        "watermark": watermark, "arrays": offsets,
+        "labels": labels, "watermark": watermark,
+        "project_aggregates": project_aggregates or [],
+        "type_aggregates": type_aggregates or [],
+        "cluster_edges": cluster_edges or [],
+        "arrays": offsets,
     }
     header_bytes = json.dumps(header).encode()
     return struct.pack("<I", len(header_bytes)) + header_bytes + bytes(body)
@@ -127,7 +196,8 @@ def decode_snapshot(data: bytes) -> dict[str, Any]:
     out: dict[str, Any] = {
         k: header[k] for k in
         ("schema_version", "count", "edge_count", "types", "projects", "edge_types",
-         "link_type_class", "object_ids", "watermark")
+         "link_type_class", "object_ids", "labels", "watermark",
+         "project_aggregates", "type_aggregates", "cluster_edges")
     }
     for name, meta in header["arrays"].items():
         code = str(meta["dtype"])
@@ -153,11 +223,17 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
     effect the snapshot already carried), never a silent drop."""
     watermark = int(await pool.fetchval("SELECT COALESCE(max(id), 0) FROM outbox"))
     rows = await pool.fetch(
-        "SELECT o.id, o.type, "
+        "SELECT o.id, o.type, o.canonical, "
         "  (SELECT (a.value #>> '{}')::float8 FROM current_assertions a "
         "   WHERE a.object_id=o.id AND a.name='graph_x') AS x, "
         "  (SELECT (a.value #>> '{}')::float8 FROM current_assertions a "
         "   WHERE a.object_id=o.id AND a.name='graph_y') AS y, "
+        "  (SELECT a.value #>> '{}' FROM current_assertions a "
+        "   WHERE a.object_id=o.id AND a.name='handle' "
+        "   ORDER BY a.confidence DESC, a.observed_at DESC LIMIT 1) AS handle, "
+        "  (SELECT a.value #>> '{}' FROM current_assertions a "
+        "   WHERE a.object_id=o.id AND a.name='name' "
+        "   ORDER BY a.confidence DESC, a.observed_at DESC LIMIT 1) AS name, "
         "  p.canonical AS project_canonical, "
         f"  {CONTESTED_SQL} AS contested "
         "FROM objects o "
@@ -188,6 +264,7 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
     project_codes: list[int] = []
     weights: list[float] = []
     statuses: list[int] = []
+    labels: list[str] = []
 
     for i, r in enumerate(rows):
         oid = r["id"]
@@ -200,6 +277,7 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
         project_codes.append(project_index.setdefault(project_key, len(project_index)))
         weights.append(float(weight_by_id.get(oid, 0)))
         statuses.append(STATUS_CONTESTED if r["contested"] else 0)
+        labels.append(_short_label(r["type"], r["canonical"], r["handle"], r["name"]))
 
     edge_src: list[int] = []
     edge_dst: list[int] = []
@@ -224,12 +302,52 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
     projects = [name for name, _ in sorted(project_index.items(), key=lambda kv: kv[1])]
     edge_types = [name for name, _ in sorted(edge_type_index.items(), key=lambda kv: kv[1])]
     link_type_class = [link_class(name) for name in edge_types]
+
+    # THE LEGIBILITY PASS, tip 2i: LOD aggregates, computed from the positions already
+    # resident above -- no extra query.
+    proj_points: dict[int, list[tuple[float, float]]] = defaultdict(list)
+    type_points: dict[tuple[int, int], list[tuple[float, float]]] = defaultdict(list)
+    for i in range(len(object_ids)):
+        pt = (xs[i], ys[i])
+        proj_points[project_codes[i]].append(pt)
+        type_points[(project_codes[i], type_codes[i])].append(pt)
+    project_aggregates = []
+    for pcode, pts in proj_points.items():
+        cx, cy, radius = _centroid_and_radius(pts)
+        project_aggregates.append({
+            "project": pcode, "count": len(pts),
+            "cx": round(cx, 2), "cy": round(cy, 2), "radius": round(radius, 2),
+        })
+    type_aggregates = []
+    for (pcode, tcode), pts in type_points.items():
+        cx, cy, radius = _centroid_and_radius(pts)
+        type_aggregates.append({
+            "project": pcode, "type": tcode, "count": len(pts),
+            "cx": round(cx, 2), "cy": round(cy, 2), "radius": round(radius, 2),
+        })
+
+    # THE LEGIBILITY PASS, tip 2j: one record per (project pair, link class), same
+    # edge/project arrays already built -- no extra query.
+    cluster_counts: dict[tuple[int, int, str], int] = defaultdict(int)
+    for i in range(len(edge_src)):
+        p1, p2 = project_codes[edge_src[i]], project_codes[edge_dst[i]]
+        if p1 == p2:
+            continue
+        a, b = (p1, p2) if p1 <= p2 else (p2, p1)
+        cluster_counts[(a, b, link_type_class[edge_type_codes[i]])] += 1
+    cluster_edges = [
+        {"a": a, "b": b, "class": cls, "count": n}
+        for (a, b, cls), n in cluster_counts.items()
+    ]
+
     return encode_snapshot(
         object_ids=object_ids, x=xs, y=ys, type_code=type_codes,
         project_code=project_codes, weight=weights, status_flag=statuses,
         edge_src=edge_src, edge_dst=edge_dst, edge_type_code=edge_type_codes,
         types=types, projects=projects, edge_types=edge_types,
-        link_type_class=link_type_class, watermark=watermark,
+        link_type_class=link_type_class, labels=labels, watermark=watermark,
+        project_aggregates=project_aggregates, type_aggregates=type_aggregates,
+        cluster_edges=cluster_edges,
     )
 
 
