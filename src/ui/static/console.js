@@ -6,7 +6,15 @@
 const $ = id => document.getElementById(id);
 const esc = s => (s == null ? "" : String(s)).replace(/[<>&]/g, c => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]));
 
-let FOCUS = null, SET = [], ROOM = '', ROOMS = [], PROJECTS = [], ACTIVE_SURFACE = 'browse';
+// ROOM RETIREMENT (thread 96f09d48, decision 31717ca7, Thoth DM 10792): the operator's
+// own word — "scope really died and made itself obsolete... gotta remove that too." ROOM
+// is now a plain global constant, never reassigned (switchRoom/newRoom/loadRooms, the
+// workspace pill and its dropdown are gone) — every existing reader that still checks it
+// (loadCompositions' own room-scoped fetch, authorComposition/forkComposition's own
+// room_id, watchConsole's other sync fields) keeps working unchanged, always taking its
+// own "no room" branch, rather than needing every call site individually scrubbed.
+const ROOM = '';
+let FOCUS = null, SET = [], PROJECTS = [], ACTIVE_SURFACE = 'browse';
 let SELECTED_ENTITY_TYPES = new Set(), ENTITY_SEARCH_QUERY = '', ENTITY_VIEW_MODE = 'table';
 let TABLE_SORT_COL = 'date', TABLE_SORT_DIR = 'desc', EXPANDED_ROWS = new Set();
 let SYNCING = false, CONSOLE_REV = 0, SHOW_AGENTS = false, SCOPE_FILTER = '';
@@ -37,54 +45,17 @@ async function switchSurface(surface) {
   }
 }
 
-// ── Room / Workspace ─────────────────────────────────────────────────────────
-function toggleWorkspaceDropdown(e) {
-  if (e) e.stopPropagation();
-  const dd = $('workspace-dropdown'), pill = $('workspace-pill');
-  if (!dd) return; const isOpen = dd.style.display === 'flex';
-  closeAllDropdowns();
-  if (!isOpen) { dd.style.display = 'flex'; pill.classList.add('open'); renderWorkspaceDropdown(); }
-}
-function renderWorkspaceDropdown() {
-  const c = $('workspace-dd-items'); if (!c) return;
-  const items = [{ id: '', name: 'Global / Fleet' }, ...(ROOMS || [])];
-  c.innerHTML = items.map(r => {
-    const sel = (ROOM || '') === (r.id || '');
-    return '<div class="dd-item' + (sel ? ' sel' : '') + '" onclick="selectWorkspace(\'' + esc(r.id || '') + '\')"><div class="dd-item-main"><span class="dd-item-name">' + esc(r.name) + '</span>' + (r.compositions ? '<span class="dd-item-hint">' + r.compositions + ' lenses</span>' : '') + '</div>' + (sel ? '<span class="dd-item-check">\u2713</span>' : '') + '</div>';
-  }).join('');
-}
-function selectWorkspace(id) { closeAllDropdowns(); switchRoom(id); }
+// ROOM RETIREMENT (thread 96f09d48, decision 31717ca7, Thoth DM 10792): the workspace
+// pill, its dropdown, and the switchRoom/newRoom/loadRooms/selectWorkspace/
+// updateWorkspaceScopeUI/toggleWorkspaceDropdown/renderWorkspaceDropdown functions that
+// drove it are gone -- "one scope" (the header repo selector, console chrome cleanup
+// part 2) replaces the room dimension. closeAllDropdowns() drops its own
+// workspace-dropdown/workspace-pill lines since neither element exists anymore.
 function closeAllDropdowns() {
-  var wd = document.getElementById('workspace-dropdown'); if(wd) wd.style.display='none';
   var rd = document.getElementById('repo-dropdown'); if(rd) rd.style.display='none';
   var od = document.getElementById('omni-dropdown'); if(od) od.style.display='none';
-  var wp = document.getElementById('workspace-pill'); if(wp) wp.classList.remove('open');
   var rp = document.getElementById('repo-pill'); if(rp) rp.classList.remove('open');
   collapseSearchIfUnfocused();
-}
-function updateWorkspaceScopeUI() {
-  const room = (ROOMS || []).find(r => r.id === ROOM);
-  const rName = room ? room.name : (ROOM ? 'Custom' : 'Global / Fleet');
-  if ($('workspace-pill-label')) $('workspace-pill-label').textContent = rName;
-}
-async function loadRooms() {
-  ROOMS = await fetch('/rooms').then(r => r.json());
-  if ($('room')) { $('room').innerHTML = '<option value="">All Rooms</option>' + ROOMS.map(r => '<option value="' + r.id + '">' + esc(r.name) + '</option>').join(''); $('room').value = ROOM; }
-  renderWorkspaceDropdown(); updateWorkspaceScopeUI();
-}
-async function switchRoom(id) {
-  ROOM = id; postConsole({ room_id: id || null }); $('room').value = id;
-  renderWorkspaceDropdown(); updateWorkspaceScopeUI();
-  const room = ROOMS.find(r => r.id === id);
-  const collect = !!(room && room.config && room.config.collect);
-  document.querySelectorAll('.collect-only').forEach(el => el.style.display = collect ? '' : 'none');
-  if (ACTIVE_SURFACE === 'browse') { SET = []; await loadObjectSet(); renderEntityExplorer(); }
-  await loadCompositions();
-}
-async function newRoom() {
-  const name = prompt('Name this stance / perspective:'); if (!name) return;
-  const r = await fetch('/rooms', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name }) }).then(r => r.json());
-  await loadRooms(); switchRoom(r.id);
 }
 async function loadProjects() {
   try {
@@ -172,11 +143,12 @@ function objectScopeParams() {
   // The scope bits browseScope() and objectCountsUrl() both need — split out so the
   // counts fetch (#196, Thoth msg 5600) reads the exact same scope the entity set's own
   // load would, never a second, drifting copy of the same three branches.
+  //
+  // ROOM RETIREMENT (thread 96f09d48): the room-subject leg (a room's own config could
+  // bind a repo:/case: subject, narrowing this before the repo pill's own SCOPE_FILTER
+  // ever got read) is gone along with the room concept itself — the repo pill is now the
+  // ONE scoping lever.
   var ex = SHOW_AGENTS ? '' : '&exclude_types=Agent';
-  var room = ROOMS.find(function(r){return r.id === ROOM;});
-  var subject = (room && room.config && room.config.subject) || null;
-  if (subject && subject.startsWith('repo:')) return { extra: ex, project: [subject.replace('repo:', '')], case_id: null };
-  if (subject && subject.startsWith('case:')) return { extra: ex, project: [], case_id: subject.replace('case:', '') };
   var repos = SCOPE_FILTER ? SCOPE_FILTER.split(',').filter(Boolean) : [];
   return { extra: ex, project: repos, case_id: null };
 }
@@ -1007,7 +979,10 @@ async function addSeed() { const raw = $('seed')?.value.trim(); if (!raw) return
 // ── Console Sync ─────────────────────────────────────────────────────────────
 function postConsole(fields) { fetch('/console', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(fields) }).then(r => r.json()).then(j => { CONSOLE_REV = j.rev; }).catch(() => {}); }
 function setSyncBadge(by) { $('syncbadge').textContent = by === 'claude' ? '\u25cf agent' : ''; }
-function watchConsole() { const es = new EventSource('/console/stream'); es.onmessage = async ev => { const s = JSON.parse(ev.data); if (s.rev == null || s.rev <= CONSOLE_REV) return; CONSOLE_REV = s.rev; if (s.updated_by !== 'human') { SYNCING = true; try { setSyncBadge(s.updated_by); if (s.room_id && s.room_id !== ROOM) await switchRoom(s.room_id); if (s.focused_object_id && s.focused_object_id !== FOCUS) inspectOnly(s.focused_object_id); } finally { SYNCING = false; } } }; }
+// ROOM RETIREMENT (thread 96f09d48): the room_id leg of cross-client sync is gone
+// (switchRoom no longer exists) — every OTHER field (focused_object_id, and surface via
+// the caller's own postConsole({surface}) elsewhere) keeps syncing unchanged.
+function watchConsole() { const es = new EventSource('/console/stream'); es.onmessage = async ev => { const s = JSON.parse(ev.data); if (s.rev == null || s.rev <= CONSOLE_REV) return; CONSOLE_REV = s.rev; if (s.updated_by !== 'human') { SYNCING = true; try { setSyncBadge(s.updated_by); if (s.focused_object_id && s.focused_object_id !== FOCUS) inspectOnly(s.focused_object_id); } finally { SYNCING = false; } } }; }
 
 // ── Pulse ────────────────────────────────────────────────────────────────────
 async function updatePulse() {
@@ -1232,10 +1207,11 @@ document.addEventListener('keydown', e => { const inField = /^(INPUT|TEXTAREA|SE
 function closePeek() { const o = $('peek'); o.className = 'peek-overlay'; o.innerHTML = ''; }
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
+// ROOM RETIREMENT (thread 96f09d48): boot no longer fetches /console for a room_id to
+// restore (switchRoom, its own loadCompositions() call included, is gone) —
+// loadCompositions() runs directly here instead, unscoped (ROOM is always '' now).
 Osiris.loadSchema().then(async function() {
-  await Promise.all([loadProjects(), loadRooms(), loadObjectSet()]);
-  var cur = await fetch('/console').then(function(r){return r.ok ? r.json() : null;}).catch(function(){return null;});
-  await switchRoom((cur && cur.room_id) || '');
+  await Promise.all([loadProjects(), loadObjectSet(), loadCompositions()]);
   switchSurface('browse');
   loadPanes(); wireGrips(); watchConsole();
   updatePulse(); setInterval(updatePulse, 8000);

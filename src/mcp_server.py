@@ -12327,7 +12327,13 @@ memprofile.maybe_start()  # inert unless OSIRIS_PROFILE_MEMORY is set — thread
 # _WATCHDOG_STALL_THRESHOLD_S. Registered at import time, unconditionally: harmless for
 # the per-session stdio subprocess too, and importing this module is cheap insurance
 # against ever again having "no stack, no faulthandler signal" be the honest postmortem.
-faulthandler.register(signal.SIGUSR1, all_threads=True)
+# `file=sys.__stderr__`, never the bare default of `sys.stderr` (found live: cli.py's
+# cmd_proposal lazily imports this module from inside a caller that has redirected
+# sys.stderr to an io.StringIO for capture — faulthandler.register would then call
+# .fileno() on that StringIO at IMPORT time and blow up with UnsupportedOperation,
+# nothing to do with the signal handler ever firing). sys.__stderr__ is the process's
+# real stream, never reassigned by a redirect, so it always has a real fd.
+faulthandler.register(signal.SIGUSR1, file=sys.__stderr__ or 2, all_threads=True)
 
 
 def main() -> None:
