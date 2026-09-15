@@ -15,6 +15,8 @@ from datetime import UTC, datetime
 
 from src.actions.core import Actions
 from src.orchestrator.graph_layout import (
+    _HALO_BASE,
+    _HALO_MIN,
     _LAYOUT_VERSION_PROP,
     _MIN_SEPARATION,
     _adjacency_ranks,
@@ -23,6 +25,8 @@ from src.orchestrator.graph_layout import (
     _intra_project_neighbors,
     _neighbors_of,
     _place_projects,
+    _project_connected_counts,
+    _project_halo_base,
     _relax_projects,
     _release_layout_lock,
     _try_acquire_layout_lock,
@@ -107,6 +111,43 @@ def test_adjacency_position_halo_band_clears_the_connected_bands_own_extent() ->
     r_connected = math.dist(center, connected_pos)
     r_halo = math.dist(center, halo_pos)
     assert r_halo > r_connected
+
+
+def test_adjacency_position_custom_halo_base_wraps_tighter_than_the_default() -> None:
+    """DENSITY NOT DISCS tip (g): a small project's own tight halo_base sits closer to
+    center than the old flat _HALO_BASE, still strictly beyond that project's own
+    connected disc -- the halo wraps the project's own cluster, not the whole plane."""
+    center = project_center(0)
+    tight_base = _project_halo_base(connected_count=10)
+    assert tight_base < _HALO_BASE
+    halo_pos = adjacency_position(center, False, 0, halo_base=tight_base)
+    assert math.dist(center, halo_pos) >= tight_base
+    assert tight_base >= _HALO_MIN
+
+
+def test_project_halo_base_grows_with_connected_count_but_never_below_the_floor() -> None:
+    assert _project_halo_base(0) == _HALO_MIN
+    assert _project_halo_base(1_000_000) > _project_halo_base(10)
+
+
+async def test_project_connected_counts_reflects_real_semantic_membership(
+    actions: Actions,
+) -> None:
+    project = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gl-rl-halo-count", "test")
+    connected = await actions.create_or_find_object(
+        "Thread", "thread:gl-rl-halo-count-connected", "test")
+    friend = await actions.create_or_find_object(
+        "Thread", "thread:gl-rl-halo-count-friend", "test")
+    halo = await actions.create_or_find_object(
+        "Thread", "thread:gl-rl-halo-count-halo", "test")
+    now = datetime.now(UTC)
+    for oid in (connected, friend, halo):
+        await actions.create_link(oid, project, "in_repo", "test", now, 1.0)
+    await actions.create_link(connected, friend, "cites", "test", now, 1.0)
+
+    counts = await _project_connected_counts(actions)
+    assert counts.get(project, 0) == 2  # connected + friend, not halo
 
 
 def test_adjacency_position_ranks_within_one_band_never_collide_at_realistic_scale() -> None:
@@ -445,15 +486,18 @@ async def test_place_projects_positions_every_unplaced_project(actions: Actions)
         assert math.isfinite(x) and math.isfinite(y)
 
 
-async def test_place_projects_never_overlaps_two_projects_content_radii(
+async def test_place_projects_never_overlaps_two_projects_min_spacing(
     actions: Actions,
 ) -> None:
+    from src.orchestrator.graph_layout import _PROJECT_GUTTER, _PROJECT_SPACING_K
+
     a_id = uuid.uuid4()
     b_id = uuid.uuid4()
-    radius = {a_id: 100.0, b_id: 100.0}
-    out = _relax_projects([a_id, b_id], {}, radius, {})
+    counts = {a_id: 100, b_id: 100}
+    out = _relax_projects([a_id, b_id], {}, counts, {})
     dist = math.dist(out[a_id], out[b_id])
-    assert dist >= radius[a_id] + radius[b_id] + 300.0 - 1e-6  # + the fixed gutter
+    min_dist = _PROJECT_SPACING_K * math.sqrt(counts[a_id] + counts[b_id] + 2) + _PROJECT_GUTTER
+    assert dist >= min_dist - 1e-6
 
 
 async def test_hub_ids_finds_a_structural_high_degree_object(actions: Actions) -> None:

@@ -102,6 +102,29 @@ of its OWN band (connected or halo, whichever it actually falls in) rather than 
 ordinary creation-order rank.
 
 graph_layout_v bumped again (4 -> 5) to force the one-time migration this change needs.
+
+DENSITY NOT DISCS (ruling 6f866d9d, operator 2026-09-15 morning, "lets try that" -- the
+near view is a green fan because cluster spacing was radii-plus-a-fixed-gutter with the
+halo ring between clusters and every edge drawing at full alpha). Server-side tips (f)
+and (g):
+  (f) CLUSTER SPACING, NOT TWO RADII PLUS 300: `_relax_projects`'s old minimum
+      inter-project distance summed two independently sunflower-derived "radii"
+      (`_NODE_SPACING * sqrt(member_count + 1)`, the OBJECT-level minimum-pairwise
+      constant reused at project-pair scale) plus a flat 300-unit gutter -- for two
+      projects near osiris's own size (11,768 objects) that stacked to ~3,554 units,
+      exactly the operator's "way too far apart" complaint. Spacing between a pair is
+      now proportional to sqrt of the PAIR'S OWN combined member count directly, at a
+      much smaller constant, plus a small (50-unit, was 300) fixed gutter -- one
+      formula over the pair, not two independent per-project radii summed.
+  (g) HALO WRAPS EACH PROJECT'S OWN CLUSTER, NOT ONE RING AROUND THE PLANE: the old
+      `_HALO_BASE` was a single flat constant (6000.0) sized against the WORST-CASE
+      population everywhere -- every project's halo band started at the same offset
+      regardless of that project's own actual size, so a small project's halo ring sat
+      wildly farther out than its own connected disc ever reached. The halo base is now
+      computed PER PROJECT from that project's own live connected-member count
+      (`_project_halo_base`), the same sunflower-extent formula with a safety margin,
+      tightening around each cluster's own real content instead of a shared worst case.
+graph_layout_v bumped again (5 -> 6) to force the one-time migration this change needs.
 """
 from __future__ import annotations
 
@@ -127,7 +150,7 @@ _MAX_STEP = 10.0
 
 # NAVIGABLE SPACE, piece A additions ---------------------------------------------------
 _LAYOUT_VERSION_PROP = "graph_layout_v"
-_LAYOUT_VERSION = 5  # bump this to force one migration pass over every already-placed object
+_LAYOUT_VERSION = 6  # bump this to force one migration pass over every already-placed object
 _RELAX_ITERATIONS = 6  # "a FEW iterations" -- a nudge on top of the deterministic base,
                        # never enough to erase the sunflower structure
 _UNFILED_KEY = "unfiled"  # the same sentinel /graph/supernodes already uses for no-in_repo
@@ -145,18 +168,34 @@ _PROJECT_SPACING = 5000.0  # unfiled's own fixed seed spacing (see _UNFILED_KEY 
 
 # THE LEGIBILITY PASS additions (ruling e1cb9e3b, tip 2h) -------------------------------
 _INNER_BASE = 0.0  # the CONNECTED band starts right at the project center -- no ring offset
-_HALO_BASE = 6000.0  # the HALO band's own fixed offset, sized to comfortably clear the
-                     # worst-case CONNECTED disc's own extent even well beyond today's
-                     # population: at spacing 15.0, 50,000 connected members in one project
-                     # (today's worst single group, Agent/unfiled, is 18,978) reach only
-                     # ~3,354 units out -- 6,000 leaves a real margin, not a bare clearance
+_HALO_BASE = 6000.0  # the DEFAULT/fallback halo offset (unfiled, and any caller that
+                     # doesn't have a per-project count handy, e.g. this module's own
+                     # pure-function tests) -- superseded per real project by
+                     # `_project_halo_base` below (DENSITY NOT DISCS tip (g))
 
 # THE READING LAYER additions ----------------------------------------------------------
-_PROJECT_GUTTER = 300.0  # fixed clearance ON TOP of two projects' own combined content
-                         # radius -- "spacing = the two cluster radii plus a fixed gutter"
+_PROJECT_GUTTER = 50.0  # small, fixed clearance on top of a pair's own spacing (DENSITY
+                        # NOT DISCS tip (f) -- was 300.0, "radii plus 300")
+_PROJECT_SPACING_K = 4.0  # DENSITY NOT DISCS tip (f): the old minimum inter-project
+                          # distance summed two independently sunflower-derived "radii"
+                          # (_NODE_SPACING * sqrt(member_count+1) per project, the
+                          # OBJECT-level 15.0 spacing constant reused at project-pair
+                          # scale) -- for two projects near osiris's own size (11,768
+                          # objects) that stacked to ~3,554 units, the operator's own
+                          # "way too far apart" complaint. Spacing between a pair is now
+                          # proportional to sqrt of the PAIR'S OWN combined member count
+                          # directly, at this much smaller constant: the same worst pair
+                          # (11,768 + 11,768) now clears ~653 units instead of ~3,554.
 _PROJECT_RELAX_ITERATIONS = 300  # small N (a few dozen projects) -- cheap even at this
                                  # iteration count, and the weighted spring needs more
                                  # rounds than the object-level relax to actually settle
+_HALO_MARGIN = 1.8  # DENSITY NOT DISCS tip (g): same margin ratio the old flat 6000.0
+                    # constant carried against its own worst-case population (6000 /
+                    # ~3354 units at 50,000 connected members ~= 1.79), applied instead
+                    # to THIS project's own live connected count, so a small project's
+                    # halo wraps its own cluster tightly instead of the shared worst case
+_HALO_MIN = 200.0  # floor so a tiny or empty-of-connections project still gets a little
+                   # real clearance between its inner disc and its halo ring
 _HUB_DEGREE_THRESHOLD = 1000  # this house's own measured population: 11 objects over
                               # 1,000 structural-degree, 84 over 100 -- 1,000 catches the
                               # unambiguous hubs (principal Persons, the biggest projects)
@@ -195,18 +234,35 @@ def project_center(rank: int) -> tuple[float, float]:
     return _sunflower_point(rank, _PROJECT_SPACING)
 
 
+def _project_halo_base(connected_count: int) -> float:
+    """DENSITY NOT DISCS tip (g): this project's OWN halo offset, tight around its own
+    connected disc's real extent instead of one flat worst-case constant shared by
+    every project regardless of size -- same margin ratio `_HALO_BASE` carried against
+    the global worst case (see `_HALO_MARGIN`'s own docstring), applied here to this
+    project's own live connected-member count. Floored at `_HALO_MIN` so a tiny or
+    empty project still gets a little real clearance rather than a halo ring sitting
+    right on top of its own (near-empty) inner disc."""
+    return max(_HALO_MIN, _HALO_MARGIN * _NODE_SPACING * math.sqrt(connected_count + 0.5))
+
+
 def adjacency_position(
     center: tuple[float, float], connected: bool, rank_in_group: int,
+    *, halo_base: float = _HALO_BASE,
 ) -> tuple[float, float]:
     """THE LEGIBILITY PASS (ruling e1cb9e3b, tip 2h): the placement rule itself, TYPE
     RINGS GONE -- a sunflower disc for the object's own (project, connected) band,
     keyed on its permanent rank within that band, offset outward from the band's own
-    fixed base radius (`_INNER_BASE` for connected, `_HALO_BASE` for halo -- so the
+    fixed base radius (`_INNER_BASE` for connected, `halo_base` for halo -- so the
     halo band always starts well clear of the inner disc's own worst-case extent). A
-    pure function of (center, connected, rank) alone -- recomputing it for the same
-    inputs always lands on the same point."""
+    pure function of (center, connected, rank, halo_base) alone -- recomputing it for
+    the same inputs always lands on the same point.
+
+    `halo_base` (DENSITY NOT DISCS tip (g)) defaults to the old flat `_HALO_BASE` for
+    any caller without a real per-project figure handy (unfiled, this module's own
+    pure-function tests) -- `layout_batch` passes `_project_halo_base`'s own per-
+    project result for every real project instead."""
     cx, cy = center
-    base_r = _INNER_BASE if connected else _HALO_BASE
+    base_r = _INNER_BASE if connected else halo_base
     lx, ly = _sunflower_point(rank_in_group, _NODE_SPACING)
     local_r = math.hypot(lx, ly)
     angle = math.atan2(ly, lx)
@@ -320,6 +376,50 @@ async def _adjacency_ranks(
         ") SELECT id, connected, rank_in_group FROM ranked WHERE id = ANY($1::uuid[])",
         ids, _UNFILED_KEY, list(STRUCTURAL_LINK_TYPES))
     return {r["id"]: (bool(r["connected"]), int(r["rank_in_group"])) for r in rows}
+
+
+async def _project_connected_counts(
+    actions: Actions,
+) -> dict[uuid.UUID | None, int]:
+    """DENSITY NOT DISCS tip (g): every project's own CURRENT connected-member count
+    (None key for the unfiled bucket) -- the same `members`/`semantic_ids` shape
+    `_adjacency_ranks` already builds, computed over the whole active population once
+    per tick (same cost class that function already pays, no new class of query).
+
+    NOT A PERFECT FOREVER GUARANTEE, disclosed rather than silently assumed: a
+    project's connected count only ever grows, so `_project_halo_base` computed from
+    it also only ever grows -- but an object placed EARLIER against a smaller halo
+    base keeps that fixed absolute position forever (this module's own incrementality
+    rule), while that same project's connected band keeps extending outward as more
+    connected members arrive. For a project growing fast enough, a later connected
+    member could in principle reach an earlier halo member's own fixed radius before
+    a later halo placement's own (by-then-larger) base would have cleared it. The
+    `_HALO_MARGIN` safety factor makes this a slow-growth-only risk, not a redesign
+    the way the old flat 6000.0 constant needed one -- same category of measured,
+    documented tradeoff as this module's other spacing constants, not a hidden one."""
+    rows = await actions.pool.fetch(
+        "WITH semantic_ids AS ("
+        "  SELECT DISTINCT node FROM ("
+        "    SELECT from_id AS node, type FROM links "
+        "      WHERE valid_until IS NULL OR valid_until > now() "
+        "    UNION ALL "
+        "    SELECT to_id AS node, type FROM links "
+        "      WHERE valid_until IS NULL OR valid_until > now()"
+        "  ) x WHERE type <> ALL($1::text[])"
+        "), members AS ("
+        "  SELECT DISTINCT ON (o.id) o.id, p.id AS project_id, "
+        "    (s.node IS NOT NULL) AS connected "
+        "  FROM objects o "
+        "  LEFT JOIN links l ON l.from_id=o.id AND l.type='in_repo' "
+        "    AND (l.valid_until IS NULL OR l.valid_until > now()) "
+        "  LEFT JOIN objects p ON p.id=l.to_id AND p.type='SoftwareProject' "
+        "  LEFT JOIN semantic_ids s ON s.node = o.id "
+        "  WHERE o.status NOT IN ('archived','merged','retired') "
+        "  ORDER BY o.id, l.id"
+        ") SELECT project_id, count(*) AS n FROM members WHERE connected "
+        "GROUP BY project_id",
+        list(STRUCTURAL_LINK_TYPES))
+    return {r["project_id"]: int(r["n"]) for r in rows}
 
 
 async def _neighbors_of(
@@ -586,19 +686,22 @@ async def _project_link_weights(
 def _relax_projects(
     unplaced_ids: list[uuid.UUID],
     anchors: dict[uuid.UUID, tuple[float, float]],
-    radius: dict[uuid.UUID, float],
+    member_counts: dict[uuid.UUID, int],
     weights: dict[tuple[uuid.UUID, uuid.UUID], int],
     *, iterations: int = _PROJECT_RELAX_ITERATIONS, gutter: float = _PROJECT_GUTTER,
+    spacing_k: float = _PROJECT_SPACING_K,
 ) -> dict[uuid.UUID, tuple[float, float]]:
     """THE READING LAYER's own project-center layout (ruling c5953bb1): plain Python,
     never vectorized -- N is a few dozen projects, not thousands, so the clarity of a
     direct pairwise loop matters more than the constant-factor speedup `relax()`
     needs at object scale. Two differences from `relax()`'s own model: the minimum
-    distance between two centers is THEIR OWN combined content radius plus a fixed
-    gutter (never one flat ideal length), and attraction exists ONLY between projects
-    that actually share cross-project links, scaled by how many -- an unlinked pair
-    only ever repels, which is what makes "no two linked projects farther apart than
-    an unlinked pair of similar radii" true by construction rather than by luck.
+    distance between two centers is proportional to sqrt of the PAIR'S OWN combined
+    member count plus a small gutter (DENSITY NOT DISCS tip (f) -- see
+    `_PROJECT_SPACING_K`'s own docstring for why this replaced the old two-independent-
+    radii-summed formula), and attraction exists ONLY between projects that actually
+    share cross-project links, scaled by how many -- an unlinked pair only ever
+    repels, which is what makes "no two linked projects farther apart than an
+    unlinked pair of similar size" true by construction rather than by luck.
     Already-placed projects (`anchors`) are fixed, exactly like the object-level
     relax's own anchors. Seeded from a small sunflower point purely for a numerically
     stable, deterministic starting position -- the FINAL position is force-derived,
@@ -615,6 +718,10 @@ def _relax_projects(
         key = (a, b) if str(a) < str(b) else (b, a)
         return float(weights.get(key, 0))
 
+    def min_dist_of(a: uuid.UUID, b: uuid.UUID) -> float:
+        return spacing_k * math.sqrt(
+            member_counts.get(a, 0) + member_counts.get(b, 0) + 2) + gutter
+
     for _ in range(iterations):
         disp = {pid: (0.0, 0.0) for pid in unplaced_ids}
         for a in unplaced_ids:
@@ -625,7 +732,7 @@ def _relax_projects(
                 bx, by = get_pos(b)
                 dx, dy = ax - bx, ay - by
                 dist = math.hypot(dx, dy) or 0.01
-                min_dist = radius.get(a, 0.0) + radius.get(b, 0.0) + gutter
+                min_dist = min_dist_of(a, b)
                 if dist < min_dist:
                     f = min_dist - dist
                     disp[a] = (disp[a][0] + dx / dist * f, disp[a][1] + dy / dist * f)
@@ -645,7 +752,7 @@ def _relax_projects(
             break
 
     # HARD MINIMUM-DISTANCE CLAMP, same spirit as `_declump` but with a PER-PAIR floor
-    # (two projects' own combined content radius plus the gutter) instead of one flat
+    # (the pair's own combined-count spacing plus the gutter) instead of one flat
     # constant -- the iterative spring above approaches this floor, this guarantees it.
     for _ in range(iterations):
         moved = False
@@ -657,7 +764,7 @@ def _relax_projects(
                 bx, by = get_pos(b)
                 dx, dy = ax - bx, ay - by
                 dist = math.hypot(dx, dy)
-                min_dist = radius.get(a, 0.0) + radius.get(b, 0.0) + gutter
+                min_dist = min_dist_of(a, b)
                 if dist < min_dist:
                     moved = True
                     if dist < 1e-9:
@@ -690,10 +797,8 @@ async def _place_projects(
     already_placed = [pid for pid in all_ids if pid not in unplaced_set]
     anchors = await positions_for(actions, already_placed)
     member_counts = await _project_member_counts(actions, all_ids)
-    radius = {pid: _NODE_SPACING * math.sqrt(member_counts.get(pid, 0) + 1)
-              for pid in all_ids}
     weights = await _project_link_weights(actions, all_ids)
-    return _relax_projects(unplaced_ids, anchors, radius, weights)
+    return _relax_projects(unplaced_ids, anchors, member_counts, weights)
 
 
 async def _bulk_assert_positions(
@@ -780,6 +885,7 @@ async def layout_batch(actions: Actions, *, limit: int | None = None) -> int:
         project_ids_needed = [pid for pid, _ in proj_type.values() if pid]
         project_centers = await positions_for(actions, project_ids_needed)
         unfiled_center = project_center(0)
+        connected_counts = await _project_connected_counts(actions)
 
         base = {}
         for oid in unplaced_regular:
@@ -788,7 +894,8 @@ async def layout_batch(actions: Actions, *, limit: int | None = None) -> int:
                       if proj_id else unfiled_center)
             connected, own_rank = adjacency.get(oid, (False, 0))
             rank = 0 if oid in hub_ids else own_rank
-            base[oid] = adjacency_position(center, connected, rank)
+            halo_base = _project_halo_base(connected_counts.get(proj_id, 0))
+            base[oid] = adjacency_position(center, connected, rank, halo_base=halo_base)
 
         anchors = await positions_for(actions, neighbor_ids)
         intra = _intra_project_neighbors(unplaced_regular, neighbors, proj_type)
