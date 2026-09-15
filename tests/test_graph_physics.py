@@ -661,9 +661,41 @@ async def test_run_physics_migrate_verify_only_writes_nothing(actions: Actions) 
     assert receipts[-1]["verify_only"] is True
     assert receipts[-1]["placed"] >= 2
     assert "peak_rss_kb" not in receipts[-1]
+    # THE ACCEPTANCE METRICS (Thoth mail 11208) ride the receipt too.
+    assert "layout_bbox_min" in receipts[-1]
+    assert "layout_bbox_max" in receipts[-1]
+    assert "layout_project_stats" in receipts[-1]
 
     placed = await positions_for(actions, [a, b])
     assert placed == {}
+
+
+def test_layout_acceptance_metrics_reports_purity_gap_and_bbox_for_two_projects() -> None:
+    """THE ACCEPTANCE METRICS (Thoth mail 11208, required after the first real v8
+    write measured a 163k-unit bbox with every centroid near-coincident and 0.32
+    same-project purity): two well-separated projects, hand-built positions, should
+    report a positive centroid gap and full same-project purity."""
+    proj_a, proj_b = uuid.uuid4(), uuid.uuid4()
+    members_a = [uuid.uuid4() for _ in range(6)]
+    members_b = [uuid.uuid4() for _ in range(6)]
+    object_ids = [*members_a, *members_b]
+    membership = {m: proj_a for m in members_a} | {m: proj_b for m in members_b}
+    groups = {proj_a: members_a, proj_b: members_b}
+    project_ids = [proj_a, proj_b]
+    radii = {proj_a: 20.0, proj_b: 20.0}
+
+    pos = np.array(
+        [[0.0, 0.0] for _ in members_a] + [[500.0, 0.0] for _ in members_b])
+    # spread each cluster a little so r50/r95 aren't degenerate zeros
+    pos = pos + np.array([[i * 2.0, 0.0] for i in range(len(object_ids))])
+
+    metrics = graph_physics._layout_acceptance_metrics(
+        pos, object_ids, membership, groups, project_ids, radii)
+    assert metrics["layout_min_top10_centroid_gap"] > 0  # well clear of R_a+R_b
+    assert metrics["layout_biggest_project_5nn_purity"] == 1.0  # tight, isolated cluster
+    assert len(metrics["layout_project_stats"]) == 2
+    assert metrics["layout_bbox_min"] is not None
+    assert metrics["layout_bbox_max"] is not None
 
 
 async def test_run_physics_migrate_refuses_when_the_layout_lock_is_held(

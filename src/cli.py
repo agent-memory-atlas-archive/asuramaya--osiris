@@ -782,9 +782,16 @@ async def cmd_layout(
                     f" (worst residual {receipt['declump_worst_residual']:.3f}, "
                     f"{receipt['declump_iterations']} declump iterations)"
                     if "declump_worst_residual" in receipt else "")
+                acceptance_note = (
+                    f"\n  bbox width {receipt['layout_bbox_width']}"
+                    f"\n  min top-10 centroid gap vs. R_a+R_b: "
+                    f"{receipt['layout_min_top10_centroid_gap']:.1f}"
+                    f"\n  biggest-project 5-NN purity: "
+                    f"{receipt['layout_biggest_project_5nn_purity']}"
+                    if "layout_bbox_width" in receipt else "")
                 if "error" in receipt:
-                    print(f"osiris layout: {receipt['error']}{declump_note}",
-                          file=sys.stderr)
+                    print(f"osiris layout: {receipt['error']}{declump_note}"
+                          f"{acceptance_note}", file=sys.stderr)
                     rc = 1
                     break
                 if "stage" in receipt:
@@ -792,10 +799,10 @@ async def cmd_layout(
                           + (f" ({receipt['count']})" if "count" in receipt else ""))
                 elif receipt.get("verify_only"):
                     print(f"osiris layout: verify-only OK — {receipt['placed']} objects "
-                          f"would be placed, nothing written{declump_note}")
+                          f"would be placed, nothing written{declump_note}{acceptance_note}")
                 elif receipt.get("done"):
                     print(f"osiris layout: done — {receipt['placed']} objects placed "
-                          f"under the physics layout{declump_note}")
+                          f"under the physics layout{declump_note}{acceptance_note}")
             return rc
         async for receipt in run_layout_migrate(actions, limit=limit):
             if "error" in receipt:

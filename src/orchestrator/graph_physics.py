@@ -221,6 +221,35 @@ _LEVEL1_GUTTER = 3 * _MIN_SEPARATION  # extra clearance beyond R_a+R_b between a
                                       # requires >= R_a+R_b; a real gutter keeps a
                                       # bridging member's own facing-edge nudge (below)
                                       # from ever pushing it into the NEXT project.
+_INTRA_PROJECT_GUTTER = _MIN_SEPARATION  # THE INTRA-PROJECT GUTTER FIX (live
+                                         # specimen: the first real v8 write, deployed
+                                         # ba9669a4, measured as a 163k-unit bbox with
+                                         # 0.32 same-project 5-NN purity -- "not
+                                         # compact, not separated, fully interleaved").
+                                         # `_level2_raw_layout_for_project`'s own
+                                         # recursive community split reused
+                                         # `_level1_layout` with the SAME
+                                         # `_LEVEL1_GUTTER` a whole-graph PROJECT pair
+                                         # needs -- for a large project split into
+                                         # dozens of communities, that many pairwise
+                                         # 45-unit-plus clearances compounds into a
+                                         # sprawling archipelago (a giant project's
+                                         # own real extent measured in THOUSANDS of
+                                         # units, not the nominal formula's hundreds),
+                                         # whose own internal gaps are large enough
+                                         # for an entire SMALLER project to nest
+                                         # inside geometrically, even though every
+                                         # pairwise project-centroid distance still
+                                         # satisfies R_a+R_b+gutter on paper --
+                                         # `_separate_extents` only ever pushes
+                                         # CENTROIDS apart, it has no notion of a
+                                         # porous shape. Communities within ONE
+                                         # project don't need PROJECT-scale clearance
+                                         # from each other (they are still meant to
+                                         # read as one project, just with internal
+                                         # districts) -- min_sep alone keeps them
+                                         # visually distinct without ballooning the
+                                         # project's own overall footprint.
 _LEVEL1_FR_ITERATIONS = 500  # a small graph (one vertex per project) -- generous
                              # iteration budget costs nothing at this vertex count.
 _LEVEL1_SEPARATION_ITERATIONS = 300  # bounded like `_declump`'s own cap; separating
@@ -585,11 +614,16 @@ def _separate_extents(
 
 def _level1_layout(
     project_ids: list[uuid.UUID], radii: dict[uuid.UUID, float],
-    cross_edges: dict[tuple[uuid.UUID, uuid.UUID], float],
+    cross_edges: dict[tuple[uuid.UUID, uuid.UUID], float], *,
+    gutter: float = _LEVEL1_GUTTER,
 ) -> dict[uuid.UUID, np.ndarray]:
     """One vertex per project, FR over the cross-project semantic aggregate, then
     `_separate_extents` so no two project discs ever overlap -- see the module
-    docstring's HIERARCHICAL PHYSICS section for the full shape."""
+    docstring's HIERARCHICAL PHYSICS section for the full shape. `gutter` defaults
+    to the whole-graph project-vs-project clearance but is overridden much smaller
+    (THE INTRA-PROJECT GUTTER FIX) when this same function is reused one level
+    deeper for a project's own communities -- see
+    `_level2_raw_layout_for_project`'s own docstring for why."""
     if not project_ids:
         return {}
     idx = {pid: i for i, pid in enumerate(project_ids)}
@@ -607,7 +641,7 @@ def _level1_layout(
         seed=seed.tolist(), grid=True)
     pos = np.array(coords.coords)
     radii_arr = np.array([radii[pid] for pid in project_ids])
-    pos = _separate_extents(pos, radii_arr)
+    pos = _separate_extents(pos, radii_arr, gutter=gutter)
     return {pid: pos[i] for i, pid in enumerate(project_ids)}
 
 
@@ -750,7 +784,8 @@ def _level2_raw_layout_for_project(
         vid: max(nominal_radii[vid], real_extents[vid]) for vid in vertex_for.values()}
 
     cross_edges = _intra_project_community_edges(link_rows, oid_community_vertex)
-    centroids = _level1_layout(list(vertex_for.values()), radii, cross_edges)
+    centroids = _level1_layout(
+        list(vertex_for.values()), radii, cross_edges, gutter=_INTRA_PROJECT_GUTTER)
 
     out: dict[uuid.UUID, np.ndarray] = {}
     for key, vid in vertex_for.items():
@@ -835,6 +870,7 @@ def _apply_bridge_nudges(
 def _place_unfiled(
     unfiled_ids: list[uuid.UUID], link_rows: list[asyncpg.Record],
     placed: dict[uuid.UUID, np.ndarray],
+    project_centroids: dict[uuid.UUID, np.ndarray] | None = None,
 ) -> dict[uuid.UUID, np.ndarray]:
     """Unfiled objects (Thoth mail 11128 item 4): one with a live semantic link to
     an already-placed object lands at the mean position of those neighbours; one
@@ -854,7 +890,17 @@ def _place_unfiled(
     as a FIXED anchor -- the SAME anchor-vs-movable mode `_declump` already
     supports (used unchanged, no new mechanism), just invoked at the point of
     insertion instead of leaving all the decluttering work to one pass over the
-    whole population at the end."""
+    whole population at the end.
+
+    THE FOG-SCALE FIX (live specimen, first real v8 write, deployed ba9669a4:
+    163k-unit bbox, 0.32 same-project purity): the OLD `cloud_std` was the raw std
+    of EVERY placed point's own coordinates -- for a huge project (one alone
+    r95 in the thousands after real-extent separation), that std balloons well
+    past the LEVEL-1 canvas scale, so the fog's own Gaussian spread put real
+    density inside project regions instead of only "between and around" them
+    (Thoth's own item-4 spec). `project_centroids`, when given, scales the fog
+    off the spread of PROJECT CENTROIDS instead -- the level-1 canvas's own
+    scale, not any one project's internal member spread."""
     neighbours: dict[uuid.UUID, list[np.ndarray]] = defaultdict(list)
     unfiled_set = set(unfiled_ids)
     for r in link_rows:
@@ -866,13 +912,16 @@ def _place_unfiled(
         if t in unfiled_set and f in placed:
             neighbours[t].append(placed[f])
 
+    scale_source = project_centroids if project_centroids else placed
+    if scale_source:
+        scale_pos = np.array(list(scale_source.values()))
+        cloud_std = max(float(scale_pos.std()), _UNFILED_FOG_MIN_STD)
+    else:
+        cloud_std = _UNFILED_FOG_MIN_STD
     if placed:
-        all_pos = np.array(list(placed.values()))
-        cloud_center = all_pos.mean(axis=0)
-        cloud_std = max(float(all_pos.std()), _UNFILED_FOG_MIN_STD)
+        cloud_center = np.array(list(placed.values())).mean(axis=0)
     else:
         cloud_center = np.zeros(2)
-        cloud_std = _UNFILED_FOG_MIN_STD
 
     out: dict[uuid.UUID, np.ndarray] = {}
     for oid in unfiled_ids:
@@ -1111,7 +1160,9 @@ async def _physics_positions(
             pos_arr, np.zeros((0, 2)), ids_order, min_sep=_MIN_SEPARATION,
             iterations=_PHYSICS_DECLUMP_ITERATIONS)
         positions = {oid: pos_arr[i] for i, oid in enumerate(ids_order)}
-    positions.update(_place_unfiled(unfiled_ids, link_rows, positions))
+    project_centroids_only = {pid: centroids[pid] for pid in project_ids}
+    positions.update(
+        _place_unfiled(unfiled_ids, link_rows, positions, project_centroids_only))
 
     if hub_order:
         positions.update(_place_hubs_in_zone(hub_order, centroids[_HUB_ZONE_ID]))
@@ -1132,10 +1183,82 @@ async def _physics_positions(
     if diagnostics is not None:
         diagnostics["declump_worst_residual"] = worst_residual
         diagnostics["declump_iterations"] = declump_iters
+        diagnostics.update(_layout_acceptance_metrics(
+            declumped, object_ids, membership, groups, project_ids, radii))
     _verify_min_separation(worst_residual, min_sep=_MIN_SEPARATION)
 
     return {oid: (float(declumped[i, 0]), float(declumped[i, 1]))
             for i, oid in enumerate(object_ids)}
+
+
+def _layout_acceptance_metrics(
+    pos: np.ndarray, object_ids: list[uuid.UUID], membership: dict[uuid.UUID, uuid.UUID],
+    groups: dict[uuid.UUID, list[uuid.UUID]], project_ids: list[uuid.UUID],
+    radii: dict[uuid.UUID, float],
+) -> dict[str, Any]:
+    """THE ACCEPTANCE METRICS (Thoth mail 11208, required in every verify-only
+    receipt from now on): per-project centroid/r50/r95/N for the top 10 projects,
+    the minimum pairwise centroid gap among them against their own R_a+R_b, 5-NN
+    same-project purity for the biggest project, and the global bbox. Computed
+    from the SAME final positions the migration would write (or refuse) -- the
+    exact numbers Thoth's own live measurement caught v8's first real write
+    failing on (163k-unit bbox, every centroid near-coincident, 0.32 purity)."""
+    idx = {oid: i for i, oid in enumerate(object_ids)}
+    top = sorted(project_ids, key=lambda p: -len(groups[p]))[:10]
+
+    project_stats = []
+    top_centroids: dict[uuid.UUID, np.ndarray] = {}
+    for pid in top:
+        member_idx = [idx[m] for m in groups[pid] if m in idx]
+        if not member_idx:
+            continue
+        pts = pos[member_idx]
+        centroid = pts.mean(axis=0)
+        top_centroids[pid] = centroid
+        dists = np.linalg.norm(pts - centroid, axis=1)
+        project_stats.append({
+            "project": str(pid), "n": len(member_idx),
+            "centroid": centroid.tolist(),
+            "r50": float(np.percentile(dists, 50)),
+            "r95": float(np.percentile(dists, 95)),
+        })
+
+    min_gap = None
+    top_list = list(top_centroids.keys())
+    for i in range(len(top_list)):
+        for j in range(i + 1, len(top_list)):
+            a, b = top_list[i], top_list[j]
+            dist = float(np.linalg.norm(top_centroids[a] - top_centroids[b]))
+            required = radii.get(a, _MIN_SEPARATION) + radii.get(b, _MIN_SEPARATION)
+            gap = dist - required
+            if min_gap is None or gap < min_gap:
+                min_gap = gap
+
+    purity = None
+    if top:
+        biggest = top[0]
+        member_idx = [idx[m] for m in groups[biggest] if m in idx]
+        if member_idx:
+            rng = np.random.default_rng(42)
+            sample_idx = [member_idx[i] for i in rng.choice(
+                len(member_idx), size=min(300, len(member_idx)), replace=False)]
+            same_project = np.array([membership.get(oid) == biggest for oid in object_ids])
+            purities = []
+            for i in sample_idx:
+                d = np.linalg.norm(pos - pos[i], axis=1)
+                nn_idx = np.argsort(d)[1:6]  # skip self (distance 0)
+                purities.append(float(same_project[nn_idx].mean()))
+            purity = float(np.mean(purities))
+
+    bbox_min, bbox_max = pos.min(axis=0), pos.max(axis=0)
+    return {
+        "layout_project_stats": project_stats,
+        "layout_min_top10_centroid_gap": min_gap,
+        "layout_biggest_project_5nn_purity": purity,
+        "layout_bbox_min": bbox_min.tolist(),
+        "layout_bbox_max": bbox_max.tolist(),
+        "layout_bbox_width": (bbox_max - bbox_min).tolist(),
+    }
 
 
 async def _memory_guard(actions: Actions, positions: np.ndarray) -> str | None:
