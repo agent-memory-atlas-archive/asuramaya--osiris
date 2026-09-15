@@ -96,11 +96,18 @@ async def test_reingest_same_history_does_not_regrow_dev_assertions(
     assert email_rows_2 == email_rows_1, "unchanged email re-asserted on a no-op re-ingest"
 
 
-async def test_reingest_with_a_real_name_change_still_writes(
+async def test_a_second_author_name_under_a_known_email_lands_as_an_alias_not_a_rewrite(
     actions: Actions, tmp_path: Path
 ) -> None:
-    """The no-op guard must never suppress a REAL change — a dev whose git name genuinely
-    changes between ingests still gets the new value recorded."""
+    """GIT IDENTITIES WEARING THE WRONG NAME (thread 0be2f790's own operator-finding
+    follow-up, Thoth DM 10711): THE INGEST GUARD — superseding
+    test_reingest_with_a_real_name_change_still_writes, which asserted the OLD, now-
+    retired "last commit's author name becomes `name`" policy. That policy is exactly
+    the bug class Thoth traced live: the operator's own git identity's displayed name
+    flipping to whichever agent's commit happened to touch it last. `name` is now a
+    pure function of the (stable) canonical itself — a SECOND author name under the
+    SAME known email must never rewrite it, no matter how many ingests see that second
+    name. It still isn't silently dropped: it rides along as `author_alias`."""
     repo = tmp_path / "proj4"
     repo.mkdir()
     _git(repo, "init", "-q")
@@ -125,10 +132,55 @@ async def test_reingest_with_a_real_name_change_still_writes(
     current_name = await p.fetchval(
         "SELECT value #>> '{}' FROM current_assertions WHERE object_id=$1 AND name='name'",
         dev_id)
-    assert current_name == "Ada Lovelace"
+    assert current_name == "ada", "a second author name under a known email must not rewrite name"
     name_rows = await p.fetchval(
         "SELECT count(*) FROM assertions WHERE object_id=$1 AND name='name'", dev_id)
-    assert name_rows == 2, "a genuine name change must still be written"
+    assert name_rows == 1, "name is written once, from the identity itself, never reasserted"
+    aliases = await p.fetchval(
+        "SELECT value FROM current_assertions WHERE object_id=$1 AND name='author_alias'",
+        dev_id)
+    assert aliases == ["Ada Lovelace"], "the second author name is preserved as an alias"
+
+
+async def test_author_aliases_merge_across_runs_instead_of_replacing(
+    actions: Actions, tmp_path: Path,
+) -> None:
+    """The alias set is additive across separate ingest runs (mirroring `dev_info`'s own
+    within-run accumulation) — a name seen on an earlier run is never lost just because a
+    later run's own commit walk didn't happen to repeat it."""
+    repo = tmp_path / "proj4b"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "Ada")
+    _git(repo, "config", "user.email", "ada@x.io")
+    (repo / "a.txt").write_text("1")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "genesis")
+    env1 = {**os.environ, "GIT_AUTHOR_NAME": "Ada Lovelace", "GIT_AUTHOR_EMAIL": "ada@x.io",
+            "GIT_COMMITTER_NAME": "Ada Lovelace", "GIT_COMMITTER_EMAIL": "ada@x.io"}
+    (repo / "b.txt").write_text("2")
+    _git(repo, "add", ".")
+    await asyncio.to_thread(
+        subprocess.run, ["git", "-C", str(repo), "commit", "-q", "-m", "second"],
+        check=True, capture_output=True, env=env1)
+    await ingest_repo(actions, str(repo))
+
+    env2 = {**os.environ, "GIT_AUTHOR_NAME": "A. Lovelace", "GIT_AUTHOR_EMAIL": "ada@x.io",
+            "GIT_COMMITTER_NAME": "A. Lovelace", "GIT_COMMITTER_EMAIL": "ada@x.io"}
+    (repo / "c.txt").write_text("3")
+    _git(repo, "add", ".")
+    await asyncio.to_thread(
+        subprocess.run, ["git", "-C", str(repo), "commit", "-q", "-m", "third"],
+        check=True, capture_output=True, env=env2)
+    await ingest_repo(actions, str(repo))
+
+    p = actions.pool
+    dev_id = await p.fetchval("SELECT id FROM objects WHERE canonical='dev:ada@x.io'")
+    aliases = await p.fetchval(
+        "SELECT value FROM current_assertions WHERE object_id=$1 AND name='author_alias'",
+        dev_id)
+    assert aliases == ["A. Lovelace", "Ada Lovelace"], \
+        "both distinct author names, from separate runs, are preserved together"
 
 
 async def test_repo_name_survives_conventional_commits(actions: Actions, tmp_path: Path) -> None:
