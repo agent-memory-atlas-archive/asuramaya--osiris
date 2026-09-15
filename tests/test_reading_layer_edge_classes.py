@@ -46,7 +46,8 @@ def test_structural_class_is_hidden_by_default() -> None:
 
 
 def test_edge_geometry_build_filters_by_hidden_classes_and_types() -> None:
-    body = _SPACE_JS.split("function buildEdgeLines(nodes, edgeList)", 1)[1][:600]
+    # TIP 3 (Thoth mail 10930) renamed the parameter rawEdgeList.
+    body = _SPACE_JS.split("function buildEdgeLines(nodes, rawEdgeList)", 1)[1][:600]
     assert "!hiddenEdgeClasses.has(e.edgeClass)" in body
     assert "!hiddenEdgeTypes.has(e.type)" in body
 
@@ -96,8 +97,10 @@ def test_legend_checkboxes_rebuild_edge_lines_on_change() -> None:
     # header repo selector's entry point, CONSOLE CHROME CLEANUP piece 2, decision
     # 31717ca7), plus TIP 1b's own review-flaw-#1 fix: focusObject and clearFocus each
     # rebuild the base layer too, so unreachable edges actually disappear on focus instead
-    # of only nodes — seven call sites total. This slice runs unbounded to end-of-file (no
-    # closing boundary in the split above), so it catches every function defined after
-    # renderLegend, not just renderLegend's own body — noted rather than silently
-    # re-scoping an existing test's own slicing choice.
-    assert body.count("buildEdgeLines(idToNode, edges);") == 7
+    # of only nodes — plus TIP 3's own refreshLOD (Thoth mail 10930), rebuilding the edge
+    # layer under its new budget the moment a zoom step crosses a LOD tier boundary — eight
+    # call sites total now. This slice runs unbounded to end-of-file (no closing boundary in
+    # the split above), so it catches every function defined after renderLegend, not just
+    # renderLegend's own body — noted rather than silently re-scoping an existing test's own
+    # slicing choice.
+    assert body.count("buildEdgeLines(idToNode, edges);") == 8

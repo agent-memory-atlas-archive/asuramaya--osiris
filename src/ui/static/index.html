@@ -15,6 +15,14 @@
          padding: 1px 4px; border-radius: 3px; transform: translate(-50%, -140%);
          white-space: nowrap; pointer-events: none; }
   .lbl.lit { color: #f0f6fc; background: rgba(35,55,80,0.9); font-weight: 600; }
+  /* THE LEGIBILITY PASS, TIP 3 (Thoth mail 10930): the LOD glyph's own label -- a project
+     or type summary ("name (count)") shown only at the far/mid zoom tiers, styled bigger
+     and bolder than a plain node .lbl since it's standing in for a whole cluster, not one
+     object. */
+  .lod-glyph-label { position: absolute; font-size: 12px; font-weight: 700; color: #f0f6fc;
+                      background: rgba(13,18,25,0.82); padding: 2px 7px; border-radius: 4px;
+                      transform: translate(-50%, -50%); white-space: nowrap; pointer-events: none;
+                      letter-spacing: 0.2px; }
   /* THE LEGIBILITY PASS, TIP 1(f) (ruling e1cb9e3b): the table drawer owns the bottom edge
      now -- nothing floats in its collapsed 34px handle band any more (Thoth's own
      screenshot showed the canvas controls colliding with it there). */

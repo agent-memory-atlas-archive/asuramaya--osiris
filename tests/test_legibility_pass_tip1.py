@@ -122,7 +122,9 @@ def test_base_edge_layer_hides_edges_touching_an_invisible_node() -> None:
     # own per-instance flag — an edge touching a project-hidden node must not still draw.
     assert "hiddenProjects.has(nd.project)" in body
     assert "pathReachable.has(nd.id)" in body
-    build_body = _SPACE_JS.split("function buildEdgeLines(nodes, edgeList)", 1)[1][:700]
+    # TIP 3 (Thoth mail 10930) renamed the parameter rawEdgeList -- buildEdgeLines now
+    # applies its own zoom-tier edge budget to it before this filtering runs.
+    build_body = _SPACE_JS.split("function buildEdgeLines(nodes, rawEdgeList)", 1)[1][:700]
     assert "nodeVisible(byId.get(e.source))" in build_body
     assert "nodeVisible(byId.get(e.target))" in build_body
 

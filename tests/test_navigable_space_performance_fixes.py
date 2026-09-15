@@ -128,7 +128,12 @@ def test_context_loss_is_handled_not_left_to_crash() -> None:
     assert '"webglcontextlost"' in _SPACE_JS
     assert "ev.preventDefault();" in _SPACE_JS
     assert '"webglcontextrestored"' in _SPACE_JS
-    body = _SPACE_JS.split('"webglcontextrestored"', 1)[1][:400]
+    # window widened for TIP 3 (Thoth mail 10930): context loss invalidates every GPU
+    # resource, so the LOD glyphs/cluster edges/halo (all their own GPU meshes) rebuild here
+    # too now, pushing resume() further into the handler body.
+    body = _SPACE_JS.split('"webglcontextrestored"', 1)[1][:600]
     assert "buildScene(idToNode, edges)" in body
     assert "fitToNodes(idToNode)" in body
+    assert "buildLODGlyphs()" in body
+    assert "buildHalo()" in body
     assert "resume();" in body
