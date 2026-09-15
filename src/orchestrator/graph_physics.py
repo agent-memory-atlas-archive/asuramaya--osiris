@@ -915,16 +915,28 @@ async def _memory_guard(actions: Actions, positions: np.ndarray) -> str | None:
     return None
 
 
-async def run_physics_migrate(actions: Actions) -> AsyncIterator[dict[str, Any]]:
+async def run_physics_migrate(
+    actions: Actions, *, verify_only: bool = False,
+) -> AsyncIterator[dict[str, Any]]:
     """THE PHYSICS LAYOUT's own migration door: a SINGLE global computation over the
     whole active population (never a batch loop -- see the module docstring for why),
     sharing `graph_layout._LAYOUT_LOCK_KEY` with the cron heartbeat and
     `run_layout_migrate` so nothing else touches graph_x/graph_y while this runs.
     Yields coarse stage receipts (not one per batch, since there are none) and a
-    final `{"done": True, "placed": N, "peak_rss_kb": N}` -- `_physics_positions`'s
-    own post-FR memory guard (THE COLLAPSED-CONTAINER FIX, Thoth mail 11111) can
-    raise `MemoryBudgetExceeded` instead, turned here into a single `{"error": ...}`
-    receipt with no write."""
+    final `{"done": True, "placed": N, "peak_rss_kb": N}` -- `_physics_positions` can
+    raise `MemoryBudgetExceeded` (THE COLLAPSED-CONTAINER FIX, Thoth mail 11111) or
+    `DeclumpVerificationFailed` (item 2, Thoth mail 11128), either turned here into a
+    single `{"error": ...}` receipt with no write.
+
+    `verify_only=True` (ruling 6befd2a5, Thoth mail 11178, added after the fourth
+    live migration attempt needed a fourth deploy-probe-diagnose cycle just to see
+    whether a fix actually worked): computes and verifies everything -- population,
+    hierarchical layout, declump, the min-sep verification -- WITHOUT ever reaching
+    the write step below (structurally, not by a flag check inside the write path --
+    the `return` two lines above the write loop is what actually guarantees it). A
+    verify-only run is read-only by construction, so unlike a real migration it MAY
+    run from an undeployed branch against the live population; only a run that
+    actually writes still needs deployed code (the migration-doors rule)."""
     async with actions.pool.acquire() as lock_conn:
         if not await _try_acquire_layout_lock(lock_conn):
             yield {"error": "the layout heartbeat (or a migrate run) currently holds "
@@ -934,8 +946,11 @@ async def run_physics_migrate(actions: Actions) -> AsyncIterator[dict[str, Any]]
             yield {"stage": "computing"}
             try:
                 positions = await _physics_positions(actions)
-            except MemoryBudgetExceeded as exc:
+            except (MemoryBudgetExceeded, DeclumpVerificationFailed) as exc:
                 yield {"error": str(exc)}
+                return
+            if verify_only:
+                yield {"done": True, "verify_only": True, "placed": len(positions)}
                 return
             yield {"stage": "writing", "count": len(positions)}
             now = datetime.now(UTC)

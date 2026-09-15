@@ -730,7 +730,7 @@ async def cmd_graph_export(
 # --- layout ----------------------------------------------------------------------------------
 
 async def cmd_layout(
-    *, limit: int | None = None, physics: bool = False,
+    *, limit: int | None = None, physics: bool = False, verify_only: bool = False,
     pool: asyncpg.Pool | None = None,
 ) -> int:
     """osiris layout --migrate — THE MIGRATION DOOR (Thoth mail 10609, product law:
@@ -746,7 +746,13 @@ async def cmd_layout(
     `graph_physics.run_physics_migrate` instead — a SINGLE global force simulation
     over the whole active graph, never a batch loop (springs pull across the entire
     graph, not just within a batch, so this genuinely cannot be sliced the way the
-    old sunflower scheme could be) — `limit` is meaningless here and ignored."""
+    old sunflower scheme could be) — `limit` is meaningless here and ignored.
+
+    osiris layout --physics --verify-only (ruling 6befd2a5, Thoth mail 11178):
+    `verify_only=True` passed straight through to `run_physics_migrate` — computes
+    and verifies, WRITES NOTHING. Read-only by construction, so unlike a plain
+    `--physics` run this one may run from an undeployed branch against the live
+    population."""
     from src.actions.core import Actions
     from src.orchestrator.graph_layout import run_layout_migrate
     from src.orchestrator.graph_physics import run_physics_migrate
@@ -771,7 +777,7 @@ async def cmd_layout(
         actions = Actions(pool)
         rc = 0
         if physics:
-            async for receipt in run_physics_migrate(actions):
+            async for receipt in run_physics_migrate(actions, verify_only=verify_only):
                 if "error" in receipt:
                     print(f"osiris layout: {receipt['error']}", file=sys.stderr)
                     rc = 1
@@ -779,6 +785,9 @@ async def cmd_layout(
                 if "stage" in receipt:
                     print(f"osiris layout: {receipt['stage']}"
                           + (f" ({receipt['count']})" if "count" in receipt else ""))
+                elif receipt.get("verify_only"):
+                    print(f"osiris layout: verify-only OK — {receipt['placed']} objects "
+                          "would be placed, nothing written")
                 elif receipt.get("done"):
                     print(f"osiris layout: done — {receipt['placed']} objects placed "
                           "under the physics layout")
@@ -6737,6 +6746,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_layout.add_argument("--physics", action="store_true",
                           help="THE PHYSICS LAYOUT's own one-shot migration — a single "
                                "global force simulation, not a batch loop")
+    p_layout.add_argument("--verify-only", action="store_true",
+                          help="THE PHYSICS LAYOUT, computed and verified but WRITES "
+                               "NOTHING (ruling 6befd2a5) — read-only by construction, "
+                               "so unlike a real --physics run this may run from an "
+                               "undeployed branch against the live population; "
+                               "--physics only")
     p_layout.add_argument("--limit", type=int, default=None,
                           help="objects per batch (default: the live layout.batch_size "
                                "setting, itself defaulting to 1000) — --migrate only")
@@ -8033,7 +8048,11 @@ def main(argv: list[str] | None = None) -> int:
         if not args.migrate and not args.physics:
             print("osiris layout: pass --migrate or --physics", file=sys.stderr)
             return 1
-        return asyncio.run(cmd_layout(limit=args.limit, physics=args.physics))
+        if args.verify_only and not args.physics:
+            print("osiris layout: --verify-only needs --physics", file=sys.stderr)
+            return 1
+        return asyncio.run(cmd_layout(
+            limit=args.limit, physics=args.physics, verify_only=args.verify_only))
     if args.command == "audit":
         return asyncio.run(cmd_audit(args.name, as_json=args.as_json))
     if args.command == "seed":

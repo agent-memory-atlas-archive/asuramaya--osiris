@@ -547,6 +547,27 @@ async def test_run_physics_migrate_writes_every_active_object_at_the_current_ver
     assert all(r["v"] == _PHYSICS_LAYOUT_VERSION for r in rows)
 
 
+async def test_run_physics_migrate_verify_only_writes_nothing(actions: Actions) -> None:
+    """THE VERIFY-ONLY DOOR (ruling 6befd2a5, Thoth mail 11178): computes and
+    verifies but never reaches the write step -- a real migration door's own
+    positions_for lookup for the SAME objects must come back empty."""
+    from src.orchestrator.graph_layout import positions_for
+
+    now = datetime.now(UTC)
+    a = await actions.create_or_find_object("Thread", "thread:gp-verify-only-a", "test")
+    b = await actions.create_or_find_object("Thread", "thread:gp-verify-only-b", "test")
+    await actions.create_link(a, b, "cites", "test", now, 1.0)
+
+    receipts = [r async for r in run_physics_migrate(actions, verify_only=True)]
+    assert receipts[-1]["done"] is True
+    assert receipts[-1]["verify_only"] is True
+    assert receipts[-1]["placed"] >= 2
+    assert "peak_rss_kb" not in receipts[-1]
+
+    placed = await positions_for(actions, [a, b])
+    assert placed == {}
+
+
 async def test_run_physics_migrate_refuses_when_the_layout_lock_is_held(
     actions: Actions,
 ) -> None:
