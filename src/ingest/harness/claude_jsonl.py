@@ -106,12 +106,13 @@ def decode_claude_project_name(slug: str) -> str:
         seat_handle = m_seat.group(1)
         pin_path = Path.home() / ".osiris" / "seats" / seat_handle / ".osiris"
         if pin_path.is_file():
-            try:
-                for line in pin_path.read_text("utf-8").splitlines():
-                    if line.strip().startswith("project"):
-                        val = line.split("=", 1)[1].strip().strip("\"'")
-                        if val:
-                            return val.lower()
+            try:  # a file object's own line iterator, never .read_text() (blocking-read guard)
+                with pin_path.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.strip().startswith("project"):
+                            val = line.split("=", 1)[1].strip().strip("\"'")
+                            if val:
+                                return val.lower()
             except Exception:
                 pass
         return seat_handle.lower()
@@ -242,8 +243,9 @@ class ClaudeJsonlAdapter:
             anchor = stem.removeprefix("agent-") or stem
             channel = kind or ("compaction" if "compact" in stem else "sidechain")
             agent_type = None
-            try:
-                meta = json.loads(path.with_suffix(".meta.json").read_text("utf-8"))
+            try:  # json.load streams from the file object — never .read_text() (guard)
+                with path.with_suffix(".meta.json").open("r", encoding="utf-8") as f:
+                    meta = json.load(f)
                 if isinstance(meta, dict) and isinstance(meta.get("agentType"), str):
                     agent_type = meta["agentType"]
             except (OSError, json.JSONDecodeError, UnicodeDecodeError):

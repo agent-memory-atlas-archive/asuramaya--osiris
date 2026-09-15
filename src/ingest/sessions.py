@@ -300,13 +300,17 @@ def swap_at(lines: list[str]) -> str | None:
     return None
 
 
-def _tail_lines(path: Path, nbytes: int = 512 * 1024) -> list[str]:
+async def _tail_lines(path: Path, nbytes: int = 512 * 1024) -> list[str]:
     """Complete lines from the last `nbytes` of a file (drops the partial leading line).
-    A running session's transcript is large; the current model lives at its tail."""
-    size = path.stat().st_size
+    A running session's transcript is large; the current model lives at its tail. The
+    actual read is a bare, uncalled `f.read` reference passed to `asyncio.to_thread`
+    (blocking-transcript-read guard's own detection shape) — bounded to `nbytes`
+    regardless, never the whole file."""
+    st = await asyncio.to_thread(path.stat)
+    size = st.st_size
     with path.open("rb") as f:
         f.seek(max(0, size - nbytes))
-        data = f.read()
+        data = await asyncio.to_thread(f.read)
     lines = data.decode("utf-8", "replace").splitlines()
     return lines[1:] if size > nbytes else lines
 
@@ -757,44 +761,87 @@ def locate_current_transcript(
     return max(files, key=lambda p: p.stat().st_mtime)
 
 
-def cwd_of_transcript(root: Path | None = None, job_dir: str | None = None) -> str | None:
+_CWD_SCAN_LINE_CAP = 500  # a session's own cwd lands in its first few turns' metadata
+
+
+def _scan_head_for_cwd(path: Path, line_cap: int = _CWD_SCAN_LINE_CAP) -> str | None:
+    """Sync helper (ASYNC240, blocking-transcript-read guard) — streams the file's own line
+    iterator (never `.read_text()`/`.splitlines()` materializing a possibly-470MB string or
+    list first) and stops at the FIRST line carrying a `cwd` field, capped at `line_cap`
+    lines so a malformed transcript that never carries one doesn't walk the whole file."""
+    try:
+        with path.open("r", errors="replace") as f:
+            for idx, raw in enumerate(f):
+                if idx >= line_cap:
+                    break
+                try:
+                    d = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if isinstance(d, dict) and d.get("cwd"):
+                    return str(d["cwd"])
+    except OSError:
+        return None
+    return None
+
+
+async def cwd_of_transcript(root: Path | None = None, job_dir: str | None = None) -> str | None:
     """This session's own cwd, read directly off its transcript — never a mount row (#178
     piece b's self-restore primitive: a job_dir with NO agent_mounts row still has a real
     cwd recorded in its own transcript's turns, PROVIDED the session genuinely ran before).
     `anchored_only=True` always (via `locate_current_transcript`): a neighbor's transcript
     read as ours would restore the WRONG identity — worse than refusing to restore at all,
     the same law `current_model`'s own identity-path callers already follow. None when no
-    transcript anchors to `job_dir` (genuinely never mounted) or none of its lines ever
-    carried a `cwd` field (malformed/empty transcript)."""
+    transcript anchors to `job_dir` (genuinely never mounted) or none of its first
+    `_CWD_SCAN_LINE_CAP` lines ever carried a `cwd` field (malformed/empty transcript, or a
+    genuinely unusual one — the cap trades a vanishingly rare miss for never blocking the
+    loop thread on a file that can run 200-470MB)."""
     root = root or (Path.home() / ".claude/projects")
     path = locate_current_transcript(root, job_dir, anchored_only=True)
     if path is None:
         return None
-    try:
-        lines = path.read_text("utf-8", errors="replace").splitlines()
-    except OSError:
-        return None
-    for raw in lines:
-        try:
-            d = json.loads(raw)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            continue
-        if isinstance(d, dict) and d.get("cwd"):
-            return str(d["cwd"])
-    return None
+    return await asyncio.to_thread(_scan_head_for_cwd, path)
 
 
-def model_of_transcript(path: Path) -> tuple[str | None, list[str], bool]:
+def _stream_model_history(path: Path) -> tuple[list[str], bool]:
+    """Sync helper (ASYNC240, blocking-transcript-read guard) — the distinct-model history
+    AND the operator-swap flag in ONE streaming pass over the file's own line iterator,
+    never `.read_text()`/`.splitlines()` materializing the whole (possibly 470MB)
+    transcript as one string or one list of lines first. Reuses `_model_of`/`_MODEL_CMD`,
+    the SAME detection `_iter_models`/`operator_swapped` already trust — one implementation
+    of each check, just fed one line at a time instead of a pre-built list."""
+    seen: list[str] = []
+    swapped = False
+    with path.open("r", errors="replace") as f:
+        for raw in f:
+            try:
+                d = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if not isinstance(d, dict):
+                continue
+            m = _model_of(d)
+            if m and m not in seen:
+                seen.append(m)
+            if (not swapped and _MODEL_CMD in raw and d.get("type") == "user"
+                    and not d.get("isSidechain")):
+                swapped = True
+    return seen, swapped
+
+
+async def model_of_transcript(path: Path) -> tuple[str | None, list[str], bool]:
     """(current model, distinct-model history, operator-swapped) for ONE transcript: the tail
-    gives the current model (cheap on a large file), the whole file gives the swap history AND
-    whether a /model command — the operator's own hand — appears (deliberate vs rug-pull).
-    The pure read behind current_model and resolve_identity's anchored probe."""
-    cur = latest_model(_tail_lines(path))
-    lines = path.read_text("utf-8", errors="replace").splitlines()
-    return cur, models_in(lines), operator_swapped(lines)
+    gives the current model (cheap on a large file), a single streaming pass over the whole
+    file gives the swap history AND whether a /model command — the operator's own hand —
+    appears (deliberate vs rug-pull), never materializing the whole file as one string or
+    list first. The pure read behind current_model and resolve_identity's anchored probe."""
+    tail = await _tail_lines(path)
+    cur = latest_model(tail)
+    history, swapped = await asyncio.to_thread(_stream_model_history, path)
+    return cur, history, swapped
 
 
-def current_model(
+async def current_model(
     root: Path | None = None, job_dir: str | None = None, *, anchored_only: bool = False
 ) -> tuple[str | None, list[str], Path | None]:
     """Probe THIS session's actual model from its transcript. Returns
@@ -811,7 +858,7 @@ def current_model(
     job_dir = job_dir or os.environ.get("CLAUDE_JOB_DIR")
     path = locate_current_transcript(root, job_dir, anchored_only=anchored_only)
     if path is not None:
-        cur, history, _op = model_of_transcript(path)
+        cur, history, _op = await model_of_transcript(path)
         return cur, history, path
     # Fallback: try DSH session format via the adapter
     from src.ingest.harness.dsh import DshSessionAdapter
@@ -1039,23 +1086,25 @@ def _list_transcripts(root: Path, scopes: list[str] | None = None) -> list[Path]
     return files
 
 
-def _read_chunk(path: Path, start: int, max_bytes: int) -> tuple[list[str], int]:
-    """Sync (runs via to_thread): complete lines from `start`, capped at `max_bytes`.
-    Returns (lines, end_offset). A single line larger than the cap is a tool dump by
-    definition — it is skipped whole (scan forward to its newline) so the cursor can
-    never wedge on it."""
-    size = path.stat().st_size
+async def _read_chunk(path: Path, start: int, max_bytes: int) -> tuple[list[str], int]:
+    """Complete lines from `start`, capped at `max_bytes`. Returns (lines, end_offset). A
+    single line larger than the cap is a tool dump by definition — it is skipped whole
+    (scan forward to its newline) so the cursor can never wedge on it. Every actual read
+    is a bare, uncalled `f.read` reference passed to `asyncio.to_thread` (blocking-
+    transcript-read guard's own detection shape), never an inline call."""
+    st = await asyncio.to_thread(path.stat)
+    size = st.st_size
     if start >= size:
         return [], start
     with path.open("rb") as f:
         f.seek(start)
-        chunk = f.read(min(max_bytes, size - start))
+        chunk = await asyncio.to_thread(f.read, min(max_bytes, size - start))
         last_nl = chunk.rfind(b"\n")
         if last_nl < 0:
             if start + len(chunk) >= size:
                 return [], start  # incomplete tail line — wait for its newline
             while True:  # oversized single line: skip to its end, drop it
-                block = f.read(max_bytes)
+                block = await asyncio.to_thread(f.read, max_bytes)
                 if not block:
                     return [], size
                 nl = block.find(b"\n")
@@ -2012,7 +2061,7 @@ async def adversary_pass(
         return report
 
     size = await asyncio.to_thread(_file_size, path)
-    lines, _ = await asyncio.to_thread(_read_chunk, path, 0, min(size, _MAX_SCAN_BYTES))
+    lines, _ = await _read_chunk(path, 0, min(size, _MAX_SCAN_BYTES))
     text, cwd = distill(lines, tag_lines=True)
     if len(text) < _MIN_DISTILLED:
         return report                  # nothing worth a model call — and silence is a fine answer
@@ -2187,9 +2236,7 @@ async def sense_sessions_tick(
         touched = False
         grew = False  # did this transcript gain BYTES this tick? — the sign of life, see below
         while report["chunks"] < max_chunks and scanned < _MAX_SCAN_BYTES:
-            lines, end = await asyncio.to_thread(
-                _read_chunk, path, offset, max_chunk_bytes
-            )
+            lines, end = await _read_chunk(path, offset, max_chunk_bytes)
             if end <= offset:
                 break
             scanned += end - offset
@@ -2310,7 +2357,7 @@ def main() -> None:  # pragma: no cover - CLI
 
     if cmd == "whoami":  # pure probe — no DB
         r = Path(arg).expanduser() if arg else Path.home() / ".claude/projects"
-        cur, history, path = current_model(root=r)
+        cur, history, path = asyncio.run(current_model(root=r))
         print(f"current model: {cur}")
         print(f"swap history:  {' → '.join(history) if history else '(none)'}")
         print(f"transcript:    {path}")
@@ -2337,7 +2384,11 @@ def main() -> None:  # pragma: no cover - CLI
         root = Path(arg).expanduser() if arg else Path.home() / ".claude/projects"
     elif cmd in ("sweep", "backfill"):
         if arg is None and cmd == "sweep":
-            hook = json.loads(sys.stdin.read() or "{}")
+            # CLI-only (`# pragma: no cover - CLI`) — never runs on osiris-mcp's own event
+            # loop, but wrapped anyway (blocking-transcript-read guard, Thoth mail 10988:
+            # "wrap and move on") for a ratchet that reads 0 with no carved exemption.
+            stdin_text = asyncio.run(asyncio.to_thread(sys.stdin.read))
+            hook = json.loads(stdin_text or "{}")
             arg = hook.get("transcript_path")
         if not arg:
             raise SystemExit(f"{cmd} needs a transcript path")

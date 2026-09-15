@@ -1686,8 +1686,7 @@ def create_app(pool: asyncpg.Pool | None = None) -> FastAPI:
             watermark = await asyncio.to_thread(_file_size, path)
             while (not request.app.state.shutting_down.is_set()
                   and not await request.is_disconnected()):
-                lines, watermark = await asyncio.to_thread(
-                    _read_chunk, path, watermark, 512 * 1024)
+                lines, watermark = await _read_chunk(path, watermark, 512 * 1024)
                 text, _cwd = distill(lines) if lines else ("", None)
                 if text:
                     yield f"data: {_json.dumps({'text': text})}\n\n"

@@ -54,8 +54,8 @@ def _write_swarm(tmp_path: Path) -> Path:
     return session
 
 
-def test_scan_reads_each_subagents_OWN_model(tmp_path: Path) -> None:
-    by = {s.handle: s for s in scan_subagents(_write_swarm(tmp_path))}
+async def test_scan_reads_each_subagents_OWN_model(tmp_path: Path) -> None:
+    by = {s.handle: s for s in await scan_subagents(_write_swarm(tmp_path))}
     # the whole point: the model comes from the child's OWN transcript, not the parent's
     assert by["child01"].model == "claude-sonnet-5"
     assert by["gc000002"].model == "claude-haiku-4-5-20251001"
@@ -67,9 +67,9 @@ def test_scan_reads_each_subagents_OWN_model(tmp_path: Path) -> None:
     assert by["gc000002"].model_history == ("claude-haiku-4-5-20251001",)
 
 
-def test_resolve_parents_is_deterministic_from_tooluseid(tmp_path: Path) -> None:
-    subs = scan_subagents(_write_swarm(tmp_path))
-    parents = resolve_parents(subs)
+async def test_resolve_parents_is_deterministic_from_tooluseid(tmp_path: Path) -> None:
+    subs = await scan_subagents(_write_swarm(tmp_path))
+    parents = await resolve_parents(subs)
     # grandchild's toolUseId (tu-gc) was emitted by the child's transcript → child is the parent
     assert parents["agent:gc000002"] == "agent:child01"
     # child's toolUseId (tu-child) emitted by no sibling → the root session spawned it
@@ -234,7 +234,7 @@ def _assistant_tool(model: str, tool_name: str) -> str:
     return json.dumps({"type": "assistant", "message": {"model": model, "content": content}})
 
 
-def test_backed_by_observation_distinguishes_look_from_hearsay(tmp_path: Path) -> None:
+async def test_backed_by_observation_distinguishes_look_from_hearsay(tmp_path: Path) -> None:
     """Tier-1 act-detection (ruling 108ff2e8): an agent that ran its OWN tool looked; one whose
     only tool_use is an Agent spawn merely heard a child. The credence rebuttal reads this."""
     session = tmp_path / "-home-x-code-demo" / "abc12345-2222-491e-9ac2-af94587b18ab"
@@ -248,7 +248,7 @@ def test_backed_by_observation_distinguishes_look_from_hearsay(tmp_path: Path) -
     (subs / "agent-hears002.meta.json").write_text(json.dumps(
         {"agentType": "x", "description": "d", "toolUseId": "th", "spawnDepth": 1}))
     (subs / "agent-hears002.jsonl").write_text(_assistant("claude-opus-4-8", "tu-x") + "\n")
-    by = {s.handle: s for s in scan_subagents(session)}
+    by = {s.handle: s for s in await scan_subagents(session)}
     assert by["looker01"].backed_by_observation is True
     assert by["hears002"].backed_by_observation is False
 

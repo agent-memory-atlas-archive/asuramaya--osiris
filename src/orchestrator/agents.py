@@ -3779,7 +3779,7 @@ async def live_succession(
             main = locate_current_transcript(
                 Path.home() / ".claude/projects", row["job_dir"], anchored_only=True)
             if main is not None:
-                _cur, _hist, deliberate = model_of_transcript(main)
+                _cur, _hist, deliberate = await model_of_transcript(main)
         except OSError:
             deliberate = False
         # EARNED-PULSE (THE EARNED-PULSE COLUMN, thread 870d7391, operator ruling
