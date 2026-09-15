@@ -34,6 +34,10 @@ STRUCTURAL_LINK_TYPES: frozenset[str] = frozenset({
     # membership / identity -- an object's own place in the fleet, not a claim about
     # what it says or means
     "in_repo", "works_in", "acts_for", "authored_by", "spawned_by",
+    # a MachineIdentity's own standing relationship to the SoftwareProject it commits
+    # for (ruling edb6b0fc) -- same membership/identity shape as authored_by/in_repo
+    # just above, not a claim about content.
+    "committer_for",
     # dispatch / addressing -- who a message or broadcast reaches, not content
     "sent_by", "addressed_to", "broadcast_to", "replies_to", "in_thread",
     "holds",
@@ -52,6 +56,10 @@ SEMANTIC_LINK_TYPES_KNOWN: frozenset[str] = frozenset({
     "refuted_by", "killed_by", "implements", "rediscovers", "narrows", "peer_of",
     "produced", "derived_from", "authorized_by", "evaluated_by", "ruled_by", "revises",
     "mentions", "noted_in", "not_same_as",
+    # same_as (identity merge, loser -> winner, e.g. the MachineIdentity same_as
+    # bridge, ruling edb6b0fc): a real claim about content ("this IS that"), same
+    # class as its own negation not_same_as just above -- not membership.
+    "same_as",
     # lineage-of-FACT (succession/authorship across agent generations): a real claim
     # ("this session's own words descend from that one's"), and per Thoth's own mail
     # 10595 listed as semantic, not structural -- pulling on it doesn't bundle by

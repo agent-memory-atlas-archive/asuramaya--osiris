@@ -921,7 +921,12 @@ def _tool_chars(t: Any) -> int:
 # new capability, no existing tool exposes a caller-scoped last_seen refresh.
 # 86 -> 87 (2026-09-14, Khnum, THE MIGRATION DOOR, Thoth mail 10609): layout_migrate —
 # see TOOL_CONTRACT_CEILING_CHARS's own changelog entry just above for the full reason.
-TOOL_CONTRACT_EXPECTED_COUNT = 87
+# 87 -> 88 (2026-09-15, Imhotep, thread 2619f011, ruling edb6b0fc): declare_machine_
+# identity — the manual override door for git ingest's own MachineIdentity heuristic
+# (a bot on a real-looking domain, a local part matching no ingested repo). Genuinely
+# new capability, no existing tool mints this object type or bridges a Person via
+# same_as on demand.
+TOOL_CONTRACT_EXPECTED_COUNT = 88
 # 116 -> 117 (2026-09-04, Seshat, #203/Thoth dispatch 6966, decision a49d2730/38755abe):
 # list_unfiled_threads — the H-bucket instrument gap: a Thread filter on absence of an
 # in_repo edge (plus source=/kind= equality), paginated, that no existing door provided
@@ -1608,7 +1613,12 @@ TOOL_CONTRACT_EXPECTED_COUNT = 87
 # ('object', a bare-junk-object retirement door) — a genuine new capability documented
 # in its existing docstring, no new @mcp.tool(), tool count unchanged. Measured exact
 # (139,260).
-TOOL_CONTRACT_CEILING_CHARS = 139260
+# -> 140267 (2026-09-15, Imhotep, thread 2619f011, ruling edb6b0fc): declare_machine_
+# identity — a NEW @mcp.tool() (87 -> 88 tools, see TOOL_CONTRACT_EXPECTED_COUNT's own
+# changelog entry just below), the manual override for git ingest's own MachineIdentity
+# heuristic. Genuinely new capability, no existing tool it could parameterize. Measured
+# exact (140,267).
+TOOL_CONTRACT_CEILING_CHARS = 140267
 
 def test_ceiling_has_exactly_one_executable_assignment() -> None:
     """THE RATCHET'S OWN GUARD (thread c655c757). This file used to carry every historical

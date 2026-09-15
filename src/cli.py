@@ -5033,6 +5033,47 @@ async def cmd_correct_agent_house(
     return 0
 
 
+async def cmd_declare_machine_identity(
+    email: str, project: str, *, because: str, actor: str, pool: asyncpg.Pool | None = None,
+) -> int:
+    """osiris declare-machine-identity <email> <project> --because W [--actor W] — the
+    console-script door onto ingest.gitlog.declare_machine_identity, the SAME function
+    the declare_machine_identity MCP tool wraps (ruling edb6b0fc): covers what git
+    ingest's own heuristic misses — a bot on a real-looking domain, a local part that
+    doesn't match any ingested repo's own name."""
+    from src.actions.core import Actions
+    from src.ingest.gitlog import declare_machine_identity as _declare
+
+    owns_pool = pool is None
+    if pool is None:
+        from src.config.dev_env import apply_dev_fallback
+        from src.config.settings import get_settings
+        from src.db.pool import create_pool
+
+        apply_dev_fallback()
+        settings = get_settings()
+        try:
+            pool = await create_pool(
+                settings.database_url, min_size=1, max_size=2,
+                application_name="osiris-cli:declare-machine-identity")
+        except Exception as exc:  # noqa: BLE001 - the CLI boundary: report, no raw traceback
+            print(f"osiris declare-machine-identity: could not reach postgres at "
+                  f"{settings.database_url} — {exc}. Set DATABASE_URL, or start the dev "
+                  "instance.", file=sys.stderr)
+            return 1
+    try:
+        out = await _declare(Actions(pool), email=email, project=project, because=because,
+                             actor=actor)
+    finally:
+        if owns_pool:
+            await pool.close()
+    if "error" in out:
+        print(f"osiris declare-machine-identity: refused — {out['error']}", file=sys.stderr)
+        return 1
+    print(f"declared {out['machine_identity']} -> {out['project']}: {out}")
+    return 0
+
+
 async def cmd_reconcile_merge(
     dupe: str, into: str, *, actor: str, pool: asyncpg.Pool | None = None,
 ) -> int:
@@ -6547,7 +6588,7 @@ COMMANDS, GROUPED BY WHAT YOU'RE TRYING TO DO:
                         establish-office, resync-seat-house, reconcile-seat-identity,
                         create-project, rename-project, retire-project, fork-project,
                         set-project-tag, proposal, settings, retire-assertion,
-                        retire-link, retire-object, cite
+                        retire-link, retire-object, cite, declare-machine-identity
   operate               deploy, migrate, seed, bootstrap, retention, rematerialize,
                         fleet-reconcile, fleet-prune, backfill, layout
 
@@ -7411,6 +7452,23 @@ def _build_parser() -> argparse.ArgumentParser:
                                        help=f"who is performing this correction — "
                                             f"defaults to {_CONSOLE_ACTOR!r}")
 
+    p_declare_machine = sub.add_parser(
+        "declare-machine-identity", description=_d(
+            "manually mint/link a MachineIdentity git ingest's own heuristic missed "
+            "(ruling edb6b0fc) — a bot on a real-looking domain, a local part that "
+            "doesn't match any ingested repo's own name"),
+        epilog="example: osiris declare-machine-identity ci@example.com osiris "
+               "--because 'CI bot, real-looking domain, heuristic never fires'")
+    p_declare_machine.add_argument("email", help="the commit author email to declare")
+    p_declare_machine.add_argument("project", help="a bare repo name (e.g. 'osiris' for "
+                                   "repo:osiris) — must already be an ingested SoftwareProject")
+    p_declare_machine.add_argument("--because", required=True,
+                                   help="why this identity is a machine, not a person — "
+                                        "required, never silent")
+    p_declare_machine.add_argument("--actor", default=_CONSOLE_ACTOR,
+                                   help=f"who is making this declaration — defaults to "
+                                        f"{_CONSOLE_ACTOR!r}")
+
     p_reconcile_merge = sub.add_parser(
         "reconcile-merge", description=_d(
             "repair the estate a partial first fold left stranded on an ALREADY-MERGED "
@@ -8094,6 +8152,9 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(cmd_correct_agent_house(
             args.seat, project=args.project, seat_generation=args.seat_generation,
             actor=args.actor))
+    if args.command == "declare-machine-identity":
+        return asyncio.run(cmd_declare_machine_identity(
+            args.email, args.project, because=args.because, actor=args.actor))
     if args.command == "reconcile-merge":
         return asyncio.run(cmd_reconcile_merge(args.dupe, args.into, actor=args.actor))
     if args.command == "retire-agent":
