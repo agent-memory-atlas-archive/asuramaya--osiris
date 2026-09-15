@@ -564,6 +564,139 @@ def _neighbor_cell_indices(
     return out
 
 
+_DECLUMP_VECTORIZE_THRESHOLD = 400  # pair count above which a vectorized numpy pass
+                                    # beats a plain Python loop -- BELOW it, numpy's
+                                    # own fixed per-call overhead (building small
+                                    # arrays, meshgrid, norm) costs MORE than just
+                                    # looping: measured live, the sparse 60,000-point
+                                    # performance test (near-empty cells almost
+                                    # everywhere) went from ~20s with a plain loop to
+                                    # 78s fully vectorized. The reverse (a live
+                                    # specimen, one cell holding 6,131 points) is what
+                                    # justifies the vectorized path existing at all --
+                                    # see `_resolve_cell_pair`'s own docstring.
+_DECLUMP_MAX_VECTORIZE_PAIRS = 5_000_000  # ~80 MB delta array ceiling (THE
+                                          # COLLAPSED-CONTAINER FIX, Thoth mail
+                                          # 11111, item (b) "cap per-cell work") --
+                                          # defense in depth: the LAYOUT fix
+                                          # (container gravity scaled by
+                                          # 1/sqrt(member count)) should keep any
+                                          # post-FR cell under ~50 points (2,500
+                                          # same-cell pairs) before this ever
+                                          # matters, but a cell denser than this
+                                          # falls back to the slow-but-memory-safe
+                                          # loop instead of a huge vectorized array.
+
+
+def _resolve_cell_pair_loop(
+    pos: np.ndarray, a_idx: np.ndarray, b_idx: np.ndarray, *, same_cell: bool,
+    min_sep: float, ids: list[uuid.UUID], other_pos: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray | None, bool] | None:
+    """The plain per-pair Python loop, kept for the SMALL-candidate-count case
+    (`_DECLUMP_VECTORIZE_THRESHOLD`'s own docstring) -- cheaper than numpy's fixed
+    per-call overhead when there's almost nothing to check, which is the common
+    case for any reasonably spread population."""
+    b_pos_arr = other_pos if other_pos is not None else pos
+    push_a = np.zeros((len(a_idx), 2))
+    push_b = None if other_pos is not None else np.zeros((len(b_idx), 2))
+    moved = False
+    for ri, i in enumerate(a_idx):
+        for rj, j in enumerate(b_idx):
+            if same_cell and j <= i:
+                continue
+            d = pos[i] - b_pos_arr[j]
+            dist = float(math.hypot(d[0], d[1]))
+            if dist >= min_sep:
+                continue
+            moved = True
+            if dist < 1e-9:
+                tag = "declump" if other_pos is None else "declump-anchor"
+                j_key = ids[int(j)] if other_pos is None else int(j)
+                a = _hash01(f"{tag}:{ids[int(i)]}:{j_key}") * 2 * math.pi
+                d = np.array([math.cos(a), math.sin(a)])
+                dist = 1.0
+            deficit = min_sep - dist
+            direction = d / dist
+            if other_pos is not None:
+                push_a[ri] = push_a[ri] + direction * deficit
+            else:
+                push_a[ri] = push_a[ri] + direction * deficit / 2
+                push_b[rj] = push_b[rj] - direction * deficit / 2  # type: ignore[index]
+    if not moved:
+        return None
+    return push_a, push_b, True
+
+
+def _resolve_cell_pair(
+    pos: np.ndarray, a_idx: np.ndarray, b_idx: np.ndarray, *, same_cell: bool,
+    min_sep: float, ids: list[uuid.UUID], other_pos: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray | None, bool] | None:
+    """THE DENSE-CELL FIX (Thoth mail 11109/11110 -- a live specimen: one grid cell
+    held 6,131 post-FR points, 634 million candidate PAIRS in a pure-Python loop on
+    the FIRST declump iteration alone, ~130s and multi-GB just from Python-level
+    tuple/float overhead at that count). Resolves every pair between `a_idx` (this
+    cell's own movable points) and `b_idx` (a neighbor cell's points, or itself when
+    `same_cell`, or an anchor cell's points when `other_pos` is given) in ONE
+    vectorized numpy pass bounded by `len(a_idx) * len(b_idx)` -- the worst real
+    cell (6,131^2 * 16 bytes =~ 600 MB for a same-cell pass) is a real but bounded
+    and FAST cost, not 634M individual Python-level comparisons. Returns
+    `(push_on_a, push_on_b_or_None, moved)` -- `push_on_b` is None when `other_pos`
+    is given (anchors never move, full deficit already folded into `push_on_a`).
+
+    HYBRID (`_DECLUMP_VECTORIZE_THRESHOLD`): delegates to `_resolve_cell_pair_loop`
+    for a small candidate count instead -- the vectorized path's own fixed overhead
+    costs more than it saves when there's almost nothing to check, the common case
+    for any reasonably spread population. Also delegates for a pair count ABOVE
+    `_DECLUMP_MAX_VECTORIZE_PAIRS` -- see that constant's own docstring: a cell
+    this dense should never occur after the layout fix, but if one does, slow-and-
+    memory-safe beats fast-and-OOMing."""
+    pair_count = (
+        len(a_idx) * (len(a_idx) - 1) // 2 if same_cell else len(a_idx) * len(b_idx))
+    if pair_count == 0:
+        return None
+    if not _DECLUMP_VECTORIZE_THRESHOLD <= pair_count <= _DECLUMP_MAX_VECTORIZE_PAIRS:
+        return _resolve_cell_pair_loop(
+            pos, a_idx, b_idx, same_cell=same_cell, min_sep=min_sep, ids=ids,
+            other_pos=other_pos)
+
+    b_pos = other_pos[b_idx] if other_pos is not None else pos[b_idx]
+    delta = pos[a_idx][:, None, :] - b_pos[None, :, :]
+    dist = np.linalg.norm(delta, axis=2)
+    if same_cell:
+        ru, cu = (a.ravel() for a in np.triu_indices(len(a_idx), k=1))
+    else:
+        mesh_r, mesh_c = np.meshgrid(
+            np.arange(len(a_idx)), np.arange(len(b_idx)), indexing="ij")
+        ru, cu = mesh_r.ravel(), mesh_c.ravel()
+    if len(ru) == 0:
+        return None
+    dd = dist[ru, cu]
+    close = dd < min_sep
+    if not close.any():
+        return None
+    sel_r, sel_c, sel_d = ru[close], cu[close], dd[close].copy()
+    sel_delta = delta[sel_r, sel_c].copy()
+    zero_idx = np.where(sel_d < 1e-9)[0]
+    for z in zero_idx:
+        gi, gj = int(a_idx[sel_r[z]]), int(b_idx[sel_c[z]])
+        tag = "declump" if other_pos is None else "declump-anchor"
+        gj_key = ids[gj] if other_pos is None else gj
+        a = _hash01(f"{tag}:{ids[gi]}:{gj_key}") * 2 * math.pi
+        sel_delta[z] = (math.cos(a), math.sin(a))
+        sel_d[z] = 1.0
+    deficit = min_sep - sel_d
+    direction = sel_delta / sel_d[:, None]
+    push_full = direction * deficit[:, None]
+
+    push_a = np.zeros((len(a_idx), 2))
+    np.add.at(push_a, sel_r, push_full if other_pos is not None else push_full / 2)
+    push_b = None
+    if other_pos is None:
+        push_b = np.zeros((len(b_idx), 2))
+        np.add.at(push_b, sel_c, -push_full / 2)
+    return push_a, push_b, True
+
+
 def _declump(
     pos: np.ndarray, anchor_pos: np.ndarray, ids: list[uuid.UUID], *,
     min_sep: float = _MIN_SEPARATION, iterations: int = 30,
@@ -582,59 +715,62 @@ def _declump(
     SPATIAL-HASH GRID, not a pairwise array (THE PHYSICS LAYOUT OOM FIX, Thoth mail
     11097) -- see `_grid_cells`'s own docstring for the memory story. Anchors are
     bucketed ONCE, outside the iteration loop, since they never move; movable points
-    are re-bucketed each iteration since `pos` changes. Candidate pairs within a
-    cell-plus-neighbors group are still checked with a plain per-pair loop (numpy
-    only, no scipy) -- cheap because the grid keeps the candidate COUNT near O(n) for
-    any reasonably spread population, not because any single comparison is fast."""
+    are re-bucketed each iteration since `pos` changes.
+
+    CELL-PAIR VECTORIZED, not a per-point Python loop (THE DENSE-CELL FIX, Thoth
+    mail 11109/11110) -- see `_resolve_cell_pair`'s own docstring for the live
+    specimen this fixes. The outer loop is now over CELL PAIRS (bounded: at most 9x
+    the number of occupied cells), each resolved in one numpy pass over that pair's
+    own combined point count -- bounded by the size of the densest cell actually
+    found, never by the whole population `n`."""
     anchor_cells = _grid_cells(anchor_pos, min_sep) if len(anchor_pos) else {}
     for _ in range(iterations):
         moved = False
         disp = np.zeros_like(pos)
         cells = _grid_cells(pos, min_sep)
-        seen: set[tuple[int, int]] = set()
-        for (cx, cy), idxs in cells.items():
-            candidates = _neighbor_cell_indices(cells, cx, cy)
-            for i in idxs:
-                for j in candidates:
-                    if j <= i:
+        seen_cell_pairs: set[tuple[tuple[int, int], tuple[int, int]]] = set()
+        for (cx, cy), idxs_a in cells.items():
+            key_a = (cx, cy)
+            a_idx = np.asarray(idxs_a, dtype=np.int64)
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    key_b = (cx + dx, cy + dy)
+                    idxs_b = cells.get(key_b)
+                    if idxs_b is None:
                         continue
-                    pair = (i, j)
-                    if pair in seen:
+                    pair_key = (key_a, key_b) if key_a <= key_b else (key_b, key_a)
+                    if pair_key in seen_cell_pairs:
                         continue
-                    seen.add(pair)
-                    d = pos[i] - pos[j]
-                    dist = float(math.hypot(d[0], d[1]))
-                    if dist >= min_sep:
+                    seen_cell_pairs.add(pair_key)
+                    resolved = _resolve_cell_pair(
+                        pos, a_idx, np.asarray(idxs_b, dtype=np.int64),
+                        same_cell=key_b == key_a, min_sep=min_sep, ids=ids)
+                    if resolved is None:
                         continue
-                    moved = True
-                    if dist < 1e-9:
-                        a = _hash01(f"declump:{ids[i]}:{ids[j]}") * 2 * math.pi
-                        d = np.array([math.cos(a), math.sin(a)])
-                        dist = 1.0
-                    deficit = min_sep - dist
-                    direction = d / dist
-                    disp[i] = disp[i] + direction * deficit / 2
-                    disp[j] = disp[j] - direction * deficit / 2
+                    push_a, push_b, moved_here = resolved
+                    moved = moved or moved_here
+                    disp[a_idx] += push_a
+                    if push_b is not None:
+                        disp[np.asarray(idxs_b, dtype=np.int64)] += push_b
         pos = pos + disp
 
         if len(anchor_pos):
             disp2 = np.zeros_like(pos)
-            for i in range(len(pos)):
-                cx = int(math.floor(pos[i, 0] / min_sep))
-                cy = int(math.floor(pos[i, 1] / min_sep))
-                for k in _neighbor_cell_indices(anchor_cells, cx, cy):
-                    d = pos[i] - anchor_pos[k]
-                    dist = float(math.hypot(d[0], d[1]))
-                    if dist >= min_sep:
-                        continue
-                    moved = True
-                    if dist < 1e-9:
-                        a = _hash01(f"declump-anchor:{ids[i]}:{k}") * 2 * math.pi
-                        d = np.array([math.cos(a), math.sin(a)])
-                        dist = 1.0
-                    deficit = min_sep - dist
-                    direction = d / dist
-                    disp2[i] = disp2[i] + direction * deficit
+            movable_cells = _grid_cells(pos, min_sep)
+            for (cx, cy), idxs_a in movable_cells.items():
+                candidate_anchor_idx = _neighbor_cell_indices(anchor_cells, cx, cy)
+                if not candidate_anchor_idx:
+                    continue
+                a_idx = np.asarray(idxs_a, dtype=np.int64)
+                b_idx = np.asarray(candidate_anchor_idx, dtype=np.int64)
+                resolved = _resolve_cell_pair(
+                    pos, a_idx, b_idx, same_cell=False, min_sep=min_sep, ids=ids,
+                    other_pos=anchor_pos)
+                if resolved is None:
+                    continue
+                push_a, _push_b, moved_here = resolved
+                moved = moved or moved_here
+                disp2[a_idx] += push_a
             pos = pos + disp2
 
         if not moved:

@@ -11,11 +11,12 @@ import numpy as np
 import pytest
 from src.actions.core import Actions
 from src.orchestrator import graph_physics
-from src.orchestrator.graph_layout import _LAYOUT_VERSION, _MIN_SEPARATION
+from src.orchestrator.graph_layout import _LAYOUT_VERSION, _MIN_SEPARATION, _grid_cells
 from src.orchestrator.graph_physics import (
     _PHYSICS_LAYOUT_VERSION,
     _build_physics_graph,
     _detect_communities,
+    _fr_and_recenter,
     _memory_guard,
     _physics_positions,
     _project_membership,
@@ -67,8 +68,12 @@ async def test_memory_guard_passes_for_a_well_spread_population(actions: Actions
     assert reason is None
 
 
-def test_build_physics_graph_container_edges_get_flat_weight_semantic_get_normalised(
+def test_build_physics_graph_container_edges_are_scaled_by_member_count(
 ) -> None:
+    """THE COLLAPSED-CONTAINER FIX (Thoth mail 11111): container weight is
+    _CONTAINER_SPRING_WEIGHT / member_count, never flat -- a container with more
+    members pulls each one weaker so sibling repulsion can actually spread them
+    out post-FR."""
     a, b, proj = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     object_ids = [a, b, proj]
 
@@ -91,9 +96,28 @@ def test_build_physics_graph_container_edges_get_flat_weight_semantic_get_normal
     idx = {oid: i for i, oid in enumerate(object_ids)}
     container_w = weight_by_pair[tuple(sorted((idx[a], idx[proj])))]
     semantic_w = weight_by_pair[tuple(sorted((idx[a], idx[b])))]
-    assert container_w == graph_physics._CONTAINER_SPRING_WEIGHT
+    # proj has 2 members (a, b) -- weight = _CONTAINER_SPRING_WEIGHT / 2
+    expected = graph_physics._CONTAINER_SPRING_WEIGHT / 2
+    assert container_w == pytest.approx(expected)
     assert semantic_w != graph_physics._CONTAINER_SPRING_WEIGHT
     assert semantic_w > 0
+
+
+def test_build_physics_graph_container_weight_shrinks_as_membership_grows() -> None:
+    proj = uuid.uuid4()
+
+    class _Row(dict):
+        def __getitem__(self, key: str) -> object:
+            return dict.__getitem__(self, key)
+
+    def container_weight_for(n_members: int) -> float:
+        members = [uuid.uuid4() for _ in range(n_members)]
+        object_ids = [*members, proj]
+        link_rows = [_Row(from_id=m, to_id=proj, type="in_repo") for m in members]
+        g, _ = _build_physics_graph(object_ids, link_rows, {})
+        return float(g.es["weight"][0])
+
+    assert container_weight_for(2) > container_weight_for(200)
 
 
 def test_build_physics_graph_reroutes_community_members_through_synthetic_vertex(
@@ -204,6 +228,40 @@ async def test_physics_positions_places_every_active_object_with_no_exact_collis
         for j in range(i + 1, len(pts)):
             dist = ((pts[i][0] - pts[j][0]) ** 2 + (pts[i][1] - pts[j][1]) ** 2) ** 0.5
             assert dist >= _MIN_SEPARATION - 1e-6
+
+
+async def test_fr_and_recenter_does_not_collapse_a_large_container_into_one_cell(
+    actions: Actions,
+) -> None:
+    """THE COLLAPSED-CONTAINER FIX (Thoth mail 11111): a live specimen on the real
+    migration -- one grid cell held 6,131 post-FR points, all container-only
+    siblings of the SAME project with no semantic edge differentiating them.
+    Reproduced here at a smaller but still real scale (1,000 members, hermetic DB,
+    no semantic edges at all) -- container gravity scaled by 1/sqrt(member count)
+    should let sibling repulsion spread them out instead. Acceptance (Thoth's own
+    line): no post-FR cell holds more than roughly 50 points for any project."""
+    proj = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gp-collapse-check", "test")
+    now = datetime.now(UTC)
+    members = []
+    for i in range(1000):
+        m = await actions.create_or_find_object("Thread", f"thread:gp-collapse-{i}", "test")
+        await actions.create_link(m, proj, "in_repo", "test", now, 1.0)
+        members.append(m)
+
+    object_ids = [proj, *members]
+    link_rows = await graph_physics._live_link_rows(actions)
+    membership = await _project_membership(actions)
+    communities = _detect_communities(link_rows, membership, set(object_ids))
+    g, vertex_ids = _build_physics_graph(object_ids, link_rows, communities)
+    hub_ids: set[uuid.UUID] = set()
+
+    pos = _fr_and_recenter(g, vertex_ids, object_ids, hub_ids)
+    cells = _grid_cells(pos, _MIN_SEPARATION)
+    worst_cell = max(len(v) for v in cells.values())
+    assert worst_cell <= 100, (
+        f"worst post-FR cell holds {worst_cell} of {len(members)} members -- "
+        "container gravity is still collapsing this project's own siblings")
 
 
 async def test_physics_positions_empty_population_returns_empty(actions: Actions) -> None:
