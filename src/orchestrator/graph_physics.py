@@ -682,7 +682,20 @@ def _place_unfiled(
     with none scatters as a proper isotropic 2D Gaussian (Box-Muller polar form)
     centred on the whole placed cloud's own centroid, std from that cloud's own
     spread -- density falls off smoothly outward instead of the fixed-radius ring
-    Thoth's own measurement flagged as a spike on the v7 layout."""
+    Thoth's own measurement flagged as a spike on the v7 layout.
+
+    THE UNFILED-VS-PLACED FIX (live specimen, THIRD real migration attempt on
+    bcf0ca63): a naive neighbour-mean placement can drop an unfiled object right
+    on top of an already-densely-packed project -- one run's own pre-declump
+    positions were 205 units apart, converging to 0.058 apart post-declump. The
+    single GLOBAL `_declump` pass at the very end of `_physics_positions` couldn't
+    always finish that local cleanup within its own iteration budget once the
+    target region was already near floor density from real project members. Runs
+    its OWN local `_declump` pass here instead, with every already-placed position
+    as a FIXED anchor -- the SAME anchor-vs-movable mode `_declump` already
+    supports (used unchanged, no new mechanism), just invoked at the point of
+    insertion instead of leaving all the decluttering work to one pass over the
+    whole population at the end."""
     neighbours: dict[uuid.UUID, list[np.ndarray]] = defaultdict(list)
     unfiled_set = set(unfiled_ids)
     for r in link_rows:
@@ -714,6 +727,15 @@ def _place_unfiled(
             angle = u2 * 2 * math.pi
             out[oid] = cloud_center + np.array(
                 [radius * math.cos(angle), radius * math.sin(angle)])
+
+    if out and placed:
+        ids_order = list(out.keys())
+        pos = np.array([out[oid] for oid in ids_order])
+        anchor_pos = np.array(list(placed.values()))
+        pos = _declump(
+            pos, anchor_pos, ids_order, min_sep=_MIN_SEPARATION,
+            iterations=_PHYSICS_DECLUMP_ITERATIONS)
+        out = {oid: pos[i] for i, oid in enumerate(ids_order)}
     return out
 
 
