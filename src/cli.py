@@ -730,7 +730,8 @@ async def cmd_graph_export(
 # --- layout ----------------------------------------------------------------------------------
 
 async def cmd_layout(
-    *, limit: int | None = None, pool: asyncpg.Pool | None = None,
+    *, limit: int | None = None, physics: bool = False,
+    pool: asyncpg.Pool | None = None,
 ) -> int:
     """osiris layout --migrate — THE MIGRATION DOOR (Thoth mail 10609, product law:
     every action has a door): loops the SAME `graph_layout.layout_batch` the cron
@@ -739,9 +740,16 @@ async def cmd_layout(
     cadence (a real migration otherwise takes hours). Refuses cleanly (exit 1) if the
     heartbeat is mid-tick and already holds the layout lock — direct-to-Postgres,
     headless, same Pattern B shape as `osiris lint`/`osiris graph-export`, since this
-    is a bulk operator act, not an MCP round trip."""
+    is a bulk operator act, not an MCP round trip.
+
+    osiris layout --physics (THE PHYSICS LAYOUT, Thoth mail 11047):
+    `graph_physics.run_physics_migrate` instead — a SINGLE global force simulation
+    over the whole active graph, never a batch loop (springs pull across the entire
+    graph, not just within a batch, so this genuinely cannot be sliced the way the
+    old sunflower scheme could be) — `limit` is meaningless here and ignored."""
     from src.actions.core import Actions
     from src.orchestrator.graph_layout import run_layout_migrate
+    from src.orchestrator.graph_physics import run_physics_migrate
 
     owns_pool = pool is None
     if pool is None:
@@ -762,6 +770,19 @@ async def cmd_layout(
     try:
         actions = Actions(pool)
         rc = 0
+        if physics:
+            async for receipt in run_physics_migrate(actions):
+                if "error" in receipt:
+                    print(f"osiris layout: {receipt['error']}", file=sys.stderr)
+                    rc = 1
+                    break
+                if "stage" in receipt:
+                    print(f"osiris layout: {receipt['stage']}"
+                          + (f" ({receipt['count']})" if "count" in receipt else ""))
+                elif receipt.get("done"):
+                    print(f"osiris layout: done — {receipt['placed']} objects placed "
+                          "under the physics layout")
+            return rc
         async for receipt in run_layout_migrate(actions, limit=limit):
             if "error" in receipt:
                 print(f"osiris layout: {receipt['error']}", file=sys.stderr)
@@ -6705,15 +6726,20 @@ def _build_parser() -> argparse.ArgumentParser:
     p_layout = sub.add_parser("layout", description=_d(
         "THE MIGRATION DOOR (Thoth mail 10609) — drives the layout heartbeat's own "
         "graph_layout.layout_batch to quiescence right now, instead of waiting on "
-        "its 5-minute cron cadence; refuses if the heartbeat is mid-tick"),
-        epilog="example: osiris layout --migrate")
+        "its 5-minute cron cadence; refuses if the heartbeat is mid-tick. "
+        "--physics (THE PHYSICS LAYOUT, Thoth mail 11047) runs graph_physics."
+        "run_physics_migrate instead — a single global force simulation over the "
+        "whole active graph, never a batch loop; --limit is meaningless with it"),
+        epilog="example: osiris layout --migrate\nexample: osiris layout --physics")
     p_layout.add_argument("--migrate", action="store_true",
-                          help="the only mode today — loop layout_batch until every "
-                               "object carries the current graph_layout_v, printing "
-                               "one receipt per batch")
+                          help="loop layout_batch until every object carries the "
+                               "current graph_layout_v, printing one receipt per batch")
+    p_layout.add_argument("--physics", action="store_true",
+                          help="THE PHYSICS LAYOUT's own one-shot migration — a single "
+                               "global force simulation, not a batch loop")
     p_layout.add_argument("--limit", type=int, default=None,
                           help="objects per batch (default: the live layout.batch_size "
-                               "setting, itself defaulting to 1000)")
+                               "setting, itself defaulting to 1000) — --migrate only")
 
     p_audit = sub.add_parser("audit", description=_d(
         "headless mirror of graph_lint's own CMD-K audit siblings — one door for all "
@@ -8004,10 +8030,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "graph-export":
         return asyncio.run(cmd_graph_export(out=args.out, as_json=args.as_json))
     if args.command == "layout":
-        if not args.migrate:
-            print("osiris layout: pass --migrate (the only mode today)", file=sys.stderr)
+        if not args.migrate and not args.physics:
+            print("osiris layout: pass --migrate or --physics", file=sys.stderr)
             return 1
-        return asyncio.run(cmd_layout(limit=args.limit))
+        return asyncio.run(cmd_layout(limit=args.limit, physics=args.physics))
     if args.command == "audit":
         return asyncio.run(cmd_audit(args.name, as_json=args.as_json))
     if args.command == "seed":

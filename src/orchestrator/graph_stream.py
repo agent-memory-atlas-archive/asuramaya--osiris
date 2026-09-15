@@ -29,9 +29,12 @@ quietly:
      the frozen shape resolved node type/project codes but left `edge_type_code`
      nameless, which she needs for real relationship color-coding rather than a raw
      hash-on-int placeholder.
-  4. `link_type_class` -- index-aligned to `edge_types`, "structural"|"semantic" per
-     Thoth's THE READING LAYER dispatch (ruling c5953bb1) and src.ontology.link_classes
-     (agreed with Seshat by DM, mail 10604, before this was committed). She reads the
+  4. `link_type_class` -- index-aligned to `edge_types`, "structural"|"semantic" (as
+     of THE PHYSICS LAYOUT, ruling d7d55257: "container"|"structural"|"semantic" --
+     container is a flag nested inside the structural class, see
+     src.ontology.link_classes.link_class's own docstring) per Thoth's THE READING
+     LAYER dispatch (ruling c5953bb1) and src.ontology.link_classes (agreed with
+     Seshat by DM, mail 10604, before this was committed). She reads the
      classification off the wire rather than hardcoding a second copy client-side --
      graph_layout.py's own relax pass reads the SAME table to decide which edges are
      allowed to pull two objects together (semantic only, never structural/membership).

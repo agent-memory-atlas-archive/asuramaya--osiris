@@ -1372,6 +1372,14 @@ NEW_TOOL_DECLARATIONS: dict[str, NewToolDeclaration] = {
     # parameterization of any existing tool — no existing door loops a bulk placement
     # pass to quiescence.
     "layout_migrate": {"binding_verb": False},
+    # physics_layout_migrate — THE PHYSICS LAYOUT's own migration door (Thoth mail
+    # 11047, product law): a single global force simulation, never a batch loop the
+    # way layout_migrate is (see graph_physics.run_physics_migrate's own docstring
+    # for why it can't be sliced the same way). Not a seat/office/project binding-
+    # mover; not a parameterization of layout_migrate itself since the two are
+    # genuinely different execution shapes, not one algorithm choice among many on
+    # a shared loop.
+    "physics_layout_migrate": {"binding_verb": False},
     "resume": {"binding_verb": True},
     # proposal(action=...) — miners as last resort, item 2 (decision ac892cd9, Thoth
     # mail 8842/8920/8945): propose/accept/reject over a NEW Proposal object type. Not

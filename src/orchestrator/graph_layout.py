@@ -125,6 +125,35 @@ and (g):
       (`_project_halo_base`), the same sunflower-extent formula with a safety margin,
       tightening around each cluster's own real content instead of a shared worst case.
 graph_layout_v bumped again (5 -> 6) to force the one-time migration this change needs.
+
+THE PHYSICS LAYOUT (operator ruling d7d55257, Thoth mail 11047): the sunflower/
+declump scheme above is retired as the WHOLE-GRAPH placement rule -- see
+src.orchestrator.graph_physics for the real force simulation that replaces it
+(springs for semantic edges, weak container-gravity, nested communities, run once
+per migration, never per-tick). This module keeps every piece that scheme still
+needs: `_declump` (the physics migration's own final collision floor), `relax`
+(this module's ONGOING incremental placement for objects created AFTER a migration
+runs still uses it, just seeded differently -- see `layout_batch`'s own docstring),
+and `_hub_ids` (graph_physics.py's own "universal hub" definition, reused
+unchanged rather than inventing a second one).
+
+`layout_batch`'s OWN placement for a never-before-placed "regular" object changes
+here too: instead of the old sunflower base position (`adjacency_position`,
+project/type/connected-band ranking), a new object now seeds at the CENTROID of its
+already-placed semantic neighbours and live container objects (`_live_containers_of`/
+`_centroid_seed`) -- "initialise at the centroid of placed neighbours (or the
+container centroid)" -- then the SAME bounded local relax as before nudges it from
+that seed, with every already-placed object still pinned. The old sunflower
+functions (`_adjacency_ranks`, `adjacency_position`, `_project_halo_base`,
+`_project_connected_counts`, `_place_projects`, `_relax_projects`, `project_center`)
+are DELIBERATELY LEFT IN PLACE, now unused by any live code path -- a disclosed
+cleanup debt (flagged to Thoth, not silently carried) rather than a large destructive
+removal pass bundled into this same change; their own tests still pass unchanged.
+
+graph_layout_v bumped again (6 -> 7) to force the one-time migration this change
+needs -- run via graph_physics.run_physics_migrate, NOT `run_layout_migrate`'s own
+batch loop (a global force simulation cannot be sliced into independent batches the
+way the old sunflower scheme could; see that module's own docstring).
 """
 from __future__ import annotations
 
@@ -132,6 +161,7 @@ import hashlib
 import json
 import math
 import uuid
+from collections import defaultdict
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
@@ -140,7 +170,7 @@ import asyncpg
 import numpy as np
 
 from src.actions.core import Actions
-from src.ontology.link_classes import STRUCTURAL_LINK_TYPES
+from src.ontology.link_classes import CONTAINER_LINK_TYPES, STRUCTURAL_LINK_TYPES
 
 GRAPH_LAYOUT_SOURCE = "cron:graph_layout"
 _BATCH_SIZE = 1000
@@ -150,7 +180,7 @@ _MAX_STEP = 10.0
 
 # NAVIGABLE SPACE, piece A additions ---------------------------------------------------
 _LAYOUT_VERSION_PROP = "graph_layout_v"
-_LAYOUT_VERSION = 6  # bump this to force one migration pass over every already-placed object
+_LAYOUT_VERSION = 7  # bump this to force one migration pass over every already-placed object
 _RELAX_ITERATIONS = 6  # "a FEW iterations" -- a nudge on top of the deterministic base,
                        # never enough to erase the sunflower structure
 _UNFILED_KEY = "unfiled"  # the same sentinel /graph/supernodes already uses for no-in_repo
@@ -447,6 +477,60 @@ async def _neighbors_of(
         if t in idset:
             out[t].add(f)
     return out
+
+
+async def _live_containers_of(
+    actions: Actions, ids: list[uuid.UUID],
+) -> dict[uuid.UUID, list[uuid.UUID]]:
+    """THE PHYSICS LAYOUT (Thoth mail 11047), item 6: every live CONTAINER_LINK_TYPES
+    target FROM each id -- an object can genuinely have several (its own project via
+    in_repo, an Agent's own works_in project, acts_for principal, spawned_by parent,
+    holds seat, member_of organization), all real candidates for the new-object
+    centroid seed below."""
+    if not ids:
+        return {}
+    rows = await actions.pool.fetch(
+        "SELECT from_id, to_id FROM links "
+        "WHERE from_id = ANY($1::uuid[]) AND type = ANY($2::text[]) "
+        "  AND (valid_until IS NULL OR valid_until > now())",
+        ids, list(CONTAINER_LINK_TYPES))
+    out: dict[uuid.UUID, list[uuid.UUID]] = defaultdict(list)
+    for r in rows:
+        out[r["from_id"]].append(r["to_id"])
+    return out
+
+
+def _centroid_seed(
+    local_rank: int, candidates: list[tuple[float, float]],
+    fallback: tuple[float, float],
+) -> tuple[float, float]:
+    """THE PHYSICS LAYOUT, item 6: "initialise at the centroid of placed neighbours
+    (or the container centroid)" -- a plain mean over whichever already-placed
+    semantic neighbours and live containers a new object has; `fallback` (the
+    unfiled origin) only for the rare genuinely isolated new object with none.
+
+    OFFSET BY A SUNFLOWER POINT keyed on `local_rank` (this object's own index
+    within THIS batch, not a stored global rank -- the seed is used exactly once,
+    at first placement, so cross-tick reproducibility of the offset itself doesn't
+    matter the way it does for a position that's read back later). Several siblings
+    sharing their ONE sole container (no semantic edges of their own) would
+    otherwise all seed at the EXACT same centroid -- a real specimen (40 such
+    siblings, one shared project) hit two compounding failures from that: `relax`'s
+    own repulsion term (~ 1/distance) is explosive between near-coincident starting
+    points, throwing some objects tens of units off course in just a few bounded
+    iterations; and even where relax stayed calm, cramming 40 mutually-~15-unit-
+    apart requirements into `_declump`'s bounded iteration budget from a near-total
+    coincidence left one pair a few thousandths short of `_MIN_SEPARATION` after
+    rounding. A sunflower offset at `_NODE_SPACING` gives every sibling in the SAME
+    batch a real head start already close to the declump floor apart from its
+    fellows, not just off the exact centroid point."""
+    if not candidates:
+        cx, cy = fallback
+    else:
+        cx = sum(p[0] for p in candidates) / len(candidates)
+        cy = sum(p[1] for p in candidates) / len(candidates)
+    lx, ly = _sunflower_point(local_rank, _NODE_SPACING)
+    return cx + lx, cy + ly
 
 
 def _declump(
@@ -837,13 +921,22 @@ async def layout_batch(actions: Actions, *, limit: int | None = None) -> int:
     version. SoftwareProject objects in the batch get THE READING LAYER's own weighted
     force-layout placement (`_place_projects`) and are written FIRST, so every other
     object placed in the SAME tick can look up its own project's real stored center
-    rather than a placeholder. Every other object gets a deterministic sunflower base
-    position (its own project's stored center, its own rank within the (project, type)
-    group -- pinned to rank 0 if it's a structural-degree hub), nudged by a few
-    iterations of intra-project SEMANTIC-only edge attraction anchored on already-
-    placed same-project neighbors, then hard-declumped. Returns how many objects were
-    newly positioned in total (0 when the graph is fully placed under the current
-    version -- the tick's own natural quiescence, no flag needed).
+    rather than a placeholder. Every other object gets a deterministic CENTROID base
+    position (THE PHYSICS LAYOUT, Thoth mail 11047, item 6: the mean of its already-
+    placed semantic neighbours' and live containers' own positions -- `_centroid_seed`/
+    `_live_containers_of` -- falling back to the unfiled origin only when genuinely
+    isolated), nudged by a few iterations of intra-project SEMANTIC-only edge
+    attraction anchored on already-placed same-project neighbors, then hard-declumped.
+    Returns how many objects were newly positioned in total (0 when the graph is fully
+    placed under the current version -- the tick's own natural quiescence, no flag
+    needed).
+
+    THIS IS ONLY THE ONGOING INCREMENTAL RULE for a genuinely new object arriving
+    after a migration has already run -- the migration itself
+    (graph_physics.run_physics_migrate) is a real global force simulation over the
+    whole graph at once, not this function looped to quiescence (see that module's
+    own docstring for why the two are genuinely different shapes, not one reused as
+    the other).
 
     `limit=None` (every real caller -- the cron heartbeat and `run_layout_migrate`)
     reads `layout.batch_size` off the LIVE settings table (Thoth mail 10609, product
@@ -880,24 +973,21 @@ async def layout_batch(actions: Actions, *, limit: int | None = None) -> int:
         neighbor_ids = sorted(
             ({nb for nbs in neighbors.values() for nb in nbs} - unplaced_set), key=str)
         proj_type = await _project_and_type(actions, unplaced_regular + neighbor_ids)
-        adjacency = await _adjacency_ranks(actions, unplaced_regular)
-        hub_ids = await _hub_ids(actions, unplaced_regular)
-        project_ids_needed = [pid for pid, _ in proj_type.values() if pid]
-        project_centers = await positions_for(actions, project_ids_needed)
+        containers = await _live_containers_of(actions, unplaced_regular)
+        container_ids = sorted(
+            ({cid for cids in containers.values() for cid in cids} - unplaced_set),
+            key=str)
         unfiled_center = project_center(0)
-        connected_counts = await _project_connected_counts(actions)
+
+        anchors = await positions_for(
+            actions, sorted(set(neighbor_ids) | set(container_ids), key=str))
 
         base = {}
-        for oid in unplaced_regular:
-            proj_id, _type_name = proj_type.get(oid, (None, "Unknown"))
-            center = (project_centers.get(proj_id, unfiled_center)
-                      if proj_id else unfiled_center)
-            connected, own_rank = adjacency.get(oid, (False, 0))
-            rank = 0 if oid in hub_ids else own_rank
-            halo_base = _project_halo_base(connected_counts.get(proj_id, 0))
-            base[oid] = adjacency_position(center, connected, rank, halo_base=halo_base)
+        for local_rank, oid in enumerate(unplaced_regular):
+            candidates = [anchors[nb] for nb in neighbors.get(oid, set()) if nb in anchors]
+            candidates += [anchors[cid] for cid in containers.get(oid, []) if cid in anchors]
+            base[oid] = _centroid_seed(local_rank, candidates, unfiled_center)
 
-        anchors = await positions_for(actions, neighbor_ids)
         intra = _intra_project_neighbors(unplaced_regular, neighbors, proj_type)
         placed = relax(
             unplaced_regular, intra, anchors, iterations=_RELAX_ITERATIONS, init=base)

@@ -43,6 +43,10 @@ STRUCTURAL_LINK_TYPES: frozenset[str] = frozenset({
     "holds",
     # governance / lineage-of-OFFICE (never lineage-of-FACT, see succeeded_from below)
     "managed_by", "governs", "succeeds_seat", "forked_from", "worktree_of",
+    # OSINT-domain membership (Person member_of Organization) -- was previously
+    # unclassified by omission (THE PHYSICS LAYOUT, Thoth mail 11047): the same
+    # membership/identity shape as in_repo/works_in above, not a content claim.
+    "member_of",
 })
 
 # every OTHER link type this codebase's write paths actually mint today (scanned via
@@ -76,11 +80,32 @@ SEMANTIC_LINK_TYPES_KNOWN: frozenset[str] = frozenset({
 })
 
 
+# THE PHYSICS LAYOUT (operator ruling d7d55257, Thoth mail 11047): the SPATIAL-
+# CONTAINMENT subset of STRUCTURAL_LINK_TYPES -- an edge saying "this object's home
+# IS that container" (a project, a seat, a person, a parent agent), as opposed to a
+# structural edge that is real and load-bearing but not about WHERE an object lives
+# (dispatch/addressing, governance/lineage-of-office, authorship, commit attribution).
+# Only this subset drives gravity toward a container's own earned centroid in the
+# physics layout; every other STRUCTURAL type stays excluded from the layout
+# entirely, exactly as before this ruling -- a subset, never an independent bucket.
+CONTAINER_LINK_TYPES: frozenset[str] = frozenset({
+    "in_repo", "works_in", "acts_for", "spawned_by", "holds", "member_of",
+})
+
+
 def link_class(link_type: str) -> str:
-    """"structural" or "semantic" -- total, never raises. An unrecognized/extension
-    type defaults to "semantic" (the safe default: behaves exactly as it did before
-    this fix, never a silent new source of bundling) -- but see the module docstring
-    for why the actually-used population is held to a stricter bar than this default."""
+    """"container", "structural", or "semantic" -- total, never raises. "container" is
+    a FLAG NESTED INSIDE the structural class: every container type is also in
+    STRUCTURAL_LINK_TYPES (test_container_types_are_a_subset_of_structural), so any
+    existing caller checking membership in that frozenset directly (graph_layout.py's
+    relax-exclusion) is unaffected by this three-way split -- only a caller reading
+    the STRING value this function (or the wire's `link_type_class`) returns needs to
+    know about the new third value. An unrecognized/extension type defaults to
+    "semantic" (the safe default: behaves exactly as it did before this fix, never a
+    silent new source of bundling) -- but see the module docstring for why the
+    actually-used population is held to a stricter bar than this default."""
+    if link_type in CONTAINER_LINK_TYPES:
+        return "container"
     if link_type in STRUCTURAL_LINK_TYPES:
         return "structural"
     return "semantic"
