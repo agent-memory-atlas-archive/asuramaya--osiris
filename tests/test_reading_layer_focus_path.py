@@ -92,7 +92,10 @@ def test_select_never_hides_the_graph_only_focus_does() -> None:
     assert "const focused = !!pathFocusId;" in body
     assert "const focusHidden = focused && nd.id !== pathFocusId " \
         "&& !pathReachable.has(nd.id);" in body
-    assert "visibleAttr.setX(i, (typeHidden || focusHidden) ? 0 : 1);" in body
+    # CONSOLE CHROME CLEANUP piece 2 (decision 31717ca7): projectHidden (the repo
+    # selector's own hidden-set check) joined the same condition — select/focus
+    # semantics here are unchanged, only a third filter dimension was added alongside.
+    assert "visibleAttr.setX(i, (typeHidden || projectHidden || focusHidden) ? 0 : 1);" in body
 
 
 def test_enter_no_longer_promotes_a_selection_a_click_already_focused() -> None:

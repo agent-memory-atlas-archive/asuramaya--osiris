@@ -92,7 +92,12 @@ def test_legend_checkboxes_rebuild_edge_lines_on_change() -> None:
     # types, alongside edge class/type) to the same legend panel — all three still rebuild.
     body = _SPACE_JS.split("function renderLegend(edgeList, nodeList)", 1)[1]
     # three legend checkbox groups (node type, class, type), setHiddenTypes' own call (the
-    # header taxonomy pills' entry point, TIP 1(e)), plus TIP 1b's own review-flaw-#1 fix:
-    # focusObject and clearFocus each rebuild the base layer too, so unreachable edges
-    # actually disappear on focus instead of only nodes — six call sites total.
-    assert body.count("buildEdgeLines(idToNode, edges);") == 6
+    # header taxonomy pills' entry point, TIP 1(e)), setHiddenProjects' own call (the
+    # header repo selector's entry point, CONSOLE CHROME CLEANUP piece 2, decision
+    # 31717ca7), plus TIP 1b's own review-flaw-#1 fix: focusObject and clearFocus each
+    # rebuild the base layer too, so unreachable edges actually disappear on focus instead
+    # of only nodes — seven call sites total. This slice runs unbounded to end-of-file (no
+    # closing boundary in the split above), so it catches every function defined after
+    # renderLegend, not just renderLegend's own body — noted rather than silently
+    # re-scoping an existing test's own slicing choice.
+    assert body.count("buildEdgeLines(idToNode, edges);") == 7

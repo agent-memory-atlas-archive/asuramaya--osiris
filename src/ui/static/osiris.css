@@ -58,11 +58,19 @@ button, select, input, textarea {
   overflow: hidden;
 }
 
-/* HEADER 1: Global Application & Section Header */
+/* HEADER 1: Global Application & Section Header.
+   THE CONSOLE CHROME CLEANUP (thread 0be2f790's own operator-finding follow-up, Thoth DM
+   10731 piece 4): a true 3-column grid (left cluster / centred search / right cluster)
+   replaces the old flexbox `justify-content: space-between` — flex only visually centers
+   the middle item when the two side clusters happen to match width, which they don't
+   here (the left cluster carries the brand + two scope pills, the right only a sync
+   badge + one button). The grid's own middle track (`minmax(0, 1fr)`) centers
+   .bar-center regardless of that asymmetry, and shrinks it — never the side columns —
+   as the viewport narrows. */
 #bar {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, auto) minmax(0, 1fr) minmax(0, auto);
   align-items: center;
-  justify-content: space-between;
   padding: 0 14px;
   height: 48px;
   min-height: 48px;
@@ -112,9 +120,13 @@ button, select, input, textarea {
   display: flex;
   align-items: center;
   gap: 10px;
-  flex: 1 1 540px;
-  max-width: 660px;
-  min-width: 140px;
+  width: 100%;
+  max-width: 41.25rem;  /* 660px, in rem so it scales with the operator's own font-size */
+  min-width: 8.75rem;   /* 140px — the floor the search shrinks to before it would ever
+                            need to overlap a side cluster; the side clusters live in
+                            their own dedicated grid columns and are never compressed */
+  margin: 0 auto;        /* centers within the grid's own 1fr middle track, independent
+                            of the (unequal) left/right cluster widths */
   overflow: visible;
   position: relative;
 }
@@ -652,7 +664,10 @@ select.field, input.field {
   transition: border-color .15s;
 }
 select.field:focus, input.field:focus { border-color: var(--border-focus); }
-#search { width: 320px; }
+/* THE CONSOLE CHROME CLEANUP (Thoth DM 10731 piece 4): a fixed 320px #search width
+   defeated the header's own responsive shrink (.global-search-box input already carries
+   width:100% of its flex container) — removed so the search genuinely shrinks with the
+   grid's middle track instead of a stale ID-selector override winning by specificity. */
 
 .iconbtn {
   background: var(--chip);
