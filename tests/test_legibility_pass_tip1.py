@@ -243,7 +243,7 @@ def test_downstream_is_a_toggle_off_by_default() -> None:
 
 def test_ego_relayout_exists_and_ranks_ancestors_leftward_roots_farthest() -> None:
     assert "function applyEgoLayout(focusId, hopsUp, hopsDown)" in _SPACE_JS
-    body = _SPACE_JS.split("function applyEgoLayout(focusId, hopsUp, hopsDown)", 1)[1][:1200]
+    body = _SPACE_JS.split("function applyEgoLayout(focusId, hopsUp, hopsDown)", 1)[1][:1600]
     # ancestors (hopsUp) get a NEGATIVE signed rank -- more hops (closer to root) = further
     # negative = further left; downstream (hopsDown) gets a positive rank, mirrored right.
     assert "(byRank.get(-hop) || (byRank.set(-hop, []), byRank.get(-hop))).push(id);" in body
@@ -251,11 +251,15 @@ def test_ego_relayout_exists_and_ranks_ancestors_leftward_roots_farthest() -> No
     assert "const x = cx + signedHop * colW;" in body
 
 
-def test_ego_layout_spacing_is_screen_pixels_converted_to_world_at_current_zoom() -> None:
+def test_ego_layout_spacing_is_screen_pixels_converted_to_world_at_a_stable_scale() -> None:
+    # TIP 1c review flaw #6 (Thoth mail 10891): the CURRENT (pre-focus) worldPerPx made the
+    # ego layout's own scale track whatever zoom the camera happened to already be at -- a
+    # small reachable set following a tight prior focus could spiral the fit down to a
+    # near-empty viewSize. maxViewSize (the whole graph's own stable fitted scale) fixes it.
     assert "const EGO_COL_SPACING_PX = 150;" in _SPACE_JS
     assert "const EGO_ROW_SPACING_PX = 34;" in _SPACE_JS
-    body = _SPACE_JS.split("function applyEgoLayout(focusId, hopsUp, hopsDown)", 1)[1][:500]
-    assert "const wpp = worldPerPx();" in body
+    body = _SPACE_JS.split("function applyEgoLayout(focusId, hopsUp, hopsDown)", 1)[1][:900]
+    assert "const wpp = maxViewSize / wrap.clientHeight;" in body
     assert "const colW = EGO_COL_SPACING_PX * wpp, rowH = EGO_ROW_SPACING_PX * wpp;" in body
 
 

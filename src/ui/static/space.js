@@ -815,7 +815,13 @@ export async function initSpace(container) {
     const focusNode = idx.get(focusId);
     if (!focusNode) return;
     const cx = focusNode.x || 0, cy = focusNode.y || 0;
-    const wpp = worldPerPx();
+    // review flaw #6 (TIP 1c, Thoth mail 10891): using the CURRENT (pre-focus) worldPerPx
+    // made the ego layout's own scale track whatever zoom the camera happened to be at --
+    // a small reachable set following another tight focus could spiral the fit down to a
+    // near-empty viewSize, where the 48px screen CAP then dominates the whole frame.
+    // maxViewSize (the whole graph's own fitted scale, stable since fitToNodes) gives a
+    // reference wpp that never shrinks just because the camera was already zoomed in.
+    const wpp = maxViewSize / wrap.clientHeight;
     const colW = EGO_COL_SPACING_PX * wpp, rowH = EGO_ROW_SPACING_PX * wpp;
     egoSaved = new Map();
     const byRank = new Map(); // signed hop (-left/+right) -> [ids]
@@ -1180,8 +1186,13 @@ export async function initSpace(container) {
       // padding + a sane floor/ceiling — the ceiling rides maxViewSize (the real fitted
       // graph's own extent, set in fitToNodes) rather than a hardcoded 1300: the same class
       // of stale-constant bug Thoth caught in the wheel clamp (mail 10581) would otherwise
-      // clip a legitimately wide-spread path back down to a fixed small view.
-      viewSize = Math.max(30, Math.min(maxViewSize, span * 1.6 + 40));
+      // clip a legitimately wide-spread path back down to a fixed small view. The floor
+      // (review flaw #6, TIP 1c) is raised from the old 30 -- fine for a whole-graph fit,
+      // where span is always huge, but a tiny reachable set (a lone child or two) could
+      // collapse the ego layout's own span near that floor, leaving the 48px screen CAP as
+      // the dominant visual element in an otherwise near-empty frame.
+      const EGO_FIT_MIN_VIEWSIZE = 400;
+      viewSize = Math.max(EGO_FIT_MIN_VIEWSIZE, Math.min(maxViewSize, span * 1.6 + 40));
       updateFrustum();
       rescaleForZoom();
     }
@@ -1202,11 +1213,30 @@ export async function initSpace(container) {
   }
 
   async function inspect(id) {
-    const obj = await fetch(`/objects/${id}`).then((r) => r.json());
-    rightRail.className = "rail";
-    rightRail.innerHTML = Osiris.objectDetail(obj, "");
-    // the inspector's own Focus button — one of the three ways to trigger a real focus
-    // (ruling c5953bb1: double-click, Enter, or this button).
+    // review flaw #1 (TIP 1c, Thoth mail 10891): "the right pane must show the focused
+    // object's details... today it stays empty after a click." Root cause: no response
+    // check plus objectDetail() throwing synchronously (e.g. reading o.properties.some on
+    // a malformed/error body) meant the `rightRail.innerHTML = ...` assignment never
+    // happened at all — the rail silently kept whatever it showed BEFORE the click (the
+    // "Click any object to inspect..." placeholder on a fresh session, read as "empty").
+    // Every path below now writes something real to the rail, success or failure.
+    let obj;
+    try {
+      const res = await fetch(`/objects/${id}`);
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      obj = await res.json();
+      rightRail.className = "rail";
+      rightRail.innerHTML = Osiris.objectDetail(obj, "");
+    } catch (err) {
+      console.error("inspect() failed for", id, err);
+      rightRail.className = "rail";
+      rightRail.innerHTML = `<div class="insp-empty">Could not load ${id.slice(0, 8)}: ` +
+        `${(err && err.message) || err}</div>`;
+      return;
+    }
+    // the inspector's own Focus button — a re-focus shortcut, now that a plain click on
+    // the canvas already IS focus (TIP 1 amendment retired the old double-click/Enter
+    // triggers this button used to sit alongside).
     const focusBtn = document.createElement("button");
     focusBtn.className = "iconbtn";
     focusBtn.textContent = pathFocusId === id ? "Focused" : "Focus";
@@ -1217,7 +1247,13 @@ export async function initSpace(container) {
     // focus — ruling c5953bb1's own "harmony" requirement, part C, but the wiring lives
     // here since it's the same click-through this inspector has always used.
     const relsEl = rightRail.querySelector("[data-rels]");
-    if (relsEl) await Osiris.loadRels(relsEl, id, (pickId) => focusObject(pickId), () => {});
+    if (relsEl) {
+      try {
+        await Osiris.loadRels(relsEl, id, (pickId) => focusObject(pickId), () => {});
+      } catch (err) {
+        console.error("loadRels() failed for", id, err);
+      }
+    }
   }
 
   // TIP 1 AMENDMENT (mail 10726): "no double-click or Enter" — a click already IS focus,

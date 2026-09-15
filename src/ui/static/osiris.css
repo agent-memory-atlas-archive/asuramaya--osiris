@@ -714,6 +714,13 @@ select.field:focus, input.field:focus { border-color: var(--border-focus); }
 #main {
   display: grid;
   grid-template-columns: var(--lw, 230px) minmax(0, 1fr) var(--rw, 330px);
+  /* TIP 1c review flaw #4 (Thoth mail 10891): with no grid-template-rows, the single
+     implicit row sizes to AUTO -- its own content's intrinsic height, not this element's
+     own height:100% -- so #stage/#cy (bound to #main's own grid cell via percentage
+     heights) could grow past the real viewport instead of being clipped to it (measured:
+     #cy at 1409px in a 1198px viewport). Pinning the row to 100% breaks that content-driven
+     growth outright. */
+  grid-template-rows: 100%;
   height: 100%;
   flex: 1 1 auto;
   min-height: 0;
@@ -747,10 +754,15 @@ select.field:focus, input.field:focus { border-color: var(--border-focus); }
 #left {
   border-right: 1px solid var(--border);
   overflow: hidden;
+  min-height: 0; /* TIP 1c flaw #4: a grid item's own min-height defaults to auto (its
+    content's intrinsic size), which can stretch the shared row even with grid-template-
+    rows: 100% above -- a long inspector dossier in #right was a live candidate for
+    exactly this, since it shares the same row as #stage/#cy. */
 }
 #right {
   border-left: 1px solid var(--border);
   overflow-y: auto;
+  min-height: 0;
 }
 .rail-body {
   flex: 1 1 auto;

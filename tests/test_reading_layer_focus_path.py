@@ -105,7 +105,7 @@ def test_enter_no_longer_promotes_a_selection_a_click_already_focused() -> None:
 
 
 def test_inspector_carries_a_focus_button() -> None:
-    body = _SPACE_JS.split("async function inspect(id)", 1)[1][:1300]
+    body = _SPACE_JS.split("async function inspect(id)", 1)[1][:1900]
     assert 'focusBtn.addEventListener("click", () => focusObject(id));' in body
 
 
@@ -145,7 +145,7 @@ def test_the_focused_nodes_own_structural_edges_draw_on_focus_only() -> None:
 
 
 def test_camera_fits_to_the_reachable_set_not_a_fixed_view() -> None:
-    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:3800]
+    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:4300]
     assert "for (const rid of pathReachable)" in body
     assert "Math.min(maxViewSize, span * 1.6 + 40)" in body
 
