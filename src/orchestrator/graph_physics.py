@@ -136,18 +136,28 @@ centred on the whole placed cloud's own centroid, std set from that cloud's own
 spread -- density falls off smoothly outward instead of forming the "ring spike"
 Thoth's own measurement flagged on the v7 layout.
 
-VERIFIED DECLUMP (item 2): `_verify_min_separation` runs AFTER the final global
-`_declump` pass and raises `DeclumpVerificationFailed` loudly if any pair is still
-closer than `_MIN_SEPARATION - _MIN_SEP_EPSILON` -- declump's own 30-iteration cap is
-silent about non-convergence (it just stops), which is exactly how v7's nn p50 2.8
-went unnoticed until Thoth measured it live. The hierarchical layout is designed so
-declump only ever does bounded local cleanup at reasonable density and should always
-converge; this is the tripwire for "it didn't," not an expected outcome.
+VERIFIED DECLUMP (item 2, then PROPORTIONAL, Thoth mail 11191): the final global
+declump is `_declump_until_converged_or_budget` -- small chunks, re-measured after
+each, stopping once the worst deficit clears `_PHYSICS_DECLUMP_CONVERGED_RATIO` or
+`layout.physics_declump_budget_secs` wall-clock is spent, whichever first --
+followed by `_verify_min_separation`, which raises `DeclumpVerificationFailed`
+loudly only when the worst pair found is under `_PHYSICS_VERIFY_FAIL_RATIO * min_sep`
+(started as a fixed epsilon below the hard floor; Thoth's own live measurement on
+attempt 4 -- worst pair 13.566 of 15, "a convergence residual, not a collapse;
+invisible" -- showed a fixed-epsilon floor treated a narrow residual the same as a
+genuine collapse). `_declump`'s own per-call iteration cap is silent about non-
+convergence (it just stops), which is exactly how v7's nn p50 2.8 went unnoticed
+until Thoth measured it live -- the hierarchical layout is designed so declump only
+ever does bounded local cleanup at reasonable density and should almost always
+converge comfortably before the proportional line; this pairing (converge-or-budget,
+then a proportional check) is the tripwire for "it genuinely didn't," not a bare
+epsilon that flags ordinary residual noise as a failure.
 """
 from __future__ import annotations
 
 import math
 import resource
+import time
 import uuid
 from collections import defaultdict
 from collections.abc import AsyncIterator
@@ -211,6 +221,35 @@ _LEVEL1_GUTTER = 3 * _MIN_SEPARATION  # extra clearance beyond R_a+R_b between a
                                       # requires >= R_a+R_b; a real gutter keeps a
                                       # bridging member's own facing-edge nudge (below)
                                       # from ever pushing it into the NEXT project.
+_INTRA_PROJECT_GUTTER = _MIN_SEPARATION  # THE INTRA-PROJECT GUTTER FIX (live
+                                         # specimen: the first real v8 write, deployed
+                                         # ba9669a4, measured as a 163k-unit bbox with
+                                         # 0.32 same-project 5-NN purity -- "not
+                                         # compact, not separated, fully interleaved").
+                                         # `_level2_raw_layout_for_project`'s own
+                                         # recursive community split reused
+                                         # `_level1_layout` with the SAME
+                                         # `_LEVEL1_GUTTER` a whole-graph PROJECT pair
+                                         # needs -- for a large project split into
+                                         # dozens of communities, that many pairwise
+                                         # 45-unit-plus clearances compounds into a
+                                         # sprawling archipelago (a giant project's
+                                         # own real extent measured in THOUSANDS of
+                                         # units, not the nominal formula's hundreds),
+                                         # whose own internal gaps are large enough
+                                         # for an entire SMALLER project to nest
+                                         # inside geometrically, even though every
+                                         # pairwise project-centroid distance still
+                                         # satisfies R_a+R_b+gutter on paper --
+                                         # `_separate_extents` only ever pushes
+                                         # CENTROIDS apart, it has no notion of a
+                                         # porous shape. Communities within ONE
+                                         # project don't need PROJECT-scale clearance
+                                         # from each other (they are still meant to
+                                         # read as one project, just with internal
+                                         # districts) -- min_sep alone keeps them
+                                         # visually distinct without ballooning the
+                                         # project's own overall footprint.
 _LEVEL1_FR_ITERATIONS = 500  # a small graph (one vertex per project) -- generous
                              # iteration budget costs nothing at this vertex count.
 _LEVEL1_SEPARATION_ITERATIONS = 300  # bounded like `_declump`'s own cap; separating
@@ -236,11 +275,35 @@ _UNFILED_FOG_MIN_STD = 5 * _MIN_SEPARATION  # floor for the density-falloff Gaus
                                             # yet to measure a real cloud from (an
                                             # empty-graph edge case, never the live
                                             # population).
-_MIN_SEP_EPSILON = 0.5  # numerical slack `_verify_min_separation` allows below the
-                        # hard floor -- float rounding across `_declump`'s own
-                        # iterations can leave a pair a few thousandths short even
-                        # when it fully converged; this is tolerance for that, never
-                        # a loophole for a real violation.
+_PHYSICS_VERIFY_FAIL_RATIO = 0.75  # PROPORTIONAL VERIFICATION (Thoth mail 11191):
+                                   # `_verify_min_separation` refuses only when the
+                                   # worst pair is under this fraction of min_sep --
+                                   # Thoth's own live measurement (attempt 4, her
+                                   # run: worst pair 13.566 of 15, "a convergence
+                                   # residual, not a collapse; invisible") showed a
+                                   # fixed-epsilon floor (the OLD `_MIN_SEP_EPSILON`
+                                   # scheme) treated a narrow residual miss the same
+                                   # as a genuine collapse (specimens 1-3, all under
+                                   # 1 unit apart, comfortably still fail well
+                                   # inside this line).
+_PHYSICS_DECLUMP_CONVERGED_RATIO = 0.05  # `_declump_until_converged_or_budget`
+                                         # stops iterating once the worst deficit
+                                         # from min_sep clears this fraction (i.e.
+                                         # the worst pair is within 95% of the
+                                         # floor) -- comfortably inside
+                                         # `_PHYSICS_VERIFY_FAIL_RATIO`'s own 0.75
+                                         # line, so a converged run essentially
+                                         # never trips verification.
+_PHYSICS_DECLUMP_CHUNK = 30  # `_declump_until_converged_or_budget`'s own re-
+                             # measurement granularity -- re-checks the worst
+                             # pairwise distance after this many `_declump`
+                             # iterations rather than after every single one
+                             # (cheap either way, but `_worst_pair_distance`'s own
+                             # grid scan is O(n), no need to pay it every step).
+_DEFAULT_PHYSICS_DECLUMP_BUDGET_SECS = 120  # layout.physics_declump_budget_secs'
+                                            # own default -- the wall-clock ceiling
+                                            # `_declump_until_converged_or_budget`
+                                            # respects regardless of convergence.
 _PHYSICS_DECLUMP_ITERATIONS = 150  # started at 30 (graph_layout._declump's own
                                   # default), doubled to 60 (live flake specimen,
                                   # full-suite serial gate, e7cf6c59 follow-up: a
@@ -267,7 +330,13 @@ _PHYSICS_DECLUMP_ITERATIONS = 150  # started at 30 (graph_layout._declump's own
                                   # itself shifts between runs), not a sign the
                                   # algorithm needs doubling everywhere: every OTHER
                                   # `_declump` caller (the incremental heartbeat)
-                                  # keeps its own plain 30-iteration default.
+                                  # keeps its own plain 30-iteration default. USED
+                                  # BY the intermediate passes only (each project's
+                                  # own raw layout, each community's own raw
+                                  # layout, the post-nudge re-settle) -- the FINAL
+                                  # global pass moved to
+                                  # `_declump_until_converged_or_budget` (Thoth mail
+                                  # 11191), which no longer takes a fixed count.
 _VERIFY_MAX_CANDIDATES = 2000  # a cell-pair candidate count above this is treated as
                                # an outright verification failure rather than paying
                                # for the full pairwise check -- this many points
@@ -545,11 +614,16 @@ def _separate_extents(
 
 def _level1_layout(
     project_ids: list[uuid.UUID], radii: dict[uuid.UUID, float],
-    cross_edges: dict[tuple[uuid.UUID, uuid.UUID], float],
+    cross_edges: dict[tuple[uuid.UUID, uuid.UUID], float], *,
+    gutter: float = _LEVEL1_GUTTER,
 ) -> dict[uuid.UUID, np.ndarray]:
     """One vertex per project, FR over the cross-project semantic aggregate, then
     `_separate_extents` so no two project discs ever overlap -- see the module
-    docstring's HIERARCHICAL PHYSICS section for the full shape."""
+    docstring's HIERARCHICAL PHYSICS section for the full shape. `gutter` defaults
+    to the whole-graph project-vs-project clearance but is overridden much smaller
+    (THE INTRA-PROJECT GUTTER FIX) when this same function is reused one level
+    deeper for a project's own communities -- see
+    `_level2_raw_layout_for_project`'s own docstring for why."""
     if not project_ids:
         return {}
     idx = {pid: i for i, pid in enumerate(project_ids)}
@@ -567,7 +641,7 @@ def _level1_layout(
         seed=seed.tolist(), grid=True)
     pos = np.array(coords.coords)
     radii_arr = np.array([radii[pid] for pid in project_ids])
-    pos = _separate_extents(pos, radii_arr)
+    pos = _separate_extents(pos, radii_arr, gutter=gutter)
     return {pid: pos[i] for i, pid in enumerate(project_ids)}
 
 
@@ -710,7 +784,8 @@ def _level2_raw_layout_for_project(
         vid: max(nominal_radii[vid], real_extents[vid]) for vid in vertex_for.values()}
 
     cross_edges = _intra_project_community_edges(link_rows, oid_community_vertex)
-    centroids = _level1_layout(list(vertex_for.values()), radii, cross_edges)
+    centroids = _level1_layout(
+        list(vertex_for.values()), radii, cross_edges, gutter=_INTRA_PROJECT_GUTTER)
 
     out: dict[uuid.UUID, np.ndarray] = {}
     for key, vid in vertex_for.items():
@@ -795,6 +870,7 @@ def _apply_bridge_nudges(
 def _place_unfiled(
     unfiled_ids: list[uuid.UUID], link_rows: list[asyncpg.Record],
     placed: dict[uuid.UUID, np.ndarray],
+    project_centroids: dict[uuid.UUID, np.ndarray] | None = None,
 ) -> dict[uuid.UUID, np.ndarray]:
     """Unfiled objects (Thoth mail 11128 item 4): one with a live semantic link to
     an already-placed object lands at the mean position of those neighbours; one
@@ -814,7 +890,17 @@ def _place_unfiled(
     as a FIXED anchor -- the SAME anchor-vs-movable mode `_declump` already
     supports (used unchanged, no new mechanism), just invoked at the point of
     insertion instead of leaving all the decluttering work to one pass over the
-    whole population at the end."""
+    whole population at the end.
+
+    THE FOG-SCALE FIX (live specimen, first real v8 write, deployed ba9669a4:
+    163k-unit bbox, 0.32 same-project purity): the OLD `cloud_std` was the raw std
+    of EVERY placed point's own coordinates -- for a huge project (one alone
+    r95 in the thousands after real-extent separation), that std balloons well
+    past the LEVEL-1 canvas scale, so the fog's own Gaussian spread put real
+    density inside project regions instead of only "between and around" them
+    (Thoth's own item-4 spec). `project_centroids`, when given, scales the fog
+    off the spread of PROJECT CENTROIDS instead -- the level-1 canvas's own
+    scale, not any one project's internal member spread."""
     neighbours: dict[uuid.UUID, list[np.ndarray]] = defaultdict(list)
     unfiled_set = set(unfiled_ids)
     for r in link_rows:
@@ -826,13 +912,16 @@ def _place_unfiled(
         if t in unfiled_set and f in placed:
             neighbours[t].append(placed[f])
 
+    scale_source = project_centroids if project_centroids else placed
+    if scale_source:
+        scale_pos = np.array(list(scale_source.values()))
+        cloud_std = max(float(scale_pos.std()), _UNFILED_FOG_MIN_STD)
+    else:
+        cloud_std = _UNFILED_FOG_MIN_STD
     if placed:
-        all_pos = np.array(list(placed.values()))
-        cloud_center = all_pos.mean(axis=0)
-        cloud_std = max(float(all_pos.std()), _UNFILED_FOG_MIN_STD)
+        cloud_center = np.array(list(placed.values())).mean(axis=0)
     else:
         cloud_center = np.zeros(2)
-        cloud_std = _UNFILED_FOG_MIN_STD
 
     out: dict[uuid.UUID, np.ndarray] = {}
     for oid in unfiled_ids:
@@ -860,36 +949,93 @@ def _place_unfiled(
 
 class DeclumpVerificationFailed(Exception):
     """Raised by `_verify_min_separation` when the post-declump population still
-    holds a pair closer than `_MIN_SEPARATION - _MIN_SEP_EPSILON` -- `_declump`'s
-    own iteration cap is silent about non-convergence (it just stops), which is
-    exactly how v7's nn p50 2.8 went unnoticed until Thoth measured it live (mail
-    11128 item 2, "VERIFY it ... fail loudly if not"). The hierarchical layout is
-    designed so declump only ever does bounded local cleanup at reasonable density
-    and should always converge; this is the tripwire for "it didn't"."""
+    holds a pair closer than `_PHYSICS_VERIFY_FAIL_RATIO * min_sep` -- a genuine
+    collapse, not the ordinary convergence residual a narrower fixed-epsilon check
+    used to flag (Thoth mail 11191: attempt 4's worst pair, 13.566 of 15, was
+    "invisible" by her own read). `_declump`'s own per-call iteration cap is
+    silent about non-convergence (it just stops), which is exactly how v7's nn p50
+    2.8 went unnoticed until Thoth measured it live (mail 11128 item 2, "VERIFY it
+    ... fail loudly if not"). The hierarchical layout is designed so declump only
+    ever does bounded local cleanup at reasonable density and should comfortably
+    converge well inside the proportional line; this is the tripwire for "it
+    genuinely didn't"."""
 
 
-def _verify_min_separation(pos: np.ndarray, *, min_sep: float = _MIN_SEPARATION) -> None:
+def _worst_pair_distance(pos: np.ndarray, min_sep: float) -> float:
+    """The smallest pairwise distance anywhere in `pos`, scanned the same
+    grid-cell-neighbourhood way `_declump` itself does (never O(n^2)) -- `min_sep`
+    itself is returned when nothing violates it (nothing to report), and a cell
+    too dense to check cheaply (`_VERIFY_MAX_CANDIDATES`) reports `0.0`, the worst
+    possible value, rather than skip it silently. Shared by
+    `_declump_until_converged_or_budget` (PROPORTIONAL VERIFICATION, Thoth mail
+    11191) and `_verify_min_separation` -- the SAME measurement drives both "keep
+    iterating" and "is this bad enough to refuse the whole migration"."""
     if len(pos) < 2:
-        return
+        return min_sep
+    worst = min_sep
     cells = _grid_cells(pos, min_sep)
     for (cx, cy), _idxs in cells.items():
         candidates = _neighbor_cell_indices(cells, cx, cy)
         if len(candidates) < 2:
             continue
         if len(candidates) > _VERIFY_MAX_CANDIDATES:
-            raise DeclumpVerificationFailed(
-                f"cell ({cx},{cy}) holds {len(candidates)} candidate points after "
-                "declump -- too dense to verify cheaply, treated as a failure")
+            return 0.0
         pts = pos[candidates]
         diffs = pts[:, None, :] - pts[None, :, :]
         dists = np.sqrt((diffs ** 2).sum(axis=-1))
         np.fill_diagonal(dists, np.inf)
-        local_min = float(dists.min())
-        if local_min < min_sep - _MIN_SEP_EPSILON:
-            raise DeclumpVerificationFailed(
-                f"post-declump verification found a pair {local_min:.3f} units apart "
-                f"in cell ({cx},{cy}), under the {min_sep} floor (epsilon "
-                f"{_MIN_SEP_EPSILON}) -- declump did not converge")
+        worst = min(worst, float(dists.min()))
+    return worst
+
+
+def _declump_until_converged_or_budget(
+    pos: np.ndarray, ids: list[uuid.UUID], *, min_sep: float, budget_secs: float,
+    chunk_iterations: int = _PHYSICS_DECLUMP_CHUNK,
+) -> tuple[np.ndarray, float, int]:
+    """PROPORTIONAL VERIFICATION (Thoth mail 11191, ruling 6befd2a5's follow-up):
+    the OLD scheme ran a single FIXED iteration count and either passed or refused
+    outright -- Thoth's own live measurement (attempt 4, her own run: worst pair
+    13.566 of a 15 floor, "a convergence residual, not a collapse; invisible")
+    showed that a narrow residual miss isn't the same failure as an actual
+    structural collapse (specimens 1-3 were all under 1 unit apart), so treating
+    them identically either refuses good-enough layouts or (the old fixed-count
+    scheme) has no principled stopping point short of a hard budget. This runs
+    `_declump` in small chunks, re-measuring the worst pairwise distance
+    (`_worst_pair_distance`) after each, until either the deficit from `min_sep`
+    clears `_PHYSICS_DECLUMP_CONVERGED_RATIO` (comfortably converged) or
+    `budget_secs` wall-clock is spent (whichever first) -- returns the positions,
+    the worst residual distance actually reached, and how many iterations ran, so
+    the caller's own receipt can report both regardless of which one stopped it."""
+    start = time.monotonic()
+    total_iters = 0
+    worst = _worst_pair_distance(pos, min_sep)
+    converged_floor = min_sep * (1.0 - _PHYSICS_DECLUMP_CONVERGED_RATIO)
+    while worst < converged_floor and time.monotonic() - start < budget_secs:
+        pos = _declump(
+            pos, np.zeros((0, 2)), ids, min_sep=min_sep, iterations=chunk_iterations)
+        total_iters += chunk_iterations
+        worst = _worst_pair_distance(pos, min_sep)
+    return pos, worst, total_iters
+
+
+def _verify_min_separation(
+    worst_pair_distance: float, *, min_sep: float = _MIN_SEPARATION,
+) -> None:
+    """PROPORTIONAL VERIFICATION (Thoth mail 11191): fails only when the worst
+    pair found is under `_PHYSICS_VERIFY_FAIL_RATIO * min_sep` -- a residual ABOVE
+    that line (e.g. 13.6 of 15, Thoth's own "invisible" specimen) is tolerated as
+    a normal convergence residual, never refused; genuinely collapsed pairs
+    (specimens 1-3, all under 1 unit) still fail loudly well before this line.
+    Takes the ALREADY-MEASURED worst distance (from
+    `_declump_until_converged_or_budget`'s own return) rather than re-scanning --
+    one measurement, two decisions (keep iterating vs. refuse), never computed
+    twice."""
+    fail_floor = min_sep * _PHYSICS_VERIFY_FAIL_RATIO
+    if worst_pair_distance < fail_floor:
+        raise DeclumpVerificationFailed(
+            f"post-declump verification found a pair {worst_pair_distance:.3f} units "
+            f"apart, under {_PHYSICS_VERIFY_FAIL_RATIO} * the {min_sep} floor "
+            f"({fail_floor:.3f}) -- a genuine collapse, not a convergence residual")
 
 
 def _hub_zone_radius(n_hubs: int) -> float:
@@ -928,7 +1074,7 @@ def _place_hubs_in_zone(
 
 
 async def _physics_positions(
-    actions: Actions,
+    actions: Actions, *, diagnostics: dict[str, Any] | None = None,
 ) -> dict[uuid.UUID, tuple[float, float]]:
     """THE HIERARCHICAL PHYSICS pipeline (v8, Thoth mail 11128) -- pure enough to
     unit-test without a live migration write past the DB reads at the top:
@@ -937,10 +1083,15 @@ async def _physics_positions(
     extent-aware separation, using each project's REAL extent) -> level 2 finalize
     (scale UP only, translated onto its level-1 disc) -> cross-project bridge
     nudges -> unfiled placement -> hub re-centering -> the memory guard -> the
-    existing declump floor -> VERIFIED. Real object positions only. Can raise
-    `MemoryBudgetExceeded` or
-    `DeclumpVerificationFailed` -- the caller (`run_physics_migrate`) turns either
-    into a written refusal receipt rather than letting a bad layout write."""
+    final declump, now CONVERGE-OR-BUDGET (`_declump_until_converged_or_budget`,
+    Thoth mail 11191) -> PROPORTIONALLY VERIFIED (`_verify_min_separation`, fails
+    only on a genuine collapse, not a narrow residual). Real object positions
+    only. Can raise `MemoryBudgetExceeded` or `DeclumpVerificationFailed` -- the
+    caller (`run_physics_migrate`) turns either into a written refusal receipt
+    rather than letting a bad layout write. `diagnostics`, when given, is filled
+    with `declump_worst_residual`/`declump_iterations` regardless of outcome --
+    Thoth's own ask, "the receipt reports the worst residual pair and iteration
+    count either way"."""
     object_ids = await _active_object_ids(actions)
     if not object_ids:
         return {}
@@ -1009,7 +1160,9 @@ async def _physics_positions(
             pos_arr, np.zeros((0, 2)), ids_order, min_sep=_MIN_SEPARATION,
             iterations=_PHYSICS_DECLUMP_ITERATIONS)
         positions = {oid: pos_arr[i] for i, oid in enumerate(ids_order)}
-    positions.update(_place_unfiled(unfiled_ids, link_rows, positions))
+    project_centroids_only = {pid: centroids[pid] for pid in project_ids}
+    positions.update(
+        _place_unfiled(unfiled_ids, link_rows, positions, project_centroids_only))
 
     if hub_order:
         positions.update(_place_hubs_in_zone(hub_order, centroids[_HUB_ZONE_ID]))
@@ -1019,13 +1172,93 @@ async def _physics_positions(
     if reason:
         raise MemoryBudgetExceeded(reason)
 
-    declumped = _declump(
-        real_positions, np.zeros((0, 2)), object_ids, min_sep=_MIN_SEPARATION,
-        iterations=_PHYSICS_DECLUMP_ITERATIONS)
-    _verify_min_separation(declumped)
+    from src.orchestrator.settings_service import current_stored_value
+
+    stored_budget = await current_stored_value(
+        actions.pool, "layout.physics_declump_budget_secs")
+    budget_secs = (float(stored_budget) if isinstance(stored_budget, int | float)
+                   else _DEFAULT_PHYSICS_DECLUMP_BUDGET_SECS)
+    declumped, worst_residual, declump_iters = _declump_until_converged_or_budget(
+        real_positions, object_ids, min_sep=_MIN_SEPARATION, budget_secs=budget_secs)
+    if diagnostics is not None:
+        diagnostics["declump_worst_residual"] = worst_residual
+        diagnostics["declump_iterations"] = declump_iters
+        diagnostics.update(_layout_acceptance_metrics(
+            declumped, object_ids, membership, groups, project_ids, radii))
+    _verify_min_separation(worst_residual, min_sep=_MIN_SEPARATION)
 
     return {oid: (float(declumped[i, 0]), float(declumped[i, 1]))
             for i, oid in enumerate(object_ids)}
+
+
+def _layout_acceptance_metrics(
+    pos: np.ndarray, object_ids: list[uuid.UUID], membership: dict[uuid.UUID, uuid.UUID],
+    groups: dict[uuid.UUID, list[uuid.UUID]], project_ids: list[uuid.UUID],
+    radii: dict[uuid.UUID, float],
+) -> dict[str, Any]:
+    """THE ACCEPTANCE METRICS (Thoth mail 11208, required in every verify-only
+    receipt from now on): per-project centroid/r50/r95/N for the top 10 projects,
+    the minimum pairwise centroid gap among them against their own R_a+R_b, 5-NN
+    same-project purity for the biggest project, and the global bbox. Computed
+    from the SAME final positions the migration would write (or refuse) -- the
+    exact numbers Thoth's own live measurement caught v8's first real write
+    failing on (163k-unit bbox, every centroid near-coincident, 0.32 purity)."""
+    idx = {oid: i for i, oid in enumerate(object_ids)}
+    top = sorted(project_ids, key=lambda p: -len(groups[p]))[:10]
+
+    project_stats = []
+    top_centroids: dict[uuid.UUID, np.ndarray] = {}
+    for pid in top:
+        member_idx = [idx[m] for m in groups[pid] if m in idx]
+        if not member_idx:
+            continue
+        pts = pos[member_idx]
+        centroid = pts.mean(axis=0)
+        top_centroids[pid] = centroid
+        dists = np.linalg.norm(pts - centroid, axis=1)
+        project_stats.append({
+            "project": str(pid), "n": len(member_idx),
+            "centroid": centroid.tolist(),
+            "r50": float(np.percentile(dists, 50)),
+            "r95": float(np.percentile(dists, 95)),
+        })
+
+    min_gap = None
+    top_list = list(top_centroids.keys())
+    for i in range(len(top_list)):
+        for j in range(i + 1, len(top_list)):
+            a, b = top_list[i], top_list[j]
+            dist = float(np.linalg.norm(top_centroids[a] - top_centroids[b]))
+            required = radii.get(a, _MIN_SEPARATION) + radii.get(b, _MIN_SEPARATION)
+            gap = dist - required
+            if min_gap is None or gap < min_gap:
+                min_gap = gap
+
+    purity = None
+    if top:
+        biggest = top[0]
+        member_idx = [idx[m] for m in groups[biggest] if m in idx]
+        if member_idx:
+            rng = np.random.default_rng(42)
+            sample_idx = [member_idx[i] for i in rng.choice(
+                len(member_idx), size=min(300, len(member_idx)), replace=False)]
+            same_project = np.array([membership.get(oid) == biggest for oid in object_ids])
+            purities = []
+            for i in sample_idx:
+                d = np.linalg.norm(pos - pos[i], axis=1)
+                nn_idx = np.argsort(d)[1:6]  # skip self (distance 0)
+                purities.append(float(same_project[nn_idx].mean()))
+            purity = float(np.mean(purities))
+
+    bbox_min, bbox_max = pos.min(axis=0), pos.max(axis=0)
+    return {
+        "layout_project_stats": project_stats,
+        "layout_min_top10_centroid_gap": min_gap,
+        "layout_biggest_project_5nn_purity": purity,
+        "layout_bbox_min": bbox_min.tolist(),
+        "layout_bbox_max": bbox_max.tolist(),
+        "layout_bbox_width": (bbox_max - bbox_min).tolist(),
+    }
 
 
 async def _memory_guard(actions: Actions, positions: np.ndarray) -> str | None:
@@ -1081,13 +1314,15 @@ async def run_physics_migrate(
             return
         try:
             yield {"stage": "computing"}
+            diagnostics: dict[str, Any] = {}
             try:
-                positions = await _physics_positions(actions)
+                positions = await _physics_positions(actions, diagnostics=diagnostics)
             except (MemoryBudgetExceeded, DeclumpVerificationFailed) as exc:
-                yield {"error": str(exc)}
+                yield {"error": str(exc), **diagnostics}
                 return
             if verify_only:
-                yield {"done": True, "verify_only": True, "placed": len(positions)}
+                yield {"done": True, "verify_only": True, "placed": len(positions),
+                       **diagnostics}
                 return
             yield {"stage": "writing", "count": len(positions)}
             now = datetime.now(UTC)
@@ -1098,6 +1333,7 @@ async def run_physics_migrate(
                 await _bulk_assert_positions(
                     actions, {oid: positions[oid] for oid in batch_ids}, now)
             peak_rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            yield {"done": True, "placed": len(positions), "peak_rss_kb": peak_rss_kb}
+            yield {"done": True, "placed": len(positions), "peak_rss_kb": peak_rss_kb,
+                   **diagnostics}
         finally:
             await _release_layout_lock(lock_conn)

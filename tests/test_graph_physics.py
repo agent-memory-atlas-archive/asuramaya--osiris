@@ -232,18 +232,18 @@ async def test_physics_positions_places_every_active_object_with_no_exact_collis
     for x, y in positions.values():
         assert x == x and y == y  # not NaN
 
-    # tolerance matches `_verify_min_separation`'s own epsilon (already enforced
-    # inside `_physics_positions` itself, which would have raised
-    # DeclumpVerificationFailed otherwise) -- a bare 1e-6 assumed exact convergence,
-    # which the declump's own docstring already disclaims ("a few thousandths short
-    # after rounding"); this population's unfiled objects seed via a Gaussian fog
-    # (item 4) rather than the old deterministic sunflower scatter, so a near-exact
-    # residual after 30 iterations is expected, not a regression.
+    # tolerance matches `_verify_min_separation`'s own PROPORTIONAL floor (Thoth
+    # mail 11191; already enforced inside `_physics_positions` itself, which would
+    # have raised DeclumpVerificationFailed otherwise) -- a bare 1e-6 assumed exact
+    # convergence, which the declump's own docstring already disclaims ("a few
+    # thousandths short after rounding"); this population's unfiled objects seed
+    # via a Gaussian fog (item 4) rather than the old deterministic sunflower
+    # scatter, so a near-exact residual is expected, not a regression.
     pts = list(positions.values())
     for i in range(len(pts)):
         for j in range(i + 1, len(pts)):
             dist = ((pts[i][0] - pts[j][0]) ** 2 + (pts[i][1] - pts[j][1]) ** 2) ** 0.5
-            assert dist >= _MIN_SEPARATION - graph_physics._MIN_SEP_EPSILON
+            assert dist >= _MIN_SEPARATION * graph_physics._PHYSICS_VERIFY_FAIL_RATIO
 
 
 async def test_level2_layout_does_not_collapse_a_large_project_into_one_cell(
@@ -471,33 +471,52 @@ def test_place_unfiled_edgeless_scatters_away_from_a_fixed_ring() -> None:
 def test_verify_min_separation_passes_for_a_well_spread_population() -> None:
     ids: list[uuid.UUID | None] = [uuid.uuid4() for _ in range(50)]
     pos = _seed_positions(ids)
-    _verify_min_separation(pos, min_sep=_MIN_SEPARATION)  # no raise
+    worst = graph_physics._worst_pair_distance(pos, _MIN_SEPARATION)
+    _verify_min_separation(worst, min_sep=_MIN_SEPARATION)  # no raise
 
 
 def test_verify_min_separation_raises_on_two_coincident_points() -> None:
     pos = np.array([[0.0, 0.0], [0.001, 0.0]])
+    worst = graph_physics._worst_pair_distance(pos, _MIN_SEPARATION)
     with pytest.raises(DeclumpVerificationFailed):
-        _verify_min_separation(pos, min_sep=_MIN_SEPARATION)
+        _verify_min_separation(worst, min_sep=_MIN_SEPARATION)
 
 
-def test_declump_then_verify_never_flakes_on_many_random_small_unfiled_populations() -> None:
+def test_verify_min_separation_tolerates_a_residual_above_the_proportional_floor() -> None:
+    """PROPORTIONAL VERIFICATION (Thoth mail 11191): a residual comfortably above
+    `_PHYSICS_VERIFY_FAIL_RATIO * min_sep` (e.g. 13.6 of 15, Thoth's own "a
+    convergence residual, not a collapse; invisible") must NOT raise -- only a
+    genuine collapse well below that line does."""
+    residual = _MIN_SEPARATION * (graph_physics._PHYSICS_VERIFY_FAIL_RATIO + 0.05)
+    _verify_min_separation(residual, min_sep=_MIN_SEPARATION)  # no raise
+
+    collapse = _MIN_SEPARATION * (graph_physics._PHYSICS_VERIFY_FAIL_RATIO - 0.05)
+    with pytest.raises(DeclumpVerificationFailed):
+        _verify_min_separation(collapse, min_sep=_MIN_SEPARATION)
+
+
+def test_worst_pair_distance_returns_min_sep_for_a_well_spread_population() -> None:
+    ids: list[uuid.UUID | None] = [uuid.uuid4() for _ in range(50)]
+    pos = _seed_positions(ids)
+    assert graph_physics._worst_pair_distance(pos, _MIN_SEPARATION) == _MIN_SEPARATION
+
+
+def test_declump_until_converged_never_flakes_on_many_random_small_unfiled_pops() -> None:
     """Live flake specimen (full-suite serial gate, e7cf6c59 follow-up): a hermetic
     3-object all-unfiled population occasionally left one pair 14.24 units apart
-    after `_declump`'s own default 30 iterations, under the 15-unit floor by more
-    than `_verify_min_separation`'s epsilon. Reproduced here directly (no DB) over
-    many random small populations -- `_place_unfiled`'s own Gaussian fog is exactly
-    what generated the flaky starting configuration -- to confirm
-    `_PHYSICS_DECLUMP_ITERATIONS` actually closes the gap rather than just moving
-    it to a rarer seed."""
+    after `_declump`'s own default 30 iterations, under the old fixed-epsilon
+    floor. Reproduced here directly (no DB) over many random small populations --
+    `_place_unfiled`'s own Gaussian fog is exactly what generated the flaky
+    starting configuration -- to confirm the converge-or-budget declump actually
+    closes the gap rather than just moving it to a rarer seed."""
     for _trial in range(300):
         for n in (2, 3, 4):
             ids = [uuid.uuid4() for _ in range(n)]
             out = graph_physics._place_unfiled(ids, [], {})
             pos = np.array([out[oid] for oid in ids])
-            declumped = graph_physics._declump(
-                pos, np.zeros((0, 2)), ids, min_sep=_MIN_SEPARATION,
-                iterations=graph_physics._PHYSICS_DECLUMP_ITERATIONS)
-            _verify_min_separation(declumped)  # raises on failure -- the assertion
+            _declumped, worst, _iters = graph_physics._declump_until_converged_or_budget(
+                pos, ids, min_sep=_MIN_SEPARATION, budget_secs=5.0)
+            _verify_min_separation(worst)  # raises on failure -- the assertion
 
 
 def test_place_hubs_in_zone_spreads_hubs_at_least_min_sep_apart() -> None:
@@ -611,6 +630,10 @@ async def test_run_physics_migrate_writes_every_active_object_at_the_current_ver
     assert receipts[-1]["done"] is True
     assert receipts[-1]["placed"] >= 2
     assert receipts[-1]["peak_rss_kb"] > 0
+    # PROPORTIONAL VERIFICATION diagnostics (Thoth mail 11191) ride the receipt
+    # "either way" -- present on a successful run too, not just a refusal.
+    assert receipts[-1]["declump_worst_residual"] > 0
+    assert receipts[-1]["declump_iterations"] >= 0
 
     placed = await positions_for(actions, [a, b])
     assert a in placed and b in placed
@@ -638,9 +661,41 @@ async def test_run_physics_migrate_verify_only_writes_nothing(actions: Actions) 
     assert receipts[-1]["verify_only"] is True
     assert receipts[-1]["placed"] >= 2
     assert "peak_rss_kb" not in receipts[-1]
+    # THE ACCEPTANCE METRICS (Thoth mail 11208) ride the receipt too.
+    assert "layout_bbox_min" in receipts[-1]
+    assert "layout_bbox_max" in receipts[-1]
+    assert "layout_project_stats" in receipts[-1]
 
     placed = await positions_for(actions, [a, b])
     assert placed == {}
+
+
+def test_layout_acceptance_metrics_reports_purity_gap_and_bbox_for_two_projects() -> None:
+    """THE ACCEPTANCE METRICS (Thoth mail 11208, required after the first real v8
+    write measured a 163k-unit bbox with every centroid near-coincident and 0.32
+    same-project purity): two well-separated projects, hand-built positions, should
+    report a positive centroid gap and full same-project purity."""
+    proj_a, proj_b = uuid.uuid4(), uuid.uuid4()
+    members_a = [uuid.uuid4() for _ in range(6)]
+    members_b = [uuid.uuid4() for _ in range(6)]
+    object_ids = [*members_a, *members_b]
+    membership = {m: proj_a for m in members_a} | {m: proj_b for m in members_b}
+    groups = {proj_a: members_a, proj_b: members_b}
+    project_ids = [proj_a, proj_b]
+    radii = {proj_a: 20.0, proj_b: 20.0}
+
+    pos = np.array(
+        [[0.0, 0.0] for _ in members_a] + [[500.0, 0.0] for _ in members_b])
+    # spread each cluster a little so r50/r95 aren't degenerate zeros
+    pos = pos + np.array([[i * 2.0, 0.0] for i in range(len(object_ids))])
+
+    metrics = graph_physics._layout_acceptance_metrics(
+        pos, object_ids, membership, groups, project_ids, radii)
+    assert metrics["layout_min_top10_centroid_gap"] > 0  # well clear of R_a+R_b
+    assert metrics["layout_biggest_project_5nn_purity"] == 1.0  # tight, isolated cluster
+    assert len(metrics["layout_project_stats"]) == 2
+    assert metrics["layout_bbox_min"] is not None
+    assert metrics["layout_bbox_max"] is not None
 
 
 async def test_run_physics_migrate_refuses_when_the_layout_lock_is_held(
