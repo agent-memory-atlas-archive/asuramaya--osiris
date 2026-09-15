@@ -530,6 +530,14 @@ _LAYOUT_SETTINGS: tuple[SettingSpec, ...] = (
     SettingSpec("layout.physics_max_bytes", "int", 2_000_000_000, effect="immediate",
                validate=_validate_positive_int, consequence="low",
                requires_because=False),
+    # CONVERGE-OR-BUDGET DECLUMP (Thoth mail 11191, ruling 6befd2a5's own follow-up):
+    # the physics migration's final global declump pass now iterates in small
+    # chunks until the worst residual deficit clears 0.05*min_sep OR this wall-
+    # clock budget is spent, whichever comes first -- read fresh each migration
+    # run (no daemon to restart, same as layout.physics_max_bytes above).
+    SettingSpec("layout.physics_declump_budget_secs", "int", 120, effect="immediate",
+               validate=_validate_positive_int, consequence="low",
+               requires_because=False),
 )
 
 SETTINGS: tuple[SettingSpec, ...] = (

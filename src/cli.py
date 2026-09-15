@@ -778,8 +778,13 @@ async def cmd_layout(
         rc = 0
         if physics:
             async for receipt in run_physics_migrate(actions, verify_only=verify_only):
+                declump_note = (
+                    f" (worst residual {receipt['declump_worst_residual']:.3f}, "
+                    f"{receipt['declump_iterations']} declump iterations)"
+                    if "declump_worst_residual" in receipt else "")
                 if "error" in receipt:
-                    print(f"osiris layout: {receipt['error']}", file=sys.stderr)
+                    print(f"osiris layout: {receipt['error']}{declump_note}",
+                          file=sys.stderr)
                     rc = 1
                     break
                 if "stage" in receipt:
@@ -787,10 +792,10 @@ async def cmd_layout(
                           + (f" ({receipt['count']})" if "count" in receipt else ""))
                 elif receipt.get("verify_only"):
                     print(f"osiris layout: verify-only OK — {receipt['placed']} objects "
-                          "would be placed, nothing written")
+                          f"would be placed, nothing written{declump_note}")
                 elif receipt.get("done"):
                     print(f"osiris layout: done — {receipt['placed']} objects placed "
-                          "under the physics layout")
+                          f"under the physics layout{declump_note}")
             return rc
         async for receipt in run_layout_migrate(actions, limit=limit):
             if "error" in receipt:

@@ -136,18 +136,28 @@ centred on the whole placed cloud's own centroid, std set from that cloud's own
 spread -- density falls off smoothly outward instead of forming the "ring spike"
 Thoth's own measurement flagged on the v7 layout.
 
-VERIFIED DECLUMP (item 2): `_verify_min_separation` runs AFTER the final global
-`_declump` pass and raises `DeclumpVerificationFailed` loudly if any pair is still
-closer than `_MIN_SEPARATION - _MIN_SEP_EPSILON` -- declump's own 30-iteration cap is
-silent about non-convergence (it just stops), which is exactly how v7's nn p50 2.8
-went unnoticed until Thoth measured it live. The hierarchical layout is designed so
-declump only ever does bounded local cleanup at reasonable density and should always
-converge; this is the tripwire for "it didn't," not an expected outcome.
+VERIFIED DECLUMP (item 2, then PROPORTIONAL, Thoth mail 11191): the final global
+declump is `_declump_until_converged_or_budget` -- small chunks, re-measured after
+each, stopping once the worst deficit clears `_PHYSICS_DECLUMP_CONVERGED_RATIO` or
+`layout.physics_declump_budget_secs` wall-clock is spent, whichever first --
+followed by `_verify_min_separation`, which raises `DeclumpVerificationFailed`
+loudly only when the worst pair found is under `_PHYSICS_VERIFY_FAIL_RATIO * min_sep`
+(started as a fixed epsilon below the hard floor; Thoth's own live measurement on
+attempt 4 -- worst pair 13.566 of 15, "a convergence residual, not a collapse;
+invisible" -- showed a fixed-epsilon floor treated a narrow residual the same as a
+genuine collapse). `_declump`'s own per-call iteration cap is silent about non-
+convergence (it just stops), which is exactly how v7's nn p50 2.8 went unnoticed
+until Thoth measured it live -- the hierarchical layout is designed so declump only
+ever does bounded local cleanup at reasonable density and should almost always
+converge comfortably before the proportional line; this pairing (converge-or-budget,
+then a proportional check) is the tripwire for "it genuinely didn't," not a bare
+epsilon that flags ordinary residual noise as a failure.
 """
 from __future__ import annotations
 
 import math
 import resource
+import time
 import uuid
 from collections import defaultdict
 from collections.abc import AsyncIterator
@@ -236,11 +246,35 @@ _UNFILED_FOG_MIN_STD = 5 * _MIN_SEPARATION  # floor for the density-falloff Gaus
                                             # yet to measure a real cloud from (an
                                             # empty-graph edge case, never the live
                                             # population).
-_MIN_SEP_EPSILON = 0.5  # numerical slack `_verify_min_separation` allows below the
-                        # hard floor -- float rounding across `_declump`'s own
-                        # iterations can leave a pair a few thousandths short even
-                        # when it fully converged; this is tolerance for that, never
-                        # a loophole for a real violation.
+_PHYSICS_VERIFY_FAIL_RATIO = 0.75  # PROPORTIONAL VERIFICATION (Thoth mail 11191):
+                                   # `_verify_min_separation` refuses only when the
+                                   # worst pair is under this fraction of min_sep --
+                                   # Thoth's own live measurement (attempt 4, her
+                                   # run: worst pair 13.566 of 15, "a convergence
+                                   # residual, not a collapse; invisible") showed a
+                                   # fixed-epsilon floor (the OLD `_MIN_SEP_EPSILON`
+                                   # scheme) treated a narrow residual miss the same
+                                   # as a genuine collapse (specimens 1-3, all under
+                                   # 1 unit apart, comfortably still fail well
+                                   # inside this line).
+_PHYSICS_DECLUMP_CONVERGED_RATIO = 0.05  # `_declump_until_converged_or_budget`
+                                         # stops iterating once the worst deficit
+                                         # from min_sep clears this fraction (i.e.
+                                         # the worst pair is within 95% of the
+                                         # floor) -- comfortably inside
+                                         # `_PHYSICS_VERIFY_FAIL_RATIO`'s own 0.75
+                                         # line, so a converged run essentially
+                                         # never trips verification.
+_PHYSICS_DECLUMP_CHUNK = 30  # `_declump_until_converged_or_budget`'s own re-
+                             # measurement granularity -- re-checks the worst
+                             # pairwise distance after this many `_declump`
+                             # iterations rather than after every single one
+                             # (cheap either way, but `_worst_pair_distance`'s own
+                             # grid scan is O(n), no need to pay it every step).
+_DEFAULT_PHYSICS_DECLUMP_BUDGET_SECS = 120  # layout.physics_declump_budget_secs'
+                                            # own default -- the wall-clock ceiling
+                                            # `_declump_until_converged_or_budget`
+                                            # respects regardless of convergence.
 _PHYSICS_DECLUMP_ITERATIONS = 150  # started at 30 (graph_layout._declump's own
                                   # default), doubled to 60 (live flake specimen,
                                   # full-suite serial gate, e7cf6c59 follow-up: a
@@ -267,7 +301,13 @@ _PHYSICS_DECLUMP_ITERATIONS = 150  # started at 30 (graph_layout._declump's own
                                   # itself shifts between runs), not a sign the
                                   # algorithm needs doubling everywhere: every OTHER
                                   # `_declump` caller (the incremental heartbeat)
-                                  # keeps its own plain 30-iteration default.
+                                  # keeps its own plain 30-iteration default. USED
+                                  # BY the intermediate passes only (each project's
+                                  # own raw layout, each community's own raw
+                                  # layout, the post-nudge re-settle) -- the FINAL
+                                  # global pass moved to
+                                  # `_declump_until_converged_or_budget` (Thoth mail
+                                  # 11191), which no longer takes a fixed count.
 _VERIFY_MAX_CANDIDATES = 2000  # a cell-pair candidate count above this is treated as
                                # an outright verification failure rather than paying
                                # for the full pairwise check -- this many points
@@ -860,36 +900,93 @@ def _place_unfiled(
 
 class DeclumpVerificationFailed(Exception):
     """Raised by `_verify_min_separation` when the post-declump population still
-    holds a pair closer than `_MIN_SEPARATION - _MIN_SEP_EPSILON` -- `_declump`'s
-    own iteration cap is silent about non-convergence (it just stops), which is
-    exactly how v7's nn p50 2.8 went unnoticed until Thoth measured it live (mail
-    11128 item 2, "VERIFY it ... fail loudly if not"). The hierarchical layout is
-    designed so declump only ever does bounded local cleanup at reasonable density
-    and should always converge; this is the tripwire for "it didn't"."""
+    holds a pair closer than `_PHYSICS_VERIFY_FAIL_RATIO * min_sep` -- a genuine
+    collapse, not the ordinary convergence residual a narrower fixed-epsilon check
+    used to flag (Thoth mail 11191: attempt 4's worst pair, 13.566 of 15, was
+    "invisible" by her own read). `_declump`'s own per-call iteration cap is
+    silent about non-convergence (it just stops), which is exactly how v7's nn p50
+    2.8 went unnoticed until Thoth measured it live (mail 11128 item 2, "VERIFY it
+    ... fail loudly if not"). The hierarchical layout is designed so declump only
+    ever does bounded local cleanup at reasonable density and should comfortably
+    converge well inside the proportional line; this is the tripwire for "it
+    genuinely didn't"."""
 
 
-def _verify_min_separation(pos: np.ndarray, *, min_sep: float = _MIN_SEPARATION) -> None:
+def _worst_pair_distance(pos: np.ndarray, min_sep: float) -> float:
+    """The smallest pairwise distance anywhere in `pos`, scanned the same
+    grid-cell-neighbourhood way `_declump` itself does (never O(n^2)) -- `min_sep`
+    itself is returned when nothing violates it (nothing to report), and a cell
+    too dense to check cheaply (`_VERIFY_MAX_CANDIDATES`) reports `0.0`, the worst
+    possible value, rather than skip it silently. Shared by
+    `_declump_until_converged_or_budget` (PROPORTIONAL VERIFICATION, Thoth mail
+    11191) and `_verify_min_separation` -- the SAME measurement drives both "keep
+    iterating" and "is this bad enough to refuse the whole migration"."""
     if len(pos) < 2:
-        return
+        return min_sep
+    worst = min_sep
     cells = _grid_cells(pos, min_sep)
     for (cx, cy), _idxs in cells.items():
         candidates = _neighbor_cell_indices(cells, cx, cy)
         if len(candidates) < 2:
             continue
         if len(candidates) > _VERIFY_MAX_CANDIDATES:
-            raise DeclumpVerificationFailed(
-                f"cell ({cx},{cy}) holds {len(candidates)} candidate points after "
-                "declump -- too dense to verify cheaply, treated as a failure")
+            return 0.0
         pts = pos[candidates]
         diffs = pts[:, None, :] - pts[None, :, :]
         dists = np.sqrt((diffs ** 2).sum(axis=-1))
         np.fill_diagonal(dists, np.inf)
-        local_min = float(dists.min())
-        if local_min < min_sep - _MIN_SEP_EPSILON:
-            raise DeclumpVerificationFailed(
-                f"post-declump verification found a pair {local_min:.3f} units apart "
-                f"in cell ({cx},{cy}), under the {min_sep} floor (epsilon "
-                f"{_MIN_SEP_EPSILON}) -- declump did not converge")
+        worst = min(worst, float(dists.min()))
+    return worst
+
+
+def _declump_until_converged_or_budget(
+    pos: np.ndarray, ids: list[uuid.UUID], *, min_sep: float, budget_secs: float,
+    chunk_iterations: int = _PHYSICS_DECLUMP_CHUNK,
+) -> tuple[np.ndarray, float, int]:
+    """PROPORTIONAL VERIFICATION (Thoth mail 11191, ruling 6befd2a5's follow-up):
+    the OLD scheme ran a single FIXED iteration count and either passed or refused
+    outright -- Thoth's own live measurement (attempt 4, her own run: worst pair
+    13.566 of a 15 floor, "a convergence residual, not a collapse; invisible")
+    showed that a narrow residual miss isn't the same failure as an actual
+    structural collapse (specimens 1-3 were all under 1 unit apart), so treating
+    them identically either refuses good-enough layouts or (the old fixed-count
+    scheme) has no principled stopping point short of a hard budget. This runs
+    `_declump` in small chunks, re-measuring the worst pairwise distance
+    (`_worst_pair_distance`) after each, until either the deficit from `min_sep`
+    clears `_PHYSICS_DECLUMP_CONVERGED_RATIO` (comfortably converged) or
+    `budget_secs` wall-clock is spent (whichever first) -- returns the positions,
+    the worst residual distance actually reached, and how many iterations ran, so
+    the caller's own receipt can report both regardless of which one stopped it."""
+    start = time.monotonic()
+    total_iters = 0
+    worst = _worst_pair_distance(pos, min_sep)
+    converged_floor = min_sep * (1.0 - _PHYSICS_DECLUMP_CONVERGED_RATIO)
+    while worst < converged_floor and time.monotonic() - start < budget_secs:
+        pos = _declump(
+            pos, np.zeros((0, 2)), ids, min_sep=min_sep, iterations=chunk_iterations)
+        total_iters += chunk_iterations
+        worst = _worst_pair_distance(pos, min_sep)
+    return pos, worst, total_iters
+
+
+def _verify_min_separation(
+    worst_pair_distance: float, *, min_sep: float = _MIN_SEPARATION,
+) -> None:
+    """PROPORTIONAL VERIFICATION (Thoth mail 11191): fails only when the worst
+    pair found is under `_PHYSICS_VERIFY_FAIL_RATIO * min_sep` -- a residual ABOVE
+    that line (e.g. 13.6 of 15, Thoth's own "invisible" specimen) is tolerated as
+    a normal convergence residual, never refused; genuinely collapsed pairs
+    (specimens 1-3, all under 1 unit) still fail loudly well before this line.
+    Takes the ALREADY-MEASURED worst distance (from
+    `_declump_until_converged_or_budget`'s own return) rather than re-scanning --
+    one measurement, two decisions (keep iterating vs. refuse), never computed
+    twice."""
+    fail_floor = min_sep * _PHYSICS_VERIFY_FAIL_RATIO
+    if worst_pair_distance < fail_floor:
+        raise DeclumpVerificationFailed(
+            f"post-declump verification found a pair {worst_pair_distance:.3f} units "
+            f"apart, under {_PHYSICS_VERIFY_FAIL_RATIO} * the {min_sep} floor "
+            f"({fail_floor:.3f}) -- a genuine collapse, not a convergence residual")
 
 
 def _hub_zone_radius(n_hubs: int) -> float:
@@ -928,7 +1025,7 @@ def _place_hubs_in_zone(
 
 
 async def _physics_positions(
-    actions: Actions,
+    actions: Actions, *, diagnostics: dict[str, Any] | None = None,
 ) -> dict[uuid.UUID, tuple[float, float]]:
     """THE HIERARCHICAL PHYSICS pipeline (v8, Thoth mail 11128) -- pure enough to
     unit-test without a live migration write past the DB reads at the top:
@@ -937,10 +1034,15 @@ async def _physics_positions(
     extent-aware separation, using each project's REAL extent) -> level 2 finalize
     (scale UP only, translated onto its level-1 disc) -> cross-project bridge
     nudges -> unfiled placement -> hub re-centering -> the memory guard -> the
-    existing declump floor -> VERIFIED. Real object positions only. Can raise
-    `MemoryBudgetExceeded` or
-    `DeclumpVerificationFailed` -- the caller (`run_physics_migrate`) turns either
-    into a written refusal receipt rather than letting a bad layout write."""
+    final declump, now CONVERGE-OR-BUDGET (`_declump_until_converged_or_budget`,
+    Thoth mail 11191) -> PROPORTIONALLY VERIFIED (`_verify_min_separation`, fails
+    only on a genuine collapse, not a narrow residual). Real object positions
+    only. Can raise `MemoryBudgetExceeded` or `DeclumpVerificationFailed` -- the
+    caller (`run_physics_migrate`) turns either into a written refusal receipt
+    rather than letting a bad layout write. `diagnostics`, when given, is filled
+    with `declump_worst_residual`/`declump_iterations` regardless of outcome --
+    Thoth's own ask, "the receipt reports the worst residual pair and iteration
+    count either way"."""
     object_ids = await _active_object_ids(actions)
     if not object_ids:
         return {}
@@ -1019,10 +1121,18 @@ async def _physics_positions(
     if reason:
         raise MemoryBudgetExceeded(reason)
 
-    declumped = _declump(
-        real_positions, np.zeros((0, 2)), object_ids, min_sep=_MIN_SEPARATION,
-        iterations=_PHYSICS_DECLUMP_ITERATIONS)
-    _verify_min_separation(declumped)
+    from src.orchestrator.settings_service import current_stored_value
+
+    stored_budget = await current_stored_value(
+        actions.pool, "layout.physics_declump_budget_secs")
+    budget_secs = (float(stored_budget) if isinstance(stored_budget, int | float)
+                   else _DEFAULT_PHYSICS_DECLUMP_BUDGET_SECS)
+    declumped, worst_residual, declump_iters = _declump_until_converged_or_budget(
+        real_positions, object_ids, min_sep=_MIN_SEPARATION, budget_secs=budget_secs)
+    if diagnostics is not None:
+        diagnostics["declump_worst_residual"] = worst_residual
+        diagnostics["declump_iterations"] = declump_iters
+    _verify_min_separation(worst_residual, min_sep=_MIN_SEPARATION)
 
     return {oid: (float(declumped[i, 0]), float(declumped[i, 1]))
             for i, oid in enumerate(object_ids)}
@@ -1081,13 +1191,15 @@ async def run_physics_migrate(
             return
         try:
             yield {"stage": "computing"}
+            diagnostics: dict[str, Any] = {}
             try:
-                positions = await _physics_positions(actions)
+                positions = await _physics_positions(actions, diagnostics=diagnostics)
             except (MemoryBudgetExceeded, DeclumpVerificationFailed) as exc:
-                yield {"error": str(exc)}
+                yield {"error": str(exc), **diagnostics}
                 return
             if verify_only:
-                yield {"done": True, "verify_only": True, "placed": len(positions)}
+                yield {"done": True, "verify_only": True, "placed": len(positions),
+                       **diagnostics}
                 return
             yield {"stage": "writing", "count": len(positions)}
             now = datetime.now(UTC)
@@ -1098,6 +1210,7 @@ async def run_physics_migrate(
                 await _bulk_assert_positions(
                     actions, {oid: positions[oid] for oid in batch_ids}, now)
             peak_rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            yield {"done": True, "placed": len(positions), "peak_rss_kb": peak_rss_kb}
+            yield {"done": True, "placed": len(positions), "peak_rss_kb": peak_rss_kb,
+                   **diagnostics}
         finally:
             await _release_layout_lock(lock_conn)
