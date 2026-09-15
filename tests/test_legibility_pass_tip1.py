@@ -68,16 +68,24 @@ def test_degree_curve_matches_thoths_own_anchors() -> None:
 
 # --- (c): labels are names, per-type formatting, hard truncation, a hover card ------------
 
-def test_labels_resolve_real_names_not_the_old_wire_less_fallback() -> None:
+def test_labels_resolve_real_names_off_the_wire_header_now() -> None:
+    # TIP 1b (Thoth mail 10755): "swap the client label fallback for the header labels" --
+    # Khnum's own `labels` array (graph_stream.py's _short_label, tip 2g) is the source now,
+    # synchronous off nd.label, not a per-node /objects/{id} fetch for the general case.
     assert "function labelTextFor(nd)" in _SPACE_JS
-    assert "async function fetchNodeLabel(nd)" in _SPACE_JS
-    assert 'fetch(`/objects/${nd.id}`)' in _SPACE_JS
+    assert "label: snap.labels ? snap.labels[i] : undefined," in _SPACE_JS
+    body = _SPACE_JS.split("function labelTextFor(nd)", 1)[1][:400]
+    assert 'if (nd.type !== "Commit") return nd.label || fallbackLabel(nd);' in body
 
 
-def test_label_formatting_is_per_type() -> None:
-    body = _SPACE_JS.split("async function fetchNodeLabel(nd)", 1)[1][:700]
-    assert 'const NAME_TYPES = new Set(["Agent", "SoftwareProject", "Person"]);' in _SPACE_JS
-    assert "NAME_TYPES.has(nd.type) ? title : `${nd.type}: ${title}`" in body
+def test_commit_labels_use_the_subject_line_not_the_canonical_id() -> None:
+    # review flaw #6: Khnum's own server-side label falls back to "Commit commit:<sha>"
+    # (no subject property on the wire snapshot) -- a narrow client-side upgrade for Commit
+    # only, never a per-node fetch for any other type.
+    assert "async function fetchCommitSubject(nd)" in _SPACE_JS
+    body = _SPACE_JS.split("async function fetchCommitSubject(nd)", 1)[1][:500]
+    assert 'obj.properties.find((p) => p.name === "subject");' in body
+    assert "text = `Commit: ${subject.value}`;" in body
 
 
 def test_labels_are_hard_truncated_at_forty_chars_with_an_ellipsis() -> None:
@@ -86,10 +94,10 @@ def test_labels_are_hard_truncated_at_forty_chars_with_an_ellipsis() -> None:
     assert "flat.slice(0, LABEL_MAX - 1) + \"…\"" in body
 
 
-def test_label_names_are_cached_per_id_fetched_at_most_once() -> None:
+def test_commit_subject_is_cached_per_id_fetched_at_most_once() -> None:
     body = _SPACE_JS.split("function labelTextFor(nd)", 1)[1][:600]
-    assert "_labelCache.get(nd.id)" in body
-    assert "_labelInFlight.has(nd.id)" in body
+    assert "_commitSubjectCache.get(nd.id)" in body
+    assert "_commitSubjectInFlight.has(nd.id)" in body
 
 
 def test_hover_card_exists_and_shows_label_plus_type_and_project() -> None:

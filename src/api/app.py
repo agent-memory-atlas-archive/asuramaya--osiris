@@ -88,6 +88,24 @@ _UI_DIR = Path(__file__).resolve().parent.parent / "ui" / "static"
 _INBOX_STATIC_DIR = Path(__file__).resolve().parent / "inbox" / "static"
 
 
+class _RevalidatingStaticFiles(StaticFiles):
+    """THE LEGIBILITY PASS review, flaw #4 (Thoth mail 10752): after every /ui deploy this
+    whole session, a plain reload could still serve a STALE osiris.css/console.js/space.js —
+    Thoth's own adversarial review measured the canvas controls still bottom-anchored on a
+    freshly-deployed build (the exact rect a stale cached stylesheet renders), and this agent
+    hit the identical symptom live-verifying an earlier tip, fixed only by a hard reload.
+    Starlette's own StaticFiles sends ETag/Last-Modified but no Cache-Control, so a browser's
+    HEURISTIC cache can reuse a plain-reload response without even a conditional request.
+    `no-cache` forces revalidation on every load (a 304 on an unchanged file, a real refetch
+    on a changed one) without disabling caching outright -- the actual fix for a codebase
+    whose static assets change every few minutes during active development."""
+
+    def file_response(self, *args: object, **kwargs: object) -> Response:
+        response = super().file_response(*args, **kwargs)  # type: ignore[arg-type]
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 _log = logging.getLogger("osiris.api")
 
 
@@ -1940,7 +1958,7 @@ def create_app(pool: asyncpg.Pool | None = None) -> FastAPI:
                         media_type="text/html")
 
     if _UI_DIR.is_dir():
-        app.mount("/ui", StaticFiles(directory=str(_UI_DIR), html=True), name="ui")
+        app.mount("/ui", _RevalidatingStaticFiles(directory=str(_UI_DIR), html=True), name="ui")
 
     # THE INBOX (task #71, ruling 0b3dd431): :8011's new front door, replacing /membrane
     # (retired above). Frozen static assets (vendored datastar.js, app.css) mounted

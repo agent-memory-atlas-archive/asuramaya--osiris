@@ -153,6 +153,12 @@ async function fetchStreamSnapshot() {
       x: snap.x[i], y: snap.y[i],
       degree: snap.weight[i],
       statusFlag: snap.status_flag[i],
+      // TIP 1b (Thoth mail 10755): "swap the client label fallback for the header
+      // labels" -- Khnum's own labels array (index-aligned to object_ids, tip 2g) is
+      // the label now, computed server-side with the exact same per-type rule and
+      // 40-char truncation THE LEGIBILITY PASS specified. Falls back to a client-built
+      // string only if an older snapshot lacks the field.
+      label: snap.labels ? snap.labels[i] : undefined,
     });
   }
   const edges = [];
@@ -530,6 +536,7 @@ export async function initSpace(container) {
         if (el.checked) hiddenNodeTypes.delete(type); else hiddenNodeTypes.add(type);
         applyDim();
         buildEdgeLines(idToNode, edges);
+        scheduleLabelPick(); // review flaw #5
       });
     });
     legendPanel.querySelectorAll("[data-legend-class]").forEach((el) => {
@@ -649,6 +656,7 @@ export async function initSpace(container) {
     hiddenNodeTypes = new Set(types || []);
     applyDim();
     buildEdgeLines(idToNode, edges);
+    scheduleLabelPick(); // review flaw #5: labels never re-picked on a filter change before
   }
 
   async function loadTypeColors() {
@@ -753,14 +761,20 @@ export async function initSpace(container) {
   // restored by clearFocus or before laying out a new focus — never written back anywhere.
   const EGO_COL_SPACING_PX = 150;
   const EGO_ROW_SPACING_PX = 34;
+  // review flaw #2: "until roots" with no cap let a real hub (repo:osiris, degree 20,560)
+  // reach 20,266 nodes in 3.1s and light the whole graph -- not a lens any more. Rank-capped
+  // now: the walk still goes to genuine roots for an ordinary object, but never surfaces
+  // more than this many nodes for one direction, so a hub focus stays a legible tree.
+  const MAX_EGO_NODES = 300;
   let egoSaved = null; // Map<id, {x,y}> of positions the active relayout overwrote
   function bfsHops(adj, startId, depth) {
     const hops = new Map([[startId, 0]]);
     let frontier = [startId];
-    for (let d = 1; d <= depth && frontier.length; d++) {
+    for (let d = 1; d <= depth && frontier.length && hops.size < MAX_EGO_NODES; d++) {
       const next = [];
       for (const cur of frontier) {
         for (const t of adj.get(cur) || []) {
+          if (hops.size >= MAX_EGO_NODES) break;
           if (!hops.has(t)) { hops.set(t, d); next.push(t); }
         }
       }
@@ -945,9 +959,17 @@ export async function initSpace(container) {
     { passive: false }
   );
 
-  // ---- GPU picking (unchanged from the spike) ----------------------------------------
-  const pickTarget = new THREE.WebGLRenderTarget(1, 1);
-  const pickBuf = new Uint8Array(4);
+  // ---- GPU picking (nearest-within-tolerance, review flaw #3/#8) ----------------------
+  // review flaw #3: the original 1x1 pick was EXACT-PIXEL, no tolerance -- two real clicks
+  // on genuinely visible small nodes (4px, 8px) missed outright (selectedId/pickAt both
+  // null). Same root cause made the hover card read empty on a real hover (#8): it calls
+  // this same function. Fixed by rendering a small box around the cursor instead of one
+  // pixel and picking whichever hit id sits closest to the box's own centre — an exact hit
+  // still wins immediately (distance 0), a near-miss within PICK_BOX/2 px now resolves too.
+  const PICK_BOX = 33; // device px, odd -- generous tolerance, still a trivial GPU readback
+  const PICK_HALF = (PICK_BOX - 1) / 2;
+  const pickTarget = new THREE.WebGLRenderTarget(PICK_BOX, PICK_BOX);
+  const pickBuf = new Uint8Array(PICK_BOX * PICK_BOX * 4);
   function pickAt(clientX, clientY) {
     const rect = renderer.domElement.getBoundingClientRect();
     // setViewOffset's (x,y) origin is TOP-LEFT (matching a mouse event's own coordinates,
@@ -956,14 +978,26 @@ export async function initSpace(container) {
     // clicks missing the node visually under the cursor.
     const px = (clientX - rect.left) * (window.devicePixelRatio || 1);
     const py = (clientY - rect.top) * (window.devicePixelRatio || 1);
-    camera.setViewOffset(renderer.domElement.width, renderer.domElement.height, px, py, 1, 1);
+    camera.setViewOffset(
+      renderer.domElement.width, renderer.domElement.height,
+      px - PICK_HALF, py - PICK_HALF, PICK_BOX, PICK_BOX);
     renderer.setRenderTarget(pickTarget);
     renderer.render(pickScene, camera);
     renderer.setRenderTarget(null);
     camera.clearViewOffset();
-    renderer.readRenderTargetPixels(pickTarget, 0, 0, 1, 1, pickBuf);
-    const id = pickBuf[0] | (pickBuf[1] << 8) | (pickBuf[2] << 16);
-    return id === 0 ? null : idToNode[id - 1];
+    renderer.readRenderTargetPixels(pickTarget, 0, 0, PICK_BOX, PICK_BOX, pickBuf);
+    let bestId = 0, bestDist = Infinity;
+    for (let y = 0; y < PICK_BOX; y++) {
+      for (let x = 0; x < PICK_BOX; x++) {
+        const o = (y * PICK_BOX + x) * 4;
+        const id = pickBuf[o] | (pickBuf[o + 1] << 8) | (pickBuf[o + 2] << 16);
+        if (id === 0) continue;
+        const dx = x - PICK_HALF, dy = y - PICK_HALF;
+        const dist = dx * dx + dy * dy;
+        if (dist < bestDist) { bestDist = dist; bestId = id; }
+      }
+    }
+    return bestId === 0 ? null : idToNode[bestId - 1];
   }
 
   // TIP 1 AMENDMENT (operator via Thoth mail 10726): a single CLICK on a node IS focus —
@@ -1019,6 +1053,12 @@ export async function initSpace(container) {
     restoreEgoLayout();
     if (restored) syncMovedInstancePositions(restored);
     applyDim();
+    // review flaw #1: the BASE edge layer is its own static geometry (built once from
+    // node x/y at buildEdgeLines time) -- hiding a NODE's own instance (aVisible=0) never
+    // touched its EDGES, so the whole unreachable graph stayed drawn in faint lines after a
+    // focus. Rebuilding here (nodeVisible already gates on pathReachable/hiddenNodeTypes)
+    // is what actually drops them; clearing needs it too, to restore the full base layer.
+    buildEdgeLines(idToNode, edges);
     updatePathEdges();
     rightRail.className = "rail";
     rightRail.innerHTML =
@@ -1065,6 +1105,10 @@ export async function initSpace(container) {
   // dim), relays out the reachable set locally (TIP 1's own ego-layout amendment), fits the
   // camera, then the inspector fetch fills in after.
   async function focusObject(id, opts) {
+    // review flaw #9: focusObject(null) (a stray call with no real hit — the footer's own
+    // "focused-badge" onclick, or a failed pick) used to set pathFocusId=null yet still walk
+    // and report "focused: 1 reachable" against a degenerate single-null-entry set.
+    if (!id) { clearFocus(); return; }
     const t0 = performance.now();
     const options = opts || {};
     selectedId = id;
@@ -1078,9 +1122,13 @@ export async function initSpace(container) {
     // the camera fit to a point. When the walk finds nothing beyond the focused node itself,
     // widen one hop over its own STRUCTURAL edges instead (ranked as upstream, hop 1, for
     // the ego layout below) — still just this node's real neighbours, never a synthetic
-    // minimum.
+    // minimum. review flaw #2's OWN second half: this loop had no cap at all — a real hub
+    // (repo:osiris, structural degree 20k+) has few/no PATH_EDGE_TYPES links of its own, so
+    // pathReachable.size<=1 was true and this fallback alone reproduced the exact same
+    // whole-graph blowup the rank cap above was built to prevent. Same MAX_EGO_NODES cap.
     if (pathReachable.size <= 1) {
       for (const e of edges) {
+        if (pathReachable.size >= MAX_EGO_NODES) break;
         if (e.edgeClass !== "structural") continue;
         const other = e.source === id ? e.target : e.target === id ? e.source : null;
         if (other == null || pathReachable.has(other)) continue;
@@ -1120,6 +1168,7 @@ export async function initSpace(container) {
     }
 
     applyDim();
+    buildEdgeLines(idToNode, edges); // review flaw #1: base layer must hide too, see clearFocus
     updatePathEdges();
     setStatus(`focused: ${pathReachable.size} reachable` +
       (includeDownstream ? " (upstream+downstream)" : " (upstream)"));
@@ -1161,49 +1210,48 @@ export async function initSpace(container) {
   // directly now, a hit always focuses (click and Enter no longer differ, matching the
   // canvas's own "one gesture" — see mail 10726).
 
-  // TIP 1(c): LABELS ARE NAMES — Agent by handle/name, SoftwareProject by repo name, Person
-  // by name, everything else type + short title. One line, hard-truncated at 40 chars with
-  // an ellipsis (never a paragraph — the old "wall of garbage text" bug was Decision/Thread
-  // falling through to a full summary property). Until Khnum's tip 2 ships a labels source
-  // on the wire header, names are read from the existing /objects/{id} endpoint (the same
-  // one `inspect()` already calls) for the labelled nearest-N only — never the whole graph,
-  // cached per id so a node's name is fetched at most once per session.
+  // TIP 1(c), TIP 1b (Thoth mail 10755): LABELS ARE NAMES — Agent by handle/name,
+  // SoftwareProject by repo name, Person by name, everything else type + short title. One
+  // line, hard-truncated at 40 chars with an ellipsis. Khnum's own `labels` wire header
+  // (tip 2g) now computes exactly this rule server-side, index-aligned to object_ids — the
+  // client fallback (a per-node /objects/{id} fetch) is retired for the general case; nd.label
+  // is already the final text, synchronous, no network wait. ONE narrow exception: Khnum's
+  // own label for a Commit falls back to "Commit commit:<sha>" (no subject property exists
+  // on the wire snapshot yet, review flaw #6) — for Commit only, a single async fetch
+  // upgrades the label to the real subject line once resolved, cached per id.
   const LABEL_MAX = 40;
-  const NAME_TYPES = new Set(["Agent", "SoftwareProject", "Person"]);
   function truncateLabel(s) {
     const flat = String(s || "").replace(/\s+/g, " ").trim();
     return flat.length <= LABEL_MAX ? flat : flat.slice(0, LABEL_MAX - 1) + "…";
   }
   function fallbackLabel(nd) { return `${nd.type} ${nd.id.slice(0, 8)}`; }
-  const _labelCache = new Map(); // id -> resolved text
-  const _labelInFlight = new Set();
-  async function fetchNodeLabel(nd) {
-    let text;
+  const _commitSubjectCache = new Map(); // id -> resolved text
+  const _commitSubjectInFlight = new Set();
+  async function fetchCommitSubject(nd) {
+    let text = nd.label || fallbackLabel(nd);
     try {
       const obj = await fetch(`/objects/${nd.id}`).then((r) => r.json());
-      const title = (obj && (obj.title || obj.name)) || "";
-      text = title
-        ? (NAME_TYPES.has(nd.type) ? title : `${nd.type}: ${title}`)
-        : fallbackLabel(nd);
-    } catch {
-      text = fallbackLabel(nd);
-    }
+      const subject = obj && obj.properties &&
+        obj.properties.find((p) => p.name === "subject");
+      if (subject && subject.value) text = `Commit: ${subject.value}`;
+    } catch { /* keep the wire label on any fetch failure */ }
     return truncateLabel(text);
   }
   function labelTextFor(nd) {
-    const cached = _labelCache.get(nd.id);
+    if (nd.type !== "Commit") return nd.label || fallbackLabel(nd);
+    const cached = _commitSubjectCache.get(nd.id);
     if (cached) return cached;
-    if (!_labelInFlight.has(nd.id)) {
-      _labelInFlight.add(nd.id);
-      fetchNodeLabel(nd).then((text) => {
-        _labelCache.set(nd.id, text);
-        _labelInFlight.delete(nd.id);
+    if (!_commitSubjectInFlight.has(nd.id)) {
+      _commitSubjectInFlight.add(nd.id);
+      fetchCommitSubject(nd).then((text) => {
+        _commitSubjectCache.set(nd.id, text);
+        _commitSubjectInFlight.delete(nd.id);
         const div = labelDivs.get(nd);
         if (div) div.textContent = text;
         if (hoverNode === nd) updateHoverCard(nd);
       });
     }
-    return fallbackLabel(nd);
+    return nd.label || fallbackLabel(nd);
   }
 
   const N_LABELS = 40;
@@ -1217,7 +1265,10 @@ export async function initSpace(container) {
   function pickLabels() {
     const cx = camera.position.x, cy = camera.position.y;
     const n = Math.max(10, Math.round(N_LABELS - (viewSize / 2000) * 30));
-    const pool = pathFocusId ? idToNode.filter((nd) => pathReachable.has(nd.id)) : idToNode;
+    // review flaw #5: labels used to ignore hiddenNodeTypes entirely, so a type-filtered
+    // node's label kept showing even with its own instance invisible.
+    const pool = (pathFocusId ? idToNode.filter((nd) => pathReachable.has(nd.id)) : idToNode)
+      .filter((nd) => !hiddenNodeTypes.has(nd.type));
     labeledNodes = pool
       .map((nd) => ({ nd, d: (nd.x - cx) ** 2 + (nd.y - cy) ** 2 }))
       .sort((a, b) => a.d - b.d)

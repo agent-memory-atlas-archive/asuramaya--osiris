@@ -1208,7 +1208,25 @@ function runOmniSearch(q) {
       hint: h.type || '', cat: 'Graph',
       run: () => { switchSurface('browse'); focus(h.id); },
     }));
-    OMNI_ITEMS = toolHits.concat(compHits, graphHits).slice(0, 16);
+    // review flaw #7: "typing 'Thoth' shows No matches" though 100+ Thoth agents exist --
+    // the server /search Function doesn't surface agent handles. Rather than touch that
+    // shared search engine, this scans the graph already loaded client-side in space.js
+    // (idToNode, TIP 1b's own wire labels) for a case-insensitive substring match against
+    // Agent handles/labels -- a real fallback, not a guess, since the data is right there.
+    const space = window.OsirisSpace;
+    let agentHits = [];
+    if (space && space.idToNode) {
+      const seen = new Set(graphHits.map(g => g.label));
+      agentHits = space.idToNode
+        .filter(n => n.type === 'Agent' && n.label && n.label.toLowerCase().includes(ql))
+        .filter(n => !seen.has(n.label))
+        .slice(0, 8)
+        .map(n => ({
+          label: n.label, hint: 'Agent', cat: 'Graph',
+          run: () => { switchSurface('browse'); focus(n.id); },
+        }));
+    }
+    OMNI_ITEMS = toolHits.concat(compHits, graphHits, agentHits).slice(0, 16);
     OMNI_SEL = Math.min(OMNI_SEL, OMNI_ITEMS.length - 1);
     renderOmniList(q);
   }, 200);
