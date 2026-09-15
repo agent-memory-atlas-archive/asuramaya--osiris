@@ -85,14 +85,19 @@ def test_dead_viewswitcher_css_is_gone_too() -> None:
 # --- still-alive concerns from the retired WAVE A file, carried forward -------------------
 
 def test_breadcrumbs_are_still_wired_in_console_js() -> None:
+    # stepBackBreadcrumb is gone (TIP 1c review flaw #2, Thoth mail 10891) -- Escape now
+    # clears the focus outright instead of stepping back one crumb, per the amendment's own
+    # ruling ("Escape clears, Back walks the stack"); the function had no other caller left.
     assert "function pushBreadcrumb(id, label)" in _CONSOLE_JS
     assert "function jumpToBreadcrumb(i)" in _CONSOLE_JS
-    assert "function stepBackBreadcrumb()" in _CONSOLE_JS
+    assert "function stepBackBreadcrumb()" not in _CONSOLE_JS
 
 
-def test_escape_still_steps_back_a_breadcrumb_when_nothing_more_local_consumed_it() -> None:
-    assert "stepBackBreadcrumb()" in _CONSOLE_JS
-    assert "if (!hadDropdown && !hadPeek && ACTIVE_SURFACE === 'browse')" in _CONSOLE_JS
+def test_escape_clears_the_focus_when_nothing_more_local_consumed_it() -> None:
+    # TIP 1c review flaw #2: Escape used to step back a breadcrumb instead of actually
+    # clearing anything -- a real state divergence from the amendment's own ruling.
+    body = _CONSOLE_JS.split("if (!hadDropdown && !hadPeek", 1)[1][:120]
+    assert "window.OsirisSpace.clearFocus();" in body
 
 
 def test_breadcrumb_markup_still_exists() -> None:

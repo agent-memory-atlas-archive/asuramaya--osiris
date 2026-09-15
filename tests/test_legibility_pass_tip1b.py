@@ -41,7 +41,7 @@ async def test_ui_static_assets_force_revalidation() -> None:
 # --- flaw #1: focus rebuilds the BASE edge layer too, not just node visibility ------------
 
 def test_focus_rebuilds_the_base_edge_layer_not_just_node_visibility() -> None:
-    focus_body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:4000]
+    focus_body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:4400]
     assert "buildEdgeLines(idToNode, edges); // review flaw #1" in focus_body
     clear_body = _SPACE_JS.split("function clearFocus()", 1)[1][:900]
     assert "buildEdgeLines(idToNode, edges);" in clear_body
@@ -86,9 +86,20 @@ def test_labels_respect_the_type_filter() -> None:
 # --- flaw #7: the omnibox finds an agent by handle off the already-loaded graph -----------
 
 def test_omnibox_falls_back_to_a_client_side_agent_handle_scan() -> None:
-    body = _CONSOLE_JS.split("const graphHits = hits.filter", 1)[1][:1400]
+    body = _CONSOLE_JS.split("const graphHits = hits.filter", 1)[1][:2000]
     assert "n.type === 'Agent' && n.label && n.label.toLowerCase().includes(ql)" in body
     assert "OMNI_ITEMS = toolHits.concat(compHits, graphHits, agentHits).slice(0, 16);" in body
+
+
+def test_omnibox_fallback_awaits_space_readiness_not_just_a_truthy_global() -> None:
+    # TIP 1c re-fix (Thoth mail 10891): "the fallback did not fire on the deployed page" --
+    # it gated on window.OsirisSpace, which is undefined until initSpace's own promise
+    # resolves; a search typed before that settles found nothing and stayed that way.
+    body = _CONSOLE_JS.split("const graphHits = hits.filter", 1)[1][:2000]
+    assert "if (hits.length === 0) {" in body
+    assert "window.OsirisSpace || (window.__spaceReady && await window.__spaceReady)" in body
+    assert "if (myToken !== OMNI_SEARCH_TOKEN) return; " \
+        "// the await above can cross a newer keystroke" in body
 
 
 # --- flaw #9: a null/undefined focus id never produces a degenerate focused state ---------

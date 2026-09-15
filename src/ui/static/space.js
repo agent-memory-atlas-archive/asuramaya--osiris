@@ -815,7 +815,13 @@ export async function initSpace(container) {
     const focusNode = idx.get(focusId);
     if (!focusNode) return;
     const cx = focusNode.x || 0, cy = focusNode.y || 0;
-    const wpp = worldPerPx();
+    // review flaw #6 (TIP 1c, Thoth mail 10891): using the CURRENT (pre-focus) worldPerPx
+    // made the ego layout's own scale track whatever zoom the camera happened to be at --
+    // a small reachable set following another tight focus could spiral the fit down to a
+    // near-empty viewSize, where the 48px screen CAP then dominates the whole frame.
+    // maxViewSize (the whole graph's own fitted scale, stable since fitToNodes) gives a
+    // reference wpp that never shrinks just because the camera was already zoomed in.
+    const wpp = maxViewSize / wrap.clientHeight;
     const colW = EGO_COL_SPACING_PX * wpp, rowH = EGO_ROW_SPACING_PX * wpp;
     egoSaved = new Map();
     const byRank = new Map(); // signed hop (-left/+right) -> [ids]
@@ -1180,8 +1186,13 @@ export async function initSpace(container) {
       // padding + a sane floor/ceiling — the ceiling rides maxViewSize (the real fitted
       // graph's own extent, set in fitToNodes) rather than a hardcoded 1300: the same class
       // of stale-constant bug Thoth caught in the wheel clamp (mail 10581) would otherwise
-      // clip a legitimately wide-spread path back down to a fixed small view.
-      viewSize = Math.max(30, Math.min(maxViewSize, span * 1.6 + 40));
+      // clip a legitimately wide-spread path back down to a fixed small view. The floor
+      // (review flaw #6, TIP 1c) is raised from the old 30 -- fine for a whole-graph fit,
+      // where span is always huge, but a tiny reachable set (a lone child or two) could
+      // collapse the ego layout's own span near that floor, leaving the 48px screen CAP as
+      // the dominant visual element in an otherwise near-empty frame.
+      const EGO_FIT_MIN_VIEWSIZE = 400;
+      viewSize = Math.max(EGO_FIT_MIN_VIEWSIZE, Math.min(maxViewSize, span * 1.6 + 40));
       updateFrustum();
       rescaleForZoom();
     }
@@ -1202,11 +1213,30 @@ export async function initSpace(container) {
   }
 
   async function inspect(id) {
-    const obj = await fetch(`/objects/${id}`).then((r) => r.json());
-    rightRail.className = "rail";
-    rightRail.innerHTML = Osiris.objectDetail(obj, "");
-    // the inspector's own Focus button — one of the three ways to trigger a real focus
-    // (ruling c5953bb1: double-click, Enter, or this button).
+    // review flaw #1 (TIP 1c, Thoth mail 10891): "the right pane must show the focused
+    // object's details... today it stays empty after a click." Root cause: no response
+    // check plus objectDetail() throwing synchronously (e.g. reading o.properties.some on
+    // a malformed/error body) meant the `rightRail.innerHTML = ...` assignment never
+    // happened at all — the rail silently kept whatever it showed BEFORE the click (the
+    // "Click any object to inspect..." placeholder on a fresh session, read as "empty").
+    // Every path below now writes something real to the rail, success or failure.
+    let obj;
+    try {
+      const res = await fetch(`/objects/${id}`);
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      obj = await res.json();
+      rightRail.className = "rail";
+      rightRail.innerHTML = Osiris.objectDetail(obj, "");
+    } catch (err) {
+      console.error("inspect() failed for", id, err);
+      rightRail.className = "rail";
+      rightRail.innerHTML = `<div class="insp-empty">Could not load ${id.slice(0, 8)}: ` +
+        `${(err && err.message) || err}</div>`;
+      return;
+    }
+    // the inspector's own Focus button — a re-focus shortcut, now that a plain click on
+    // the canvas already IS focus (TIP 1 amendment retired the old double-click/Enter
+    // triggers this button used to sit alongside).
     const focusBtn = document.createElement("button");
     focusBtn.className = "iconbtn";
     focusBtn.textContent = pathFocusId === id ? "Focused" : "Focus";
@@ -1217,7 +1247,13 @@ export async function initSpace(container) {
     // focus — ruling c5953bb1's own "harmony" requirement, part C, but the wiring lives
     // here since it's the same click-through this inspector has always used.
     const relsEl = rightRail.querySelector("[data-rels]");
-    if (relsEl) await Osiris.loadRels(relsEl, id, (pickId) => focusObject(pickId), () => {});
+    if (relsEl) {
+      try {
+        await Osiris.loadRels(relsEl, id, (pickId) => focusObject(pickId), () => {});
+      } catch (err) {
+        console.error("loadRels() failed for", id, err);
+      }
+    }
   }
 
   // TIP 1 AMENDMENT (mail 10726): "no double-click or Enter" — a click already IS focus,
@@ -1232,46 +1268,15 @@ export async function initSpace(container) {
   // TIP 1(c), TIP 1b (Thoth mail 10755): LABELS ARE NAMES — Agent by handle/name,
   // SoftwareProject by repo name, Person by name, everything else type + short title. One
   // line, hard-truncated at 40 chars with an ellipsis. Khnum's own `labels` wire header
-  // (tip 2g) now computes exactly this rule server-side, index-aligned to object_ids — the
-  // client fallback (a per-node /objects/{id} fetch) is retired for the general case; nd.label
-  // is already the final text, synchronous, no network wait. ONE narrow exception: Khnum's
-  // own label for a Commit falls back to "Commit commit:<sha>" (no subject property exists
-  // on the wire snapshot yet, review flaw #6) — for Commit only, a single async fetch
-  // upgrades the label to the real subject line once resolved, cached per id.
-  const LABEL_MAX = 40;
-  function truncateLabel(s) {
-    const flat = String(s || "").replace(/\s+/g, " ").trim();
-    return flat.length <= LABEL_MAX ? flat : flat.slice(0, LABEL_MAX - 1) + "…";
-  }
+  // (tip 2g, fixed live in mail 10892/commit 0496a7d to resolve a real summary/title/
+  // subject/name assertion for every type — a Commit's own label now carries its real
+  // subject line straight off the wire) computes exactly this rule server-side,
+  // index-aligned to object_ids — nd.label is already the final text, synchronous, no
+  // per-node network fetch for any type. The earlier Commit-only client-side upgrade
+  // (fetchCommitSubject, review flaw #6) is retired outright now that the gap it patched
+  // is closed at the source.
   function fallbackLabel(nd) { return `${nd.type} ${nd.id.slice(0, 8)}`; }
-  const _commitSubjectCache = new Map(); // id -> resolved text
-  const _commitSubjectInFlight = new Set();
-  async function fetchCommitSubject(nd) {
-    let text = nd.label || fallbackLabel(nd);
-    try {
-      const obj = await fetch(`/objects/${nd.id}`).then((r) => r.json());
-      const subject = obj && obj.properties &&
-        obj.properties.find((p) => p.name === "subject");
-      if (subject && subject.value) text = `Commit: ${subject.value}`;
-    } catch { /* keep the wire label on any fetch failure */ }
-    return truncateLabel(text);
-  }
-  function labelTextFor(nd) {
-    if (nd.type !== "Commit") return nd.label || fallbackLabel(nd);
-    const cached = _commitSubjectCache.get(nd.id);
-    if (cached) return cached;
-    if (!_commitSubjectInFlight.has(nd.id)) {
-      _commitSubjectInFlight.add(nd.id);
-      fetchCommitSubject(nd).then((text) => {
-        _commitSubjectCache.set(nd.id, text);
-        _commitSubjectInFlight.delete(nd.id);
-        const div = labelDivs.get(nd);
-        if (div) div.textContent = text;
-        if (hoverNode === nd) updateHoverCard(nd);
-      });
-    }
-    return nd.label || fallbackLabel(nd);
-  }
+  function labelTextFor(nd) { return nd.label || fallbackLabel(nd); }
 
   const N_LABELS = 40;
   let labeledNodes = [];

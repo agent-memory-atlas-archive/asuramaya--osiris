@@ -337,8 +337,15 @@ function renderEntityToolbar() {
   // generally: if the scoped population itself exceeds OBJECTS_LIMIT (OBJECTS_HAS_MORE),
   // this undercounts — no uncapped *scoped* census endpoint exists yet, disclosed rather
   // than silently wrong.
+  // review flaw #5 (TIP 1c, Thoth mail 10891): "the count follows the lens or says
+  // nothing" -- while a real focus is on, the header's own total tracked an unrelated
+  // global/filtered count (measured: 1,076 during a 3-node focus) instead of the actual
+  // reachable set the canvas and table were both scoped to.
+  const space = window.OsirisSpace;
+  const focused = space && space.pathFocusId;
   const filterActive = SELECTED_ENTITY_TYPES.size > 0 || !!(ENTITY_SEARCH_QUERY || '').trim();
-  const trueTotal = filterActive ? SET.length : (TRUE_COUNTS ? TRUE_COUNTS.total : SET.length);
+  const trueTotal = focused ? space.pathReachable.size
+    : filterActive ? SET.length : (TRUE_COUNTS ? TRUE_COUNTS.total : SET.length);
   if ($('entity-total-num')) $('entity-total-num').textContent = trueTotal.toLocaleString();
   const typeCounts = TRUE_COUNTS ? Object.assign({}, TRUE_COUNTS.by_type) : {};
   if (!TRUE_COUNTS) SET.forEach(o => { typeCounts[o.type] = (typeCounts[o.type] || 0) + 1; });
@@ -429,7 +436,10 @@ function renderEntityExplorerStage() {
 // reach FOCUS directly and call it too so a table click paints the same way.
 function onSpaceFocus(id) {
   FOCUS = id;
-  if (ACTIVE_SURFACE === 'browse') renderEntityExplorerStage(); // repaints the 'sel' row
+  if (ACTIVE_SURFACE === 'browse') {
+    renderEntityExplorerStage(); // repaints the 'sel' row
+    renderEntityToolbar(); // review flaw #5: the header total must track the focus too
+  }
 }
 window.onSpaceFocus = onSpaceFocus;
 
@@ -888,14 +898,6 @@ function jumpToBreadcrumb(i) {
   BREADCRUMBS = BREADCRUMBS.slice(0, i + 1);
   focus(target.id, true);
 }
-// Escape steps back one crumb (console.js's own keydown handler calls this when browse
-// is the active surface and there's somewhere to step back TO).
-function stepBackBreadcrumb() {
-  if (BREADCRUMBS.length < 2) return false;
-  BREADCRUMBS.pop();
-  focus(BREADCRUMBS[BREADCRUMBS.length - 1].id, true);
-  return true;
-}
 // NAVIGABLE SPACE, INTEGRATION (mail 10550): focus() used to fetch a fresh one-hop
 // neighborhood and merge it into the cytoscape board — now the whole graph is already
 // loaded client-side in space.js, so "focus a node" is exactly space's own focusObject:
@@ -1180,23 +1182,26 @@ function runOmniSearch(q) {
       hint: h.type || '', cat: 'Graph',
       run: () => { switchSurface('browse'); focus(h.id); },
     }));
-    // review flaw #7: "typing 'Thoth' shows No matches" though 100+ Thoth agents exist --
-    // the server /search Function doesn't surface agent handles. Rather than touch that
-    // shared search engine, this scans the graph already loaded client-side in space.js
-    // (idToNode, TIP 1b's own wire labels) for a case-insensitive substring match against
-    // Agent handles/labels -- a real fallback, not a guess, since the data is right there.
-    const space = window.OsirisSpace;
+    // review flaw #7, TIP 1c re-fix (Thoth mail 10891): "the fallback did not fire on the
+    // deployed page" -- it gated on `window.OsirisSpace`, which is undefined until
+    // initSpace's own promise resolves (window.__spaceReady); a search typed before that
+    // promise settles silently found nothing and stayed that way (OMNI_SEARCH_TOKEN never
+    // re-fires on its own). Awaiting the readiness promise here means the fallback ALWAYS
+    // has real data once the graph has loaded at all, not just when the timing happens to
+    // work out. Scoped to when the server itself returned nothing, per Thoth's own words.
     let agentHits = [];
-    if (space && space.idToNode) {
-      const seen = new Set(graphHits.map(g => g.label));
-      agentHits = space.idToNode
-        .filter(n => n.type === 'Agent' && n.label && n.label.toLowerCase().includes(ql))
-        .filter(n => !seen.has(n.label))
-        .slice(0, 8)
-        .map(n => ({
-          label: n.label, hint: 'Agent', cat: 'Graph',
-          run: () => { switchSurface('browse'); focus(n.id); },
-        }));
+    if (hits.length === 0) {
+      const space = window.OsirisSpace || (window.__spaceReady && await window.__spaceReady);
+      if (myToken !== OMNI_SEARCH_TOKEN) return; // the await above can cross a newer keystroke
+      if (space && space.idToNode) {
+        agentHits = space.idToNode
+          .filter(n => n.type === 'Agent' && n.label && n.label.toLowerCase().includes(ql))
+          .slice(0, 8)
+          .map(n => ({
+            label: n.label, hint: 'Agent', cat: 'Graph',
+            run: () => { switchSurface('browse'); focus(n.id); },
+          }));
+      }
     }
     OMNI_ITEMS = toolHits.concat(compHits, graphHits, agentHits).slice(0, 16);
     OMNI_SEL = Math.min(OMNI_SEL, OMNI_ITEMS.length - 1);
@@ -1212,14 +1217,17 @@ async function openOmniSearch(val) { runOmniSearch(val); }
 
 // ── Keyboard Shortcuts ───────────────────────────────────────────────────────
 document.addEventListener('keydown', e => { const inField = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName); if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); openPalette(); } else if (e.key === '/' && !inField) { e.preventDefault(); openPalette(); } else if (e.key === 'Escape') {
-  // WAVE A item 6: Escape steps back one breadcrumb ONLY when nothing more local already
-  // consumed it (a dropdown, the peek overlay, or the search box's own Escape handler
-  // above) — same "most specific first" order this handler already follows.
+  // review flaw #2 (TIP 1c, Thoth mail 10891): "Escape must clear the focus" (the
+  // amendment's own ruling, mail 10726/b96fc93e: "Escape clears, Back walks the stack") --
+  // this handler used to step back one BREADCRUMB instead (WAVE A item 6, predating the
+  // path-lens focus feature entirely), which never actually cleared anything. Escape now
+  // clears space's own focus outright when nothing more local already consumed it (a
+  // dropdown, the peek overlay, or the search box's own Escape handler above).
   const hadDropdown = !!document.querySelector('.dd-item') && ['workspace-dropdown','repo-dropdown','omni-dropdown'].some(id => { const el = $(id); return el && el.style.display && el.style.display !== 'none'; });
   closeAllDropdowns();
   const hadPeek = $('peek').className.includes('on');
   if (hadPeek) closePeek();
-  if (!hadDropdown && !hadPeek && ACTIVE_SURFACE === 'browse') stepBackBreadcrumb();
+  if (!hadDropdown && !hadPeek && ACTIVE_SURFACE === 'browse' && window.OsirisSpace) window.OsirisSpace.clearFocus();
 } else if (e.key === '[' && !inField) { e.preventDefault(); toggleLeft(); } else if (e.key === ']' && !inField) { e.preventDefault(); toggleRight(); } });
 function closePeek() { const o = $('peek'); o.className = 'peek-overlay'; o.innerHTML = ''; }
 

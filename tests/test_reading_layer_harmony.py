@@ -48,5 +48,5 @@ def test_every_inspector_reference_already_walks_the_focus() -> None:
     # built in part B's own inspect() -- re-confirmed here since it's exactly what part C's
     # "harmony" asks for (upstream_ids, readers, links all route through Osiris.loadRels'
     # own pick callback).
-    body = _SPACE_JS.split("async function inspect(id)", 1)[1][:1300]
+    body = _SPACE_JS.split("async function inspect(id)", 1)[1][:2400]
     assert "Osiris.loadRels(relsEl, id, (pickId) => focusObject(pickId), () => {});" in body
