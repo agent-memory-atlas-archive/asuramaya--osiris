@@ -1,22 +1,29 @@
 """osiris init — take a fresh migrated DB to a usable console.
 
 A fresh install is an empty shell: the migrations create the tables but seed NOTHING, so a
-clean DB has 0 rooms, 0 compositions, and an empty design canon. The console lands on nothing
-and `run_composition('decision-log')` returns "no composition" — the README's promised
-question can't be answered. This one idempotent command seeds the default rooms + compositions
-(mirroring the proven dev-instance shape) and ingests the design canon (docs/reference/ + own
-docs, the substrate `consult_canon` reads), so a fresh box has a working console right after
+clean DB has 0 compositions and an empty design canon. The console lands on nothing and
+`run_composition('decision-log')` returns "no composition" — the README's promised question
+can't be answered. This one idempotent command seeds the default compositions (mirroring the
+proven dev-instance shape) and ingests the design canon (docs/reference/ + own docs, the
+substrate `consult_canon` reads), so a fresh box has a working console right after
 `alembic upgrade head`.
 
     python -m src.init
-    python -m src.init --compositions-only   # deploy step: sync DEFAULT_COMPOSITIONS + rooms
-                                              # into a LIVE DB, skip the (slow, unrelated) canon
+    python -m src.init --compositions-only   # deploy step: sync DEFAULT_COMPOSITIONS into a
+                                              # LIVE DB, skip the (slow, unrelated) canon
                                               # ingest — ruling 2ee43411, task #63: adding a
                                               # default composition is a first-class deploy step,
                                               # never a raw asyncpg heredoc against the live DB.
 
-Idempotent: rooms/compositions upsert by name, the canon find-or-creates on canonical — so
-re-running only fixes drift and never duplicates (asserted in tests/test_init.py).
+ROOM RETIREMENT (decision 31717ca7, Thoth DM 10884/10792, thread 10820): rooms are retired —
+the operator's own word was "scope really died and made itself obsolete... gotta remove that
+too." Every default composition seeds GLOBAL (room_id NULL); there is no ROOM_CONFIG here to
+re-grow the concept on a fresh box. Migration 0070 backfills the 31 compositions that were
+scoped on existing installs into `former_room_id`, a standing record, never re-populated by
+this command; the `rooms` table itself stays (read-only, never dropped).
+
+Idempotent: compositions upsert by name, the canon find-or-creates on canonical — so re-running
+only fixes drift and never duplicates (asserted in tests/test_init.py).
 
 NB the canon step reads repo-relative doc paths (docs/reference/, docs/COMPOSER.md, …) via
 `ingest_canon` — same convention as `python -m src.ingest.reference`, so run it from the repo
@@ -29,109 +36,32 @@ from typing import Any
 
 from src.actions.core import Actions
 from src.ingest.reference import ingest_canon
-from src.orchestrator.compositions import (
-    DEFAULT_COMPOSITIONS,
-    create_room,
-    save_composition,
-    seed_default_compositions,
-)
-
-# The default stance shape, mirroring the proven dev instance (CLAUDE.md: land→engineer/briefing;
-# analyst opts into collection). `home` = the composition the console lands on; `collect` = show
-# the entity-intake chrome. BOTH keys are read by the UI (src/ui/static/index.html). The
-# ENGINEER stance is created first so a fresh box lands on it (list_rooms orders by created_at).
-ROOM_CONFIG: dict[str, dict[str, Any]] = {
-    "engineer": {"home": "briefing"},
-    "analyst": {"home": "who-is-this", "collect": True},
-}
-# Which default lens goes in which stance. ENGINEER = the developer project-memory lenses (repos
-# come in via CLI, no entity collection); ANALYST = the public-record entity lenses. Every name
-# here MUST exist in DEFAULT_COMPOSITIONS (a typo KeyErrors at assign time; coverage is asserted
-# in the test) — this seeds NO new compositions, it only rooms the ones the composer already owns.
-ROOM_COMPOSITIONS: dict[str, tuple[str, ...]] = {
-    "engineer": (
-        "briefing", "project-briefing", "decision-log", "design-canon", "family-consistency",
-        "family-drift", "portfolio", "pulse-digest", "projects", "project", "fleet",
-        # rungs 2+3 (campaign 5c57f54d): the graph auditing itself + the provenance lens.
-        "graph-lint", "lap",
-        # PROVENANCE PIECE 3(b) (thread b4477e9e): the upstream-centric read, same room
-        # as lap — a provenance lens, not an entity/casework one.
-        "upstream-readers",
-        # the collapsed-echo pile, listable (ruling 758ded94) — the triage queue's lens.
-        "echoes",
-        # the ONE WALL LAW (ruling 923c380f): the graded unresolved view, operator-eyed.
-        "the-wall",
-        # thread 36352764: roadmap/docs/live-desk (ruling c5b184cd, thread d56e7073/#44) were
-        # in DEFAULT_COMPOSITIONS but never roomed — orphaned to the "All" scope, and roadmap/
-        # docs also seeded with no shelf section (see _COMP_META below). All three are
-        # developer project-memory lenses, the same class as briefing/decision-log/the-wall.
-        "roadmap", "docs", "live-desk",
-        # the fleet strip's migration pilot (task #71 slice two, msg 1894/1897) — same room
-        # as "fleet" (the unranked wall it deliberately doesn't replace).
-        "fleet-strip",
-        # /fleet's full-fidelity port, additive alongside the still-live route (rung 2,
-        # ruling d42c543b, Thoth msg 1926/1936) — same room as "fleet"/"fleet-strip".
-        "fleet-live",
-        # /mail's overview half (consolidation wave 2, ruling d42c543b, msg 1929).
-        "mail",
-        # /overhead and /desk's read-only landing roster (task #91, ruling d42c543b, msg 1959).
-        "overhead", "desk",
-        # triage-as-a-primitive's census half (task #98) — the left-pane type browser the
-        # operator sketched. BUCKETS (the middle pane) is args-driven per call, not roomed.
-        "type-census",
-        # the four numbers as a standing surface (Thoth DM 2835/2917) — how much of thread
-        # closure is held by structure vs memory, fleet-wide by default.
-        "closure-health",
-        # the smallest census door (Thoth dispatch 7543 item 2), same room as type-census/
-        # closure-health — read-only population counts, one fixed kind each.
-        "census-seat-property-contradictions", "census-cohort",
-        # the type catalog osiris SHIPS (task #111, thread 26694d10) — same room as
-        # design-canon/decision-log: a developer project-memory lens, not an entity one.
-        "reference",
-        # BROWSE'S FIRST PROOF (Thoth dispatch 9436, page conversions off 588148bb) — the
-        # entity explorer's own object-set load, proven as a composition. Engineer room,
-        # not analyst: this is the console's own dev-facing object browser, same class as
-        # fleet/projects, not a public-record entity lens.
-        "browse",
-    ),
-    "analyst": (
-        "who-is-this", "operational-vs-disclosed-geography", "co-investment-ties",
-        "screen-financing-network",
-    ),
-}
+from src.orchestrator.compositions import DEFAULT_COMPOSITIONS, seed_default_compositions
 
 
 async def init(actions: Actions, *, canon: bool = True) -> dict[str, Any]:
-    """Seed rooms + compositions + the design canon on a fresh migrated DB. Idempotent.
+    """Seed compositions + the design canon on a fresh migrated DB. Idempotent.
 
     `canon=False` skips the canon ingest — for a caller not at the repo root (the canon reads
     repo-relative doc paths). Returns a summary of what's now present.
     """
     pool = actions.pool
-    # 1. ensure every default composition exists (unassigned to a room at this point).
+    # every default composition, global (room_id NULL) — rooms are retired (decision 31717ca7);
+    # seed_default_compositions never passes a room_id, and save_composition's own "engineer
+    # room" fallback only fires when such a room already exists, which a fresh box never has.
     await seed_default_compositions(pool)
-    # 2. rooms + assign their lenses. Re-saving with a room_id upserts it (COALESCE keeps a room
-    #    on a later seed pass, so a second full init never orphans a composition from its stance).
-    roomed = 0
-    for name, config in ROOM_CONFIG.items():
-        room_id = await create_room(pool, name, config)
-        for comp in ROOM_COMPOSITIONS[name]:
-            await save_composition(pool, comp, DEFAULT_COMPOSITIONS[comp], "lens", room_id=room_id)
-            roomed += 1
-    # 3. the design canon (docs/reference/ + own docs) — what `consult_canon` / design-canon read.
-    #    Guarded to run only when ABSENT: init is a bootstrap ("empty → usable"), and ingest_canon
-    #    find-or-creates the Reference objects + dedups informs/mentions BUT its `cites` wiring is a
-    #    plain append (reference.py), so re-ingesting would duplicate the COMPOSER→vendor cites
-    #    edges. A canon re-sync after adding docs is `python -m src.ingest.reference`, not init.
+    # the design canon (docs/reference/ + own docs) — what `consult_canon` / design-canon read.
+    # Guarded to run only when ABSENT: init is a bootstrap ("empty → usable"), and ingest_canon
+    # find-or-creates the Reference objects + dedups informs/mentions BUT its `cites` wiring is a
+    # plain append (reference.py), so re-ingesting would duplicate the COMPOSER→vendor cites
+    # edges. A canon re-sync after adding docs is `python -m src.ingest.reference`, not init.
     canon_result: dict[str, Any] | None = None
     if canon:
         already = await pool.fetchval("SELECT count(*) FROM objects WHERE type='Reference'")
         canon_result = ({"skipped": "canon already present"} if already
                         else await ingest_canon(actions))
     return {
-        "rooms": len(ROOM_CONFIG),
         "compositions": len(DEFAULT_COMPOSITIONS),
-        "roomed": roomed,
         "canon": canon_result,
     }
 
@@ -146,8 +76,7 @@ def _print_next_steps(result: dict[str, Any]) -> None:  # pragma: no cover - CLI
         canon_line = "  · design canon: skipped"
     print(
         f"osiris init — ready.\n"
-        f"  · rooms: {result['rooms']} (engineer, analyst)\n"
-        f"  · compositions: {result['compositions']} seeded, {result['roomed']} roomed\n"
+        f"  · compositions: {result['compositions']} seeded (global — rooms are retired)\n"
         f"{canon_line}\n"
         f"\nnext:\n"
         f"  · ingest a repo:   uv run python -m src.ingest.project /path/to/your/repo\n"

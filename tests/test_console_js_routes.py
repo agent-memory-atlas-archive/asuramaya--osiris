@@ -109,10 +109,47 @@ def test_fork_composition_saves_the_on_screen_spec_under_a_new_name() -> None:
     assert "room_id: ROOM || null" in body
 
 
-def test_load_compositions_is_room_scoped_and_called_on_room_switch() -> None:
+def test_load_compositions_reads_the_room_conditional_query_now_always_inert() -> None:
+    """ROOM RETIREMENT (thread 96f09d48, decision 31717ca7, Thoth DM 10792): switchRoom
+    itself is gone (superseding this test's own old room-switch assertion), but
+    loadCompositions()'s own room-conditional query string is left as-is — ROOM is now a
+    plain `const ROOM = ''`, so the ternary always takes its falsy branch, an unscoped
+    fetch, without needing every reader scrubbed individually."""
+    assert "const ROOM = '';" in _JS
     assert "'/compositions' + (ROOM ? ('?room=' + encodeURIComponent(ROOM)) : '')" in _JS
-    switch_room = _JS.split("async function switchRoom(", 1)[1].split("\nasync function ", 1)[0]
-    assert "await loadCompositions();" in switch_room
+    assert "function switchRoom(" not in _JS
+    assert "loadCompositions()" in _JS.split("Osiris.loadSchema().then", 1)[1][:300]
+
+
+# ROOM RETIREMENT (thread 96f09d48, decision 31717ca7, Thoth DM 10792): the operator's own
+# word — "scope really died and made itself obsolete... gotta remove that too." The
+# workspace pill, its dropdown, and every function that only existed to drive them are
+# gone; the header repo selector (#repo-pill) is now the one scoping lever.
+
+
+def test_workspace_pill_functions_are_gone() -> None:
+    for fn in ("toggleWorkspaceDropdown", "renderWorkspaceDropdown", "selectWorkspace",
+               "updateWorkspaceScopeUI", "loadRooms", "newRoom"):
+        assert f"function {fn}(" not in _JS, f"{fn} should have been removed"
+    assert "let ROOMS" not in _JS and "ROOMS =" not in _JS
+
+
+def test_workspace_pill_markup_is_gone_from_index_html() -> None:
+    for needle in ("workspace-pill", "workspace-dropdown", "workspace-dd-items",
+                   'id="room"'):
+        assert needle not in _INDEX_HTML
+
+
+def test_object_scope_params_no_longer_reads_a_room_subject() -> None:
+    body = _JS.split("function objectScopeParams()", 1)[1].split("\n}", 1)[0]
+    assert "ROOMS" not in body
+    assert "room.config.subject" not in body
+
+
+def test_watch_console_no_longer_syncs_room_id_but_keeps_focused_object_id() -> None:
+    body = _JS.split("function watchConsole()", 1)[1]
+    assert "s.room_id" not in body
+    assert "s.focused_object_id" in body
 
 
 def test_palette_has_an_author_composition_entry() -> None:

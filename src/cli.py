@@ -2769,22 +2769,6 @@ def _alembic_revision_known(repo_root: Path, revision: str) -> bool | None:
         return False
 
 
-def composition_room_gap_notes(unassigned: list[str]) -> list[str]:
-    """NAME every composition carrying no room_id, never a count (ruling 89e67c49, the
-    follow-up to task #94's own gate fix): a NULL room_id renders nowhere outside the
-    rarely-visited god view — the exact defect a NULL section had until compositions.
-    save_composition() closed the write path for a genuine CREATE. That fix cannot close
-    every door, deliberately: room_id carries no NOT NULL constraint (unlike section) because
-    the column is `REFERENCES rooms(id) ON DELETE SET NULL` — deleting a room a composition
-    still points to writes this exact NULL back, at the DB level, past any Python guard or
-    logger.warning. This is the backstop for THAT door: not prevention, detection — the same
-    role composition_gap_notes plays for a missing default."""
-    return [f"compositions: {name!r} has no room_id — invisible outside the god view; "
-            "re-save it with a room (save_composition() defaults new saves to 'engineer', "
-            "but only closes the gap going forward, never for a row already orphaned)."
-            for name in sorted(unassigned)]
-
-
 async def _composition_gaps(pool: asyncpg.Pool) -> list[str]:
     """Composition seeding only — the alembic half moved to `_apply_pending_migrations`
     (thread c4681c38 leg 2), which now runs BEFORE the restart rather than being reported
@@ -2810,9 +2794,10 @@ async def _composition_gaps(pool: asyncpg.Pool) -> list[str]:
     would repeat the exact false-refusal cost core.hooksPath's own finding (ruling d4e65da0)
     already proved real tonight.
 
-    Also names every composition with room_id IS NULL (ruling 89e67c49) — a second, distinct
-    gap class from a missing default, folded into the same end-of-deploy report rather than
-    a separate command, since both are "a composition is silently unreachable" findings."""
+    ROOM RETIREMENT (decision 31717ca7): this used to also name every composition with
+    room_id IS NULL (ruling 89e67c49) — a NULL room_id was a defect back when rooms scoped
+    visibility. Rooms are retired now: room_id IS NULL is the correct, universal state for
+    every composition, not a gap to report."""
     from src.orchestrator.compositions import DEFAULT_COMPOSITIONS
 
     rows = await pool.fetch("SELECT name, spec FROM compositions")
@@ -2821,9 +2806,6 @@ async def _composition_gaps(pool: asyncpg.Pool) -> list[str]:
                  for r in rows}
     notes = composition_gap_notes(have, set(DEFAULT_COMPOSITIONS))
     notes += composition_drift_notes(live_specs, DEFAULT_COMPOSITIONS)
-    unassigned = [r["name"] for r in
-                 await pool.fetch("SELECT name FROM compositions WHERE room_id IS NULL")]
-    notes += composition_room_gap_notes(unassigned)
     return notes
 
 

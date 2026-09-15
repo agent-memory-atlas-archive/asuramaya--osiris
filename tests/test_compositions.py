@@ -1368,6 +1368,28 @@ async def test_save_composition_omitting_room_keeps_the_prior_value_on_resave(
     assert rows[0]["spec"]["object_type"] == "X"  # the actual edit still landed
 
 
+async def test_a_composition_with_former_room_id_set_still_lists_and_runs(
+    actions: Actions,
+) -> None:
+    """ROOM RETIREMENT step (v) (decision 31717ca7, Thoth mail 10792): migration 0070
+    backfills room_id -> former_room_id on the 31 pre-existing scoped compositions,
+    leaving room_id NULL. Neither list_compositions (an explicit room_id=None param
+    means "every room", not "only unassigned") nor run_composition (looks up by name/id,
+    never touches room_id at all) may treat a former_room_id-carrying row any
+    differently from one that was never roomed in the first place."""
+    name = await _save(actions, "wm-retired-room", {"op": "select"})
+    room_id = await create_room(actions.pool, "a-retired-stance")
+    await actions.pool.execute(
+        "UPDATE compositions SET room_id=NULL, former_room_id=$2 WHERE name=$1",
+        name, room_id,
+    )
+    rows = [c for c in await list_compositions(actions.pool) if c["name"] == name]
+    assert rows[0]["room_id"] is None
+
+    result = await run_composition(actions.pool, name)
+    assert "error" not in result
+
+
 async def _save(actions: Actions, name: str, spec: dict) -> str:
     await save_composition(actions.pool, name, spec)
     return name
