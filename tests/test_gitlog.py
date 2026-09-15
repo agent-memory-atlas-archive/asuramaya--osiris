@@ -7,12 +7,13 @@ graded AUTHORITATIVE_API, all through the same Actions waist. Hermetic: a throwa
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 from pathlib import Path
 
 from src.actions.core import Actions
-from src.ingest.gitlog import ingest_repo, parse_git_log, strip_trailers
+from src.ingest.gitlog import declare_machine_identity, ingest_repo, parse_git_log, strip_trailers
 
 
 def test_parse_git_log_is_tolerant() -> None:
@@ -293,6 +294,136 @@ async def test_commit_carries_type_scope_and_rationale(actions: Actions, tmp_pat
     assert await prop("change_type") == "feat"
     assert await prop("scope") == "engine"
     assert "Function hatch" in (await prop("rationale") or "")
+
+
+async def test_machine_identity_routes_when_local_part_matches_repo_and_domain_is_machine_shaped(
+    actions: Actions, tmp_path: Path,
+) -> None:
+    """MACHINE GIT IDENTITIES ARE NOT PEOPLE (thread 2619f011, ruling edb6b0fc): the live
+    specimen was dev:ballgem@local wrongly typed Person for repo:ballgem's own bootstrap
+    committer — local part == an already-ingested repo's own canonical name AND a
+    machine-shaped domain ('local'). A fresh ingest must route straight to MachineIdentity,
+    never mint the wrong-typed Person at all, and mint a committer_for edge with `since`
+    set to the first commit's own date."""
+    repo = tmp_path / "ballgem"
+    repo.mkdir()
+    env = {**os.environ, "GIT_AUTHOR_NAME": "Bootstrap", "GIT_AUTHOR_EMAIL": "ballgem@local",
+           "GIT_COMMITTER_NAME": "Bootstrap", "GIT_COMMITTER_EMAIL": "ballgem@local"}
+    await asyncio.to_thread(
+        subprocess.run, ["git", "-C", str(repo), "init", "-q"], check=True, capture_output=True)
+    (repo / "a.txt").write_text("1")
+    await asyncio.to_thread(
+        subprocess.run, ["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
+    await asyncio.to_thread(
+        subprocess.run, ["git", "-C", str(repo), "commit", "-q", "-m", "genesis"],
+        check=True, capture_output=True, env=env)
+
+    await ingest_repo(actions, str(repo))
+    p = actions.pool
+
+    assert await p.fetchval(
+        "SELECT count(*) FROM objects WHERE canonical='dev:ballgem@local'") == 0
+    machine_id = await p.fetchval(
+        "SELECT id FROM objects WHERE type='MachineIdentity' AND canonical='machine:ballgem@local'")
+    assert machine_id is not None
+    project_id = await p.fetchval(
+        "SELECT id FROM objects WHERE type='SoftwareProject' AND canonical='repo:ballgem'")
+    link = await p.fetchrow(
+        "SELECT properties FROM links WHERE from_id=$1 AND to_id=$2 AND type='committer_for'",
+        machine_id, project_id)
+    assert link is not None
+    props = link["properties"]
+    props = json.loads(props) if isinstance(props, str) else props
+    assert "since" in props and props["since"]  # a real, non-empty first-commit timestamp
+
+
+async def test_machine_identity_bridges_a_pre_existing_wrongly_typed_person_via_same_as(
+    actions: Actions, tmp_path: Path,
+) -> None:
+    """A Person minted under the OLD, pre-heuristic routing for the same email is never
+    deleted or retyped (objects.type is immutable) — a same_as link (loser -> winner)
+    bridges it to the new MachineIdentity instead, exactly the live dev:ballgem@local
+    correction ruling edb6b0fc calls for."""
+    repo = tmp_path / "ballgem2"
+    repo.mkdir()
+    env = {**os.environ, "GIT_AUTHOR_NAME": "Bootstrap", "GIT_AUTHOR_EMAIL": "ballgem2@local",
+           "GIT_COMMITTER_NAME": "Bootstrap", "GIT_COMMITTER_EMAIL": "ballgem2@local"}
+    await asyncio.to_thread(
+        subprocess.run, ["git", "-C", str(repo), "init", "-q"], check=True, capture_output=True)
+    (repo / "a.txt").write_text("1")
+    await asyncio.to_thread(
+        subprocess.run, ["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
+    await asyncio.to_thread(
+        subprocess.run, ["git", "-C", str(repo), "commit", "-q", "-m", "genesis"],
+        check=True, capture_output=True, env=env)
+    legacy_person = await actions.create_or_find_object("Person", "dev:ballgem2@local", "test")
+
+    await ingest_repo(actions, str(repo))
+    p = actions.pool
+
+    # never deleted, never retyped
+    assert await p.fetchval(
+        "SELECT type FROM objects WHERE id=$1", legacy_person) == "Person"
+    machine_id = await p.fetchval(
+        "SELECT id FROM objects WHERE type='MachineIdentity' "
+        "AND canonical='machine:ballgem2@local'")
+    assert machine_id is not None
+    assert await p.fetchval(
+        "SELECT 1 FROM links WHERE from_id=$1 AND to_id=$2 AND type='same_as'",
+        legacy_person, machine_id) == 1
+
+
+async def test_declare_machine_identity_refuses_without_a_because(actions: Actions) -> None:
+    out = await declare_machine_identity(
+        actions, email="bot@example.com", project="whatever", because="", actor="test")
+    assert "error" in out and "because" in out["error"]
+
+
+async def test_declare_machine_identity_refuses_an_unknown_project(actions: Actions) -> None:
+    out = await declare_machine_identity(
+        actions, email="bot@example.com", project="no-such-project-anywhere",
+        because="test", actor="test")
+    assert "error" in out and "no-such-project-anywhere" in out["error"]
+
+
+async def test_declare_machine_identity_mints_bridges_and_links(actions: Actions) -> None:
+    """THE declare-machine-identity DOOR (ruling edb6b0fc): covers what the ingest
+    heuristic misses — a bot on a real-looking domain the heuristic would never flag as
+    machine-shaped. Mints MachineIdentity, bridges a pre-existing wrongly-typed Person via
+    same_as (never deleted), and mints committer_for; re-declaring is a no-op."""
+    project_id = await actions.create_or_find_object("SoftwareProject", "repo:widget", "test")
+    legacy_person = await actions.create_or_find_object("Person", "dev:ci@widget.io", "test")
+
+    out = await declare_machine_identity(
+        actions, email="CI@Widget.io", project="widget",
+        because="CI bot, real domain, heuristic never fires", actor="operator")
+    assert out["machine_identity"] == "machine:ci@widget.io"
+    assert out["project"] == "repo:widget"
+    assert out["bridged_person"] == "dev:ci@widget.io"
+    assert out["minted_committer_for"] is True
+
+    p = actions.pool
+    machine_id = await p.fetchval(
+        "SELECT id FROM objects WHERE type='MachineIdentity' AND canonical='machine:ci@widget.io'")
+    assert machine_id is not None
+    assert await p.fetchval("SELECT type FROM objects WHERE id=$1", legacy_person) == "Person"
+    assert await p.fetchval(
+        "SELECT 1 FROM links WHERE from_id=$1 AND to_id=$2 AND type='same_as'",
+        legacy_person, machine_id) == 1
+    assert await p.fetchval(
+        "SELECT 1 FROM links WHERE from_id=$1 AND to_id=$2 AND type='committer_for'",
+        machine_id, project_id) == 1
+
+    # re-declaring is idempotent — no duplicate links, no error
+    out2 = await declare_machine_identity(
+        actions, email="ci@widget.io", project="widget", because="repeat", actor="operator")
+    assert out2["minted_committer_for"] is False
+    assert await p.fetchval(
+        "SELECT count(*) FROM links WHERE from_id=$1 AND to_id=$2 AND type='committer_for'",
+        machine_id, project_id) == 1
+    assert await p.fetchval(
+        "SELECT count(*) FROM links WHERE from_id=$1 AND to_id=$2 AND type='same_as'",
+        legacy_person, machine_id) == 1
 
 
 def test_strip_trailers_removes_machine_provenance_keeps_rationale() -> None:

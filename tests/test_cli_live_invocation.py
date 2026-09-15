@@ -63,6 +63,7 @@ from src.cli import (
     cmd_composition,
     cmd_correct_agent_house,
     cmd_correct_pin_value,
+    cmd_declare_machine_identity,
     cmd_desk,
     cmd_detach_seat,
     cmd_dossier,
@@ -290,6 +291,9 @@ NO_WRITE_INVOCATIONS: dict[str, Any] = {
         "no-such-handle-anywhere", "some_key", "some_value", "test", pool=a.pool),
     "correct-agent-house": lambda a: cmd_correct_agent_house(
         "no-such-handle-anywhere", actor="operator", pool=a.pool),
+    "declare-machine-identity": lambda a: cmd_declare_machine_identity(
+        "nobody@example.com", "no-such-project-anywhere", because="test",
+        actor="operator", pool=a.pool),
     "proposal": lambda a: cmd_proposal(
         "propose", candidate="not valid json{", pool=a.pool),
     # settings get: get_setting refuses BEFORE any write on an unregistered key

@@ -186,6 +186,18 @@ _OBJECT_TYPES: tuple[ObjectType, ...] = (
                "operator). Exists so a mechanical fallback has something real to point "
                "at instead of minting a placeholder Agent object under a non-Agent "
                "canonical (thread 6d01f21e).", ("system:",)),
+    ObjectType("MachineIdentity", "Software", "#58a6ff", "hexagon",
+               "MACHINE GIT IDENTITIES ARE NOT PEOPLE (thread 2619f011, ruling edb6b0fc): "
+               "a repository's own automated committer — a CI bot, a bootstrap script, a "
+               "noreply-style service account — never a human, so never a Person no "
+               "matter how git's own author-email field types every commit. Paralleling "
+               "dev:<email> (git ingest's own Person canonical), machine:<email> routes "
+               "here instead when the email's local part equals an already-ingested "
+               "repo's own canonical name AND the domain is machine-shaped (local, "
+               "localhost, or a noreply-style host) — never on the local part alone. A "
+               "Person object minted under the old, wrong routing is never deleted or "
+               "retyped (objects.type is immutable): a `same_as` link supersedes it, "
+               "pointing at this object instead.", ("machine:",)),
     ObjectType("Tension", "Software", "#e685b5", "vee",
                "A held POLARITY — two positions in productive tension, neither settled. Unlike a "
                "Decision (which settles) or a Thread (which closes), a tension is HELD: the "
@@ -434,6 +446,12 @@ _LINK_TYPES: tuple[LinkType, ...] = (
     LinkType("subtechnique-of", "A more specific technique under a broader one.",
              ("AttackPattern",), ("AttackPattern",)),
     LinkType("authored_by", "Commit authored by a developer.", ("Commit",), ("Person",)),
+    LinkType("committer_for", "A MachineIdentity's own standing relationship to a "
+             "SoftwareProject it commits for (thread 2619f011, ruling edb6b0fc) — "
+             "STRICT domain/range, unlike most link types here: this one never means "
+             "anything else. Carries a `since` property (the first commit date this "
+             "identity was seen for that project), set once at mint time, never "
+             "revised by a later re-ingest.", ("MachineIdentity",), ("SoftwareProject",)),
     LinkType("worktree_of", "A Worktree's own parent SoftwareProject — the main checkout "
              "its history is shared with (thread 922d920c). Written only by the disk "
              "census/migration, never by a hand write.",

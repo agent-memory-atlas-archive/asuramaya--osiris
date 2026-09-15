@@ -11630,6 +11630,27 @@ async def register_blind_spot(
             "note": "held per (project, surface); orient() speaks it to every session here"}
 
 
+@mcp.tool()
+async def declare_machine_identity(
+    email: str, project: str, because: str,
+    subagent_id: str | None = None, subagent_type: str | None = None,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """THE declare-machine-identity DOOR (thread 2619f011, ruling edb6b0fc): covers what
+    git ingest's own heuristic misses — a bot committing from a real-looking domain, or a
+    local part that just doesn't match any ingested repo's own name. Mints/finds the
+    MachineIdentity (machine:<email>), bridges any pre-existing dev:<email> Person via
+    same_as (never deleted, never retyped — objects.type is immutable), and mints a
+    committer_for edge to `project` (a bare repo name, e.g. 'osiris' for repo:osiris).
+    Refuses without a written `because` — this is a manual override, never silent."""
+    from src.ingest.gitlog import declare_machine_identity as _declare
+
+    out = await _declare(
+        Actions(await _pool_get()), email=email, project=project, because=because,
+        actor=await _actor_for(ctx, subagent_id, subagent_type))
+    return out
+
+
 @mcp.tool(meta={
     "deprecated": True,
     "reason": "zero MCP traffic in 3-week window, no CLI/daemon/slash bypass found",

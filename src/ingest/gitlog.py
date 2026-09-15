@@ -134,9 +134,100 @@ def _identity_name(dev_canonical: str) -> str:
     triggered this ingest, or what that particular commit's author name string said.
     A `dev:<name>` canonical with no `@` at all (the `_dev_canonical` fallback for a
     commit with no author email) has no "local part" to strip — the whole thing is the
-    identity, unchanged."""
-    email = dev_canonical.removeprefix("dev:")
+    identity, unchanged. A `machine:<email>` canonical (MACHINE GIT IDENTITIES ARE NOT
+    PEOPLE, ruling edb6b0fc) is the same derivation over the same shape — one prefix or
+    the other, never both, so stripping either leaves the identity untouched."""
+    email = dev_canonical.removeprefix("dev:").removeprefix("machine:")
     return email.split("@", 1)[0]
+
+
+# MACHINE GIT IDENTITIES ARE NOT PEOPLE (thread 2619f011, ruling edb6b0fc): a bare local
+# or noreply-style host is the tell — never the local part alone, since a human genuinely
+# named after a repo on a real mail provider must never misroute.
+_MACHINE_SHAPED_DOMAINS = {"local", "localhost"}
+
+
+def _is_machine_shaped_domain(domain: str) -> bool:
+    d = domain.lower()
+    return d in _MACHINE_SHAPED_DOMAINS or "noreply" in d
+
+
+def _machine_canonical(email: str) -> str:
+    return f"machine:{email.strip().lower()}"
+
+
+async def _matching_ingested_project(actions: Actions, local_part: str) -> uuid.UUID | None:
+    """The other half of the heuristic (ruling edb6b0fc): the local part must equal an
+    ALREADY-INGESTED repo's own canonical name, never just any string that happens to
+    look machine-shaped — `dev:ballgem@local` routes to MachineIdentity specifically
+    because repo:ballgem already exists as a SoftwareProject."""
+    return await actions.pool.fetchval(  # type: ignore[no-any-return]
+        "SELECT id FROM objects WHERE type='SoftwareProject' AND canonical=$1",
+        f"repo:{local_part}")
+
+
+async def declare_machine_identity(
+    actions: Actions, *, email: str, project: str, because: str, actor: str,
+) -> dict[str, Any]:
+    """THE declare-machine-identity DOOR (ruling edb6b0fc): covers what the ingest
+    heuristic (_matching_ingested_project + _is_machine_shaped_domain) misses — a bot
+    committing from a real-looking domain, or a local part that doesn't happen to match
+    any repo name. Manual, so it demands a written `because`, never silent. Mints/finds
+    the MachineIdentity, bridges any pre-existing dev:<email> Person via same_as (never
+    deleted, never retyped), and mints committer_for with `since` = now (this door has
+    no commit history of its own to date it by, unlike the ingest heuristic's own first-
+    seen date). Idempotent: re-declaring the same (email, project) is a no-op past the
+    first call, same dedup discipline as ingest_repo's own links."""
+    if not because.strip():
+        return {"error": "declare-machine-identity requires a written `because`"}
+    email = email.strip().lower()
+    local_part, _, domain = email.partition("@")
+    if not local_part or not domain:
+        return {"error": f"not an email address: {email!r}"}
+    project_id = await actions.pool.fetchval(
+        "SELECT id FROM objects WHERE type='SoftwareProject' AND canonical=$1",
+        f"repo:{project}")
+    if project_id is None:
+        return {"error": f"no such SoftwareProject: repo:{project!r}"}
+
+    now = datetime.now(UTC)
+    conf = confidence_for(EvidenceClass.SELF_DECLARED)
+    ec = EvidenceClass.SELF_DECLARED.value
+    machine_canonical = _machine_canonical(email)
+    machine_id = await actions.create_or_find_object("MachineIdentity", machine_canonical, actor)
+    await actions.assert_property(machine_id, "name", _identity_name(machine_canonical),
+                                  actor, now, conf, evidence_class=ec)
+    await actions.assert_property(machine_id, "declared_because", because, actor, now, conf,
+                                  evidence_class=ec)
+
+    bridged_person: str | None = None
+    legacy_canonical = f"dev:{email}"
+    legacy_person_id = await actions.pool.fetchval(
+        "SELECT id FROM objects WHERE type='Person' AND canonical=$1", legacy_canonical)
+    if legacy_person_id is not None:
+        already = await actions.pool.fetchval(
+            "SELECT 1 FROM links WHERE from_id=$1 AND to_id=$2 AND type='same_as'",
+            legacy_person_id, machine_id)
+        if not already:
+            await actions.create_link(legacy_person_id, machine_id, "same_as", actor, now,
+                                      conf, evidence_class=ec)
+        bridged_person = legacy_canonical
+
+    minted_committer_for = False
+    committer_exists = await actions.pool.fetchval(
+        "SELECT 1 FROM links WHERE from_id=$1 AND to_id=$2 AND type='committer_for'",
+        machine_id, project_id)
+    if not committer_exists:
+        await actions.create_link(machine_id, project_id, "committer_for", actor, now, conf,
+                                  evidence_class=ec, properties={"since": now.isoformat()})
+        minted_committer_for = True
+
+    return {
+        "machine_identity": machine_canonical,
+        "project": f"repo:{project}",
+        "bridged_person": bridged_person,
+        "minted_committer_for": minted_committer_for,
+    }
 
 
 async def ingest_repo(
@@ -159,17 +250,35 @@ async def ingest_repo(
 
     # create_link is a plain append, so re-ingesting a repo (the normal way to pick up new
     # commits) would DUPLICATE every structural edge. Objects dedup on canonical, but the
-    # authored_by/in_repo/follows links don't — dedup them so a re-ingest is truly idempotent.
+    # authored_by/in_repo/follows/committer_for/same_as links don't — dedup them so a
+    # re-ingest is truly idempotent. committer_for/same_as (ruling edb6b0fc) join the same
+    # set: a re-ingest must never re-bridge or re-link what a prior run already minted.
     existing = {(r["from_id"], r["to_id"], r["type"]) for r in await actions.pool.fetch(
         "SELECT from_id, to_id, type FROM links "
-        "WHERE type IN ('authored_by', 'in_repo', 'follows')")}
+        "WHERE type IN ('authored_by', 'in_repo', 'follows', 'committer_for', 'same_as')")}
 
-    async def _link(frm: uuid.UUID, to: uuid.UUID, typ: str, observed: datetime) -> None:
+    async def _link(frm: uuid.UUID, to: uuid.UUID, typ: str, observed: datetime, *,
+                    properties: dict[str, Any] | None = None) -> None:
         if (frm, to, typ) in existing:
             return
         await actions.create_link(frm, to, typ, source_id, observed, _CONF,
-                                  case_id=case_id, evidence_class=_EC)
+                                  case_id=case_id, evidence_class=_EC, properties=properties)
         existing.add((frm, to, typ))
+
+    # MACHINE GIT IDENTITIES ARE NOT PEOPLE (ruling edb6b0fc): the (local_part, domain) ->
+    # matched-project lookup is memoized per run — the DB round trip in
+    # _matching_ingested_project only ever fires for a machine-shaped domain (rare), and
+    # every commit from the same author asks the identical question.
+    _machine_project_cache: dict[str, uuid.UUID | None] = {}
+
+    async def _machine_project_for(email: str) -> uuid.UUID | None:
+        local_part, _, domain = email.partition("@")
+        if not local_part or not domain or not _is_machine_shaped_domain(domain):
+            return None
+        if local_part not in _machine_project_cache:
+            _machine_project_cache[local_part] = await _matching_ingested_project(
+                actions, local_part)
+        return _machine_project_cache[local_part]
 
     # A DEV'S EMAIL/ALIAS SET IS CHECKED ONCE PER RUN, NOT REASSERTED PER COMMIT (operator
     # ruling, thread 2a280e07, mail 9240 — "fix the sources"): the naive per-commit assert
@@ -191,12 +300,25 @@ async def ingest_repo(
         observed = datetime.fromisoformat(c.date)
         short = c.sha[:12]
 
-        dev = await actions.create_or_find_object("Person", _dev_canonical(c), source_id, case_id)
-        key = _dev_canonical(c)
-        info = dev_info.setdefault(key, {"id": dev, "names": set(), "email": None})
+        # MACHINE GIT IDENTITIES ARE NOT PEOPLE (ruling edb6b0fc): route to MachineIdentity
+        # at mint time when the heuristic matches, never to Person — objects.type is
+        # immutable, so getting this right at first mint is the only way to avoid a
+        # same_as bridge later. Falls back to the existing Person routing otherwise.
+        machine_project_id = (
+            await _machine_project_for(c.author_email) if c.author_email else None)
+        if machine_project_id is not None:
+            key = _machine_canonical(c.author_email)
+            dev = await actions.create_or_find_object("MachineIdentity", key, source_id, case_id)
+        else:
+            key = _dev_canonical(c)
+            dev = await actions.create_or_find_object("Person", key, source_id, case_id)
+        info = dev_info.setdefault(
+            key, {"id": dev, "names": set(), "email": None, "machine_project_id": None})
+        info["machine_project_id"] = machine_project_id or info["machine_project_id"]
         info["names"].add(c.author_name)
         info["email"] = c.author_email or info["email"]
         info["observed"] = observed
+        info.setdefault("first_seen", observed)
 
         cm = await actions.create_or_find_object("Commit", f"commit:{short}", source_id, case_id)
         await actions.assert_property(cm, "subject", c.subject, source_id, observed, _CONF,
@@ -265,6 +387,25 @@ async def ingest_repo(
                 await actions.assert_property(
                     dev, "email", author_email, source_id, observed, _CONF,
                     case_id=case_id, evidence_class=_EC)
+
+        # MACHINE GIT IDENTITIES ARE NOT PEOPLE (ruling edb6b0fc): the standing
+        # committer_for edge, `since` = the first commit this identity was seen for this
+        # project THIS run (commits arrive genesis-first, so the first one encountered is
+        # already the earliest — set once, never revised by a later re-ingest that only
+        # ever sees newer history). A Person minted under the old, pre-heuristic routing
+        # for the SAME email is bridged with same_as (loser -> winner), never deleted or
+        # retyped — the object may not exist at all if this identity was always routed
+        # correctly, which is the ordinary case going forward.
+        machine_project_id = info.get("machine_project_id")
+        if machine_project_id is not None:
+            await _link(dev, machine_project_id, "committer_for", info["first_seen"],
+                       properties={"since": info["first_seen"].isoformat()})
+            if author_email:
+                legacy_person_id = await actions.pool.fetchval(
+                    "SELECT id FROM objects WHERE type='Person' AND canonical=$1",
+                    f"dev:{author_email.strip().lower()}")
+                if legacy_person_id is not None:
+                    await _link(legacy_person_id, dev, "same_as", observed)
 
     return {"repo": name, "commits": len(commits), "developers": len(dev_info)}
 

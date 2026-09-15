@@ -1594,6 +1594,14 @@ NEW_TOOL_DECLARATIONS: dict[str, NewToolDeclaration] = {
     # door, backup_settings itself stays a separate, already-shipped door (folding it
     # into this registry is Seshat's own later piece).
     "settings": {"binding_verb": False},
+    # declare_machine_identity — THE declare-machine-identity DOOR (thread 2619f011,
+    # ruling edb6b0fc): manual override for git ingest's own MachineIdentity heuristic
+    # (a bot on a real-looking domain, a local part matching no ingested repo). Not a
+    # seat/office/project binding-mover — it mints a MachineIdentity/committer_for/
+    # same_as over the entity graph, never touches seat/house state. Not a
+    # parameterization of ingest_project/ingest_reference or any other tool — no
+    # existing door mints this object type or bridges a Person via same_as on demand.
+    "declare_machine_identity": {"binding_verb": False},
 }
 
 
