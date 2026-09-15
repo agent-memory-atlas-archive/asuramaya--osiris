@@ -519,6 +519,17 @@ _LAYOUT_SETTINGS: tuple[SettingSpec, ...] = (
                validate=_validate_positive_int, authority="operator_or_ruling",
                requires_because=True, consequence="high",
                write_name="daemon_unit_literals", env_field="osiris_layout_tick_seconds"),
+    # THE PHYSICS LAYOUT OOM (Thoth mail 11097, kernel-confirmed: anon-rss 26.3 GB,
+    # process killed): run_physics_migrate's own declump pass built a full (n,n,2)
+    # float64 pairwise array over the WHOLE active population -- 40 GB at n=50,087.
+    # Fixed by a spatial-hash-grid declump (graph_layout._declump), but this setting
+    # is the belt-and-suspenders guard: read fresh before any REMAINING quadratic-
+    # memory step a future change might reintroduce, never cached at process boot
+    # (a fresh `--physics` process every run, no daemon to restart) -- no env_field,
+    # a genuinely new knob living only in the settings table.
+    SettingSpec("layout.physics_max_bytes", "int", 2_000_000_000, effect="immediate",
+               validate=_validate_positive_int, consequence="low",
+               requires_because=False),
 )
 
 SETTINGS: tuple[SettingSpec, ...] = (
