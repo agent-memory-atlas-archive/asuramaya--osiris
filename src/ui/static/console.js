@@ -1169,11 +1169,17 @@ function runOmniSearch(q) {
       const space = window.OsirisSpace || (window.__spaceReady && await window.__spaceReady);
       if (myToken !== OMNI_SEARCH_TOKEN) return; // the await above can cross a newer keystroke
       if (space && space.idToNode) {
+        // TIP 3 review carry-over (Thoth mail 10930): a plain n.label read silently missed
+        // every node whose label wasn't already resolved on this snapshot -- read it the
+        // same fallback-safe way space.js's own pickLabels/labelTextFor do (nd.label, else
+        // `${type} ${id.slice(0,8)}`), so the fallback always has real text to search.
         agentHits = space.idToNode
-          .filter(n => n.type === 'Agent' && n.label && n.label.toLowerCase().includes(ql))
+          .filter(n => n.type === 'Agent')
+          .map(n => ({ n, text: n.label || `${n.type} ${n.id.slice(0, 8)}` }))
+          .filter(({ text }) => text.toLowerCase().includes(ql))
           .slice(0, 8)
-          .map(n => ({
-            label: n.label, hint: 'Agent', cat: 'Graph',
+          .map(({ n, text }) => ({
+            label: text, hint: 'Agent', cat: 'Graph',
             run: () => { switchSurface('browse'); focus(n.id); },
           }));
       }

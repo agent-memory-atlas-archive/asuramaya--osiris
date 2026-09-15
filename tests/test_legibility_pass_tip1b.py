@@ -86,8 +86,13 @@ def test_labels_respect_the_type_filter() -> None:
 # --- flaw #7: the omnibox finds an agent by handle off the already-loaded graph -----------
 
 def test_omnibox_falls_back_to_a_client_side_agent_handle_scan() -> None:
+    # TIP 3 review carry-over (Thoth mail 10930): a plain n.label read silently missed every
+    # node whose label wasn't already resolved on this snapshot -- fixed to read it the same
+    # fallback-safe way space.js's own pickLabels/labelTextFor do (nd.label, else
+    # `${type} ${id.slice(0,8)}`).
     body = _CONSOLE_JS.split("const graphHits = hits.filter", 1)[1][:2000]
-    assert "n.type === 'Agent' && n.label && n.label.toLowerCase().includes(ql)" in body
+    assert "n.type === 'Agent'" in body
+    assert "n.label || `${n.type} ${n.id.slice(0, 8)}`" in body
     assert "OMNI_ITEMS = toolHits.concat(compHits, graphHits, agentHits).slice(0, 16);" in body
 
 

@@ -80,7 +80,10 @@ def test_a_single_click_is_the_whole_focus_gesture() -> None:
     # plain click focuses directly, and there is no separate double-click trigger left.
     assert "async function selectObject" not in _SPACE_JS
     assert "async function focusObject(id, opts)" in _SPACE_JS
-    click_body = _SPACE_JS.split('addEventListener("click", (ev) => {', 1)[1][:300]
+    # window widened for TIP 3 (Thoth mail 10930): at the far/mid LOD tiers a click drills
+    # into a glyph instead (no individual object to focus at that zoom) -- the near-tier
+    # focusObject(hit.id) branch now sits after that.
+    click_body = _SPACE_JS.split('addEventListener("click", (ev) => {', 1)[1][:500]
     assert "focusObject(hit.id)" in click_body
     assert 'addEventListener("dblclick"' not in _SPACE_JS
 
