@@ -122,6 +122,23 @@ def _dev_canonical(c: Commit) -> str:
     return f"dev:{(c.author_email or c.author_name).strip().lower()}"
 
 
+def _identity_name(dev_canonical: str) -> str:
+    """GIT IDENTITIES WEARING THE WRONG NAME (thread 0be2f790's own operator-finding
+    follow-up, Thoth DM 10711, ruling 9d64cb25): a dev: identity's own `name` is
+    derived ONCE from the identity itself — the email local part, literally whatever
+    precedes '@' in the canonical's own `dev:<email>` — never from whichever commit
+    author happened to write it last. Stable by construction: a pure function of the
+    (immutable) canonical, so it never varies run to run regardless of which of the many
+    callers (gitlog's own CLI, pulse's watch loop, tree_ingest's own one-source-id-per-
+    agent-worktree calls, each a DIFFERENT source_id under the SAME shared ingest_repo)
+    triggered this ingest, or what that particular commit's author name string said.
+    A `dev:<name>` canonical with no `@` at all (the `_dev_canonical` fallback for a
+    commit with no author email) has no "local part" to strip — the whole thing is the
+    identity, unchanged."""
+    email = dev_canonical.removeprefix("dev:")
+    return email.split("@", 1)[0]
+
+
 async def ingest_repo(
     actions: Actions, path: str = ".", *, limit: int | None = None,
     source_id: str = _SOURCE, case_id: uuid.UUID | None = None,
@@ -154,25 +171,32 @@ async def ingest_repo(
                                   case_id=case_id, evidence_class=_EC)
         existing.add((frm, to, typ))
 
-    # A DEV'S NAME/EMAIL IS ONE VALUE FOR THE WHOLE RUN (operator ruling, thread 2a280e07,
-    # mail 9240 — "fix the sources"): the naive per-commit assert reasserted both on EVERY
-    # commit by the same author, live-measured at 166,786/166,782 rows for one Person — this
-    # repo's own git history is exactly the 8-12-minute-cron source Thoth's dispatch named.
-    # CHECKED ONCE PER DEV PER RUN, USING THE DEV'S LAST (most recent) COMMIT IN THIS WALK,
-    # NEVER THE FIRST — `commits` is oldest-first (`--reverse`), so a dev renamed partway
-    # through history has an earlier name at first sighting and the real, current one only
-    # at their LAST commit; a "first commit wins" check (the bug this replaces) locks onto
-    # the stale name forever once seen once, and a genuine rename never lands on re-ingest.
-    # `dev_latest` is overwritten on every commit for that dev, so after the full walk it
-    # holds each dev's most recent commit's own name/email — the ONE value checked against
-    # the graph, and written only if it actually differs.
-    dev_latest: dict[str, tuple[uuid.UUID, str, str | None, datetime]] = {}
+    # A DEV'S EMAIL/ALIAS SET IS CHECKED ONCE PER RUN, NOT REASSERTED PER COMMIT (operator
+    # ruling, thread 2a280e07, mail 9240 — "fix the sources"): the naive per-commit assert
+    # reasserted on EVERY commit by the same author, live-measured at 166,786/166,782 rows
+    # for one Person — this repo's own git history is exactly the 8-12-minute-cron source
+    # Thoth's dispatch named. `dev_info` accumulates, per dev canonical, EVERY distinct
+    # author_name actually seen across this run's whole walk (not just the last commit) —
+    # GIT IDENTITIES WEARING THE WRONG NAME (thread 0be2f790's own operator-finding
+    # follow-up, Thoth DM 10711, ruling 9d64cb25) replaced the old "last commit's
+    # author name becomes `name`" policy (which let whichever of many source_id-per-
+    # agent-worktree ingest runs happened to write most recently silently flip a Person's
+    # own displayed name — the operator's own git identity flipping to an agent's name was
+    # exactly this) with a policy that never lets ANY commit author name touch `name` at
+    # all: `_identity_name` derives it once from the (stable) canonical itself, and every
+    # author name actually seen rides along as an `author_alias` instead — never lost,
+    # never mistaken for the identity's own chosen name.
+    dev_info: dict[str, dict[str, Any]] = {}
     for c in commits:
         observed = datetime.fromisoformat(c.date)
         short = c.sha[:12]
 
         dev = await actions.create_or_find_object("Person", _dev_canonical(c), source_id, case_id)
-        dev_latest[_dev_canonical(c)] = (dev, c.author_name, c.author_email, observed)
+        key = _dev_canonical(c)
+        info = dev_info.setdefault(key, {"id": dev, "names": set(), "email": None})
+        info["names"].add(c.author_name)
+        info["email"] = c.author_email or info["email"]
+        info["observed"] = observed
 
         cm = await actions.create_or_find_object("Commit", f"commit:{short}", source_id, case_id)
         await actions.assert_property(cm, "subject", c.subject, source_id, observed, _CONF,
@@ -200,14 +224,38 @@ async def ingest_repo(
             )
             await _link(cm, par, "follows", observed)
 
-    for dev, author_name, author_email, observed in dev_latest.values():
+    for key, info in dev_info.items():
+        dev, observed, author_email = info["id"], info["observed"], info["email"]
+        identity_name = _identity_name(key)
         current_name = await actions.pool.fetchval(
             "SELECT a.value #>> '{}' FROM current_assertions a "
             "WHERE a.object_id=$1 AND a.name='name' AND a.source_id=$2 LIMIT 1",
             dev, source_id)
-        if current_name != author_name:
-            await actions.assert_property(dev, "name", author_name, source_id, observed,
+        if current_name != identity_name:
+            await actions.assert_property(dev, "name", identity_name, source_id, observed,
                                           _CONF, case_id=case_id, evidence_class=_EC)
+        # GIT IDENTITIES WEARING THE WRONG NAME (Thoth DM 10711, ruling 9d64cb25):
+        # every author_name actually seen for this dev this run, other than the identity-
+        # derived name itself, rides along as `author_alias` — additive across runs (merged
+        # with whatever this SAME source already recorded), never overwritten, never
+        # mistaken for the identity's own chosen name.
+        # case-insensitive compare: `identity_name` is always lowercase (`_dev_canonical`
+        # lowercases the whole canonical), but a commit author's own display name carries
+        # its natural casing — "Ada" must not count as an alias of "ada" just because the
+        # email-derived identity name is lowercase; "Ada Lovelace" genuinely is a different
+        # name and still does.
+        seen_aliases = {n for n in info["names"] if n and n.lower() != identity_name}
+        if seen_aliases:
+            existing_alias_value = await actions.pool.fetchval(
+                "SELECT a.value FROM current_assertions a "
+                "WHERE a.object_id=$1 AND a.name='author_alias' AND a.source_id=$2 LIMIT 1",
+                dev, source_id)
+            existing_aliases = set(existing_alias_value) if existing_alias_value else set()
+            merged = sorted(existing_aliases | seen_aliases)
+            if merged != sorted(existing_aliases):
+                await actions.assert_property(
+                    dev, "author_alias", merged, source_id, observed, _CONF,
+                    case_id=case_id, evidence_class=_EC)
         if author_email:
             current_email = await actions.pool.fetchval(
                 "SELECT a.value #>> '{}' FROM current_assertions a "
@@ -218,7 +266,7 @@ async def ingest_repo(
                     dev, "email", author_email, source_id, observed, _CONF,
                     case_id=case_id, evidence_class=_EC)
 
-    return {"repo": name, "commits": len(commits), "developers": len(dev_latest)}
+    return {"repo": name, "commits": len(commits), "developers": len(dev_info)}
 
 
 def main() -> None:  # pragma: no cover - CLI
