@@ -134,6 +134,10 @@ def test_a_focused_node_with_no_semantic_edges_still_lights_its_structural_neigh
 def test_base_edge_layer_hides_edges_touching_an_invisible_node() -> None:
     body = _SPACE_JS.split("function nodeVisible(nd)", 1)[1][:400]
     assert "hiddenNodeTypes.has(nd.type)" in body
+    # CONSOLE CHROME CLEANUP piece 2 (decision 31717ca7): the repo selector's own
+    # hidden-set must ALSO gate edge-geometry visibility here, the same as applyDim's
+    # own per-instance flag — an edge touching a project-hidden node must not still draw.
+    assert "hiddenProjects.has(nd.project)" in body
     assert "pathReachable.has(nd.id)" in body
     build_body = _SPACE_JS.split("function buildEdgeLines(nodes, edgeList)", 1)[1][:700]
     assert "nodeVisible(byId.get(e.source))" in build_body
@@ -166,6 +170,19 @@ def test_header_type_filters_and_the_legend_drive_the_same_visibility_flag() -> 
     assert "syncSpaceTypeFilter();" in body
     legend_body = _SPACE_JS.split("[data-legend-node-type]", 1)[1][:400]
     assert "hiddenNodeTypes.delete(type)" in legend_body
+
+
+def test_header_repo_selector_drives_the_same_visibility_flag_by_project() -> None:
+    """CONSOLE CHROME CLEANUP piece 2 (decision 31717ca7, thread 0be2f790's own operator-
+    finding follow-up): setHiddenProjects is the repo pill's own sibling to
+    setHiddenTypes above — same per-instance aVisible flag, filtered by nd.project
+    instead of nd.type."""
+    assert "function setHiddenProjects(projects)" in _SPACE_JS
+    assert "function syncSpaceProjectFilter()" in _CONSOLE_JS
+    body = _CONSOLE_JS.split("function applyRepoFilter()", 1)[1][:400]
+    assert "syncSpaceProjectFilter();" in body
+    apply_dim_body = _SPACE_JS.split("function applyDim()", 1)[1][:800]
+    assert "hiddenProjects.has(nd.project)" in apply_dim_body
 
 
 def test_legend_gains_a_node_types_section() -> None:

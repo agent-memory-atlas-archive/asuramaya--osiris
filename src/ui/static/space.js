@@ -318,6 +318,12 @@ export async function initSpace(container) {
   // TIP 1(e): header taxonomy-pill type filters hide instances through the same per-instance
   // aVisible flag focus uses (1(d)) — empty means nothing filtered, everything shown.
   let hiddenNodeTypes = new Set();
+  // CONSOLE CHROME CLEANUP piece 2 (decision 31717ca7, thread 0be2f790's own operator-
+  // finding follow-up): the header's repo selector drives the SAME aVisible flag through
+  // this sibling set — nd.project (already carried on every node since the snapshot's own
+  // project_code lookup, line ~148) is the field it filters on, empty means nothing
+  // filtered, everything shown.
+  let hiddenProjects = new Set();
   // THE READING LAYER, part B: FOCUS = PATH LENS (ruling c5953bb1, Thoth DM 10596). SELECT
   // (a plain click) and FOCUS (double-click, Enter, or the inspector's Focus button) are now
   // two different acts — selectedId just shows the inspector; pathFocusId/pathReachable are
@@ -453,6 +459,7 @@ export async function initSpace(container) {
   function nodeVisible(nd) {
     if (!nd) return false;
     if (hiddenNodeTypes.has(nd.type)) return false;
+    if (hiddenProjects.size > 0 && hiddenProjects.has(nd.project)) return false;
     if (pathFocusId && nd.id !== pathFocusId && !pathReachable.has(nd.id)) return false;
     return true;
   }
@@ -635,8 +642,9 @@ export async function initSpace(container) {
     for (let i = 0; i < idToNode.length; i++) {
       const nd = idToNode[i];
       const typeHidden = hiddenNodeTypes.has(nd.type);
+      const projectHidden = hiddenProjects.size > 0 && hiddenProjects.has(nd.project);
       const focusHidden = focused && nd.id !== pathFocusId && !pathReachable.has(nd.id);
-      visibleAttr.setX(i, (typeHidden || focusHidden) ? 0 : 1);
+      visibleAttr.setX(i, (typeHidden || projectHidden || focusHidden) ? 0 : 1);
       color.set(typeColors.get(nd.type) || "#6e7681");
       if (focused && nd.id === pathFocusId) color.set("#58a6ff");
       else if (!focused && nd.id === selectedId) color.set("#58a6ff");
@@ -657,6 +665,17 @@ export async function initSpace(container) {
     applyDim();
     buildEdgeLines(idToNode, edges);
     scheduleLabelPick(); // review flaw #5: labels never re-picked on a filter change before
+  }
+
+  // CONSOLE CHROME CLEANUP piece 2 (decision 31717ca7): the header's repo pill's own
+  // sibling to setHiddenTypes above — same "caller hands the full HIDDEN set, translated
+  // from whatever allowlist/selection semantics that caller owns" convention (console.js's
+  // selectRepos()/applyRepoFilter() do the SELECTED-repos-to-hidden-repos translation, same
+  // shape toggleEntityType already does for types).
+  function setHiddenProjects(projects) {
+    hiddenProjects = new Set(projects || []);
+    applyDim();
+    buildEdgeLines(idToNode, edges);
   }
 
   async function loadTypeColors() {
@@ -1338,6 +1357,7 @@ export async function initSpace(container) {
 
   const api = {
     focusObject, clearFocus, inspect, pause, resume, goBack, setHiddenTypes,
+    setHiddenProjects,
     get idToNode() { return idToNode; },
     get pathReachable() { return pathReachable; },
     get pathFocusId() { return pathFocusId; },

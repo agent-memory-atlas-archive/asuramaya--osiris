@@ -164,35 +164,46 @@ def test_palette_search_includes_saved_compositions_in_both_search_paths() -> No
     assert "OMNI_ITEMS = toolHits.concat(compHits, graphHits, agentHits).slice(0, 16);" in _JS
 
 
-# THE PROJECTS SWAP (Thoth dispatch 9542/9676/9690/9716, 588148bb): the hardcoded /projects
-# fetch + hand-rolled projectRow()/openProjectInBrowse() replaced by the "projects" saved
-# composition — proven complete across 4 pieces first (object_count, bucket badges, worktree
-# nesting, click-through), plus the name-resolution parity gap the swap itself surfaced. The
-# status toggle stays (never collapse the status dimension to one number, msg 5631); the
-# table body renders through the same generic pipeline every other composition uses.
+# THE CONSOLE CHROME CLEANUP (thread 0be2f790's own operator-finding follow-up, Thoth DM
+# 10731 piece 1): the left-nav "Projects" surface — redundant with the header's own repo
+# selector, per the operator's own word — is retired: no nav item, no bespoke
+# renderProjects()/status-toggle chrome. The "projects" saved composition itself is
+# UNTOUCHED and stays reachable exactly like every other saved composition (the omnibox,
+# or the CLI/MCP composition-run door) — only the surface wrapper around it is gone.
+# Superseding test_projects_no_longer_fetches_the_hardcoded_route/
+# test_projects_hand_rolled_row_renderer_is_gone/
+# test_projects_renders_through_the_generic_composer_pipeline/
+# test_projects_status_toggle_still_narrows_client_side_over_every_status, which all
+# asserted on renderProjects()'s own body — meaningless once that function is gone.
 
 
-def test_projects_no_longer_fetches_the_hardcoded_route() -> None:
-    assert "fetch('/projects')" not in _JS
-    assert "'/compositions/projects/run'" in _JS
+def test_projects_nav_item_is_gone() -> None:
+    assert 'data-surface="projects"' not in _INDEX_HTML
+    assert "nav-projects" not in _INDEX_HTML
+    assert ">Projects<" not in _INDEX_HTML
 
 
-def test_projects_hand_rolled_row_renderer_is_gone() -> None:
-    assert "function projectRow(" not in _JS
-    assert "function openProjectInBrowse(" not in _JS
+def test_projects_surface_chrome_is_gone_from_console_js() -> None:
+    assert "function renderProjects(" not in _JS
+    assert "PROJECTS_INDEX_DATA" not in _JS
+    assert "setProjectsStatusFilter" not in _JS
+    assert "if (surface === 'projects')" not in _JS
 
 
-def test_projects_renders_through_the_generic_composer_pipeline() -> None:
-    body = _JS.split("async function renderProjects()", 1)[1].split("\nfunction ", 1)[0]
-    assert "Osiris.renderResult(filtered" in body
-    assert "JSON.stringify(res, null, 2)" not in body
+def test_projects_composition_still_runs_through_the_generic_omnibox_path() -> None:
+    # the underlying data access is untouched — SAVED_COMPOSITIONS (loaded by
+    # loadCompositions(), the omnibox's own source list) still resolves a "projects" hit
+    # to the SAME generic runTool()/runComposition() pipeline every other saved
+    # composition uses, never a route this cleanup would have orphaned.
+    assert "'/compositions/' + encodeURIComponent(name) + '/run'" in _JS
 
 
-def test_projects_status_toggle_still_narrows_client_side_over_every_status() -> None:
-    # the composition itself fetches every status in one call (status:"any", piece 1); the
-    # toggle narrowing stays client-side, same shape as the pre-swap page.
-    body = _JS.split("async function renderProjects()", 1)[1].split("\nfunction ", 1)[0]
-    assert "PROJECTS_INDEX_STATUS === 'all' || r.status === PROJECTS_INDEX_STATUS" in body
+def test_projects_array_and_its_loader_survive_for_the_repo_pill() -> None:
+    # loadProjects()/PROJECTS stay — the repo-scope pill (renderRepoDropdown) depends on
+    # them, even though the left-nav Projects SURFACE that also used to read from a
+    # similarly-named endpoint is gone.
+    assert "async function loadProjects()" in _JS
+    assert "PROJECTS = await fetch('/objects?type=SoftwareProject')" in _JS
 
 
 # THE BROWSE SWAP (Thoth dispatch 9838/9855, 588148bb): the entity set's own load used to

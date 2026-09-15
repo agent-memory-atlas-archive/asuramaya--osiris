@@ -34,7 +34,6 @@ async function switchSurface(surface) {
     if (window.OsirisSpace) window.OsirisSpace.pause();
     if (surface === 'mailbox') renderMailbox();
     if (surface === 'pane') renderPane();
-    if (surface === 'projects') renderProjects();
   }
 }
 
@@ -144,6 +143,25 @@ function applyRepoFilter() {
   if (pill) pill.textContent = SELECTED_REPOS.length ? SELECTED_REPOS.join(", ") : "All Repos";
   SCOPE_FILTER = SELECTED_REPOS.join(",");
   SET = []; loadObjectSet().then(function(){ renderEntityExplorer(); });
+  syncSpaceProjectFilter();
+}
+// CONSOLE CHROME CLEANUP piece 2 (decision 31717ca7): the header's repo selector drives
+// the canvas through the SAME per-instance visibility flag syncSpaceTypeFilter already
+// uses for the type pills (space.js's setHiddenProjects, sibling to setHiddenTypes) —
+// SELECTED_REPOS is an ALLOWLIST of stripped repo names (empty = show all, "All Repos"),
+// translated to a hidden-set of RAW nd.project values (space.js's own project field
+// carries the "repo:" canonical prefix, or the literal "unfiled") before handing it to
+// the graph, which speaks "hidden" not "allowed" — same translation shape
+// syncSpaceTypeFilter already does for types.
+function syncSpaceProjectFilter() {
+  const space = window.OsirisSpace; if (!space || !space.setHiddenProjects) return;
+  if (SELECTED_REPOS.length === 0) { space.setHiddenProjects(new Set()); return; }
+  const selected = new Set(SELECTED_REPOS);
+  const present = new Set(space.idToNode.map(function(n){ return n.project; }));
+  const hidden = new Set([...present].filter(function(p){
+    return !selected.has((p || '').replace(/^repo:/, ''));
+  }));
+  space.setHiddenProjects(hidden);
 }
 function updateRepoPill() {
   var pill = document.getElementById("repo-pill-label");
@@ -830,62 +848,16 @@ async function applyRepair(target) {
   setStatus(target + ' applied.');
 }
 
-// ── Projects (#93, the project dimension — Thoth msg 5631) ────────────────────
-// THE SWAP (Thoth dispatch 9542/9676/9690/9716, 588148bb): the hardcoded /projects fetch
-// + hand-rolled projectRow()/openProjectInBrowse() replaced by the "projects" saved
-// composition, proven complete across 4 pieces first (object_count, bucket badges,
-// worktree nesting, click-through) plus the name-resolution parity gap the swap itself
-// surfaced (compositions.py's `name_fallback` column kind) — per Thoth's own bar, "prove
-// each old view is a composition BEFORE deleting the hardcoded page." The status toggle
-// (NEVER collapse the status dimension to one number, msg 5631) stays client-side, same
-// shape as before, over the composition's own `status:"any"` fetch; the table body now
-// renders through the SAME generic Osiris.renderResult() pipeline every other saved
-// composition uses — bucket/worktrees show as plain columns (the generic table()'s own
-// _flatVal prose for worktrees, same accepted gap as piece 3), click-through is a
-// "run:browse" button per row (piece 4's bind_subject), not a whole-row click.
-var PROJECTS_INDEX_DATA = null, PROJECTS_INDEX_STATUS = 'active';
-async function renderProjects() {
-  var container = $('result'); showPanel();
-  try {
-    if (!PROJECTS_INDEX_DATA) {
-      PROJECTS_INDEX_DATA = await fetch('/compositions/projects/run', {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ subject: null }),
-      }).then(function(r){ return r.json(); });
-    }
-    if (PROJECTS_INDEX_DATA.error) {
-      container.innerHTML = '<div class="o-empty" style="padding:40px">' + esc(PROJECTS_INDEX_DATA.error) + '</div>';
-      return;
-    }
-    var rows = PROJECTS_INDEX_DATA.items || [];
-    if (!rows.length) { container.innerHTML = '<div class="o-empty" style="padding:40px">No projects.</div>'; return; }
-    // NEVER collapse the status dimension to one number (Thoth's own instruction, msg
-    // 5631): "what is live" and "what has ever existed" are different questions — a
-    // toggle, not a single count, so both stay askable.
-    var counts = {};
-    rows.forEach(function(r){ counts[r.status] = (counts[r.status] || 0) + 1; });
-    var allCount = rows.length, activeCount = counts.active || 0;
-    var shown = rows.filter(function(r){ return PROJECTS_INDEX_STATUS === 'all' || r.status === PROJECTS_INDEX_STATUS; });
-    var head = document.createElement('div');
-    head.style.cssText = 'padding:16px 16px 8px;max-width:1100px;margin:0 auto';
-    head.innerHTML = '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">' +
-      '<h2 style="font-size:13px;text-transform:uppercase;letter-spacing:0.5px;color:var(--muted)">Projects (' + shown.length + ')</h2>' +
-      '<div><button class="iconbtn' + (PROJECTS_INDEX_STATUS === 'active' ? ' sel' : '') + '" onclick="setProjectsStatusFilter(\'active\')">Active (' + activeCount + ')</button> ' +
-      '<button class="iconbtn' + (PROJECTS_INDEX_STATUS === 'all' ? ' sel' : '') + '" onclick="setProjectsStatusFilter(\'all\')">All (' + allCount + ')</button></div></div>';
-    var panel = document.createElement('div');
-    panel.style.padding = '0 16px 16px';
-    var filtered = Object.assign({}, PROJECTS_INDEX_DATA, { items: shown, count: shown.length });
-    await Osiris.renderResult(filtered, { panel: panel }, Osiris.defaultView(filtered), null, null, null);
-    container.innerHTML = '';
-    container.appendChild(head);
-    container.appendChild(panel);
-    setStatus(shown.length + ' of ' + allCount + ' projects');
-  } catch(e) {
-    console.error('renderProjects failed', e);
-    container.innerHTML = '<div class="o-empty" style="padding:40px">Could not load projects.</div>';
-  }
-}
-function setProjectsStatusFilter(status) { PROJECTS_INDEX_STATUS = status; renderProjects(); }
+// ── Projects ────────────────────────────────────────────────────────────────
+// THE CONSOLE CHROME CLEANUP (thread 0be2f790's own operator-finding follow-up, Thoth DM
+// 10731 piece 1): the left-nav "Projects" surface (renderProjects() + its own status
+// toggle, formerly wired here) is retired — redundant with the header's own repo
+// selector, per the operator's own word. The underlying "projects" saved composition is
+// UNTOUCHED and stays reachable exactly as every other saved composition is: the omnibox
+// (type "projects" in the header search) or the CLI/MCP composition-run door directly —
+// this removes only the bespoke surface/status-toggle chrome around it, never the data
+// access itself. loadProjects()/the PROJECTS array below stay — the repo pill still
+// depends on them.
 
 // ── Fleet ────────────────────────────────────────────────────────────────────
 
