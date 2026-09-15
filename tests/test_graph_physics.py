@@ -23,7 +23,6 @@ from src.orchestrator.graph_physics import (
     _detect_communities,
     _level1_layout,
     _level1_radius,
-    _level2_layout_for_project,
     _memory_guard,
     _physics_positions,
     _place_unfiled,
@@ -267,10 +266,9 @@ async def test_level2_layout_does_not_collapse_a_large_project_into_one_cell(
     link_rows = await graph_physics._live_link_rows(actions)
     membership = await _project_membership(actions)
     communities = _detect_communities(link_rows, membership, {proj, *members})
-    radius = _level1_radius(len(members))
 
-    member_pos = _level2_layout_for_project(
-        proj, members, link_rows, communities, np.zeros(2), radius)
+    member_pos = graph_physics._level2_raw_layout_for_project(
+        proj, members, link_rows, communities)
     pos = np.array([member_pos[m] for m in members])
     cells = _grid_cells(pos, _MIN_SEPARATION)
     worst_cell = max(len(v) for v in cells.values())
@@ -379,6 +377,26 @@ def test_verify_min_separation_raises_on_two_coincident_points() -> None:
     pos = np.array([[0.0, 0.0], [0.001, 0.0]])
     with pytest.raises(DeclumpVerificationFailed):
         _verify_min_separation(pos, min_sep=_MIN_SEPARATION)
+
+
+def test_declump_then_verify_never_flakes_on_many_random_small_unfiled_populations() -> None:
+    """Live flake specimen (full-suite serial gate, e7cf6c59 follow-up): a hermetic
+    3-object all-unfiled population occasionally left one pair 14.24 units apart
+    after `_declump`'s own default 30 iterations, under the 15-unit floor by more
+    than `_verify_min_separation`'s epsilon. Reproduced here directly (no DB) over
+    many random small populations -- `_place_unfiled`'s own Gaussian fog is exactly
+    what generated the flaky starting configuration -- to confirm
+    `_PHYSICS_DECLUMP_ITERATIONS` actually closes the gap rather than just moving
+    it to a rarer seed."""
+    for _trial in range(300):
+        for n in (2, 3, 4):
+            ids = [uuid.uuid4() for _ in range(n)]
+            out = graph_physics._place_unfiled(ids, [], {})
+            pos = np.array([out[oid] for oid in ids])
+            declumped = graph_physics._declump(
+                pos, np.zeros((0, 2)), ids, min_sep=_MIN_SEPARATION,
+                iterations=graph_physics._PHYSICS_DECLUMP_ITERATIONS)
+            _verify_min_separation(declumped)  # raises on failure -- the assertion
 
 
 def test_place_hubs_in_zone_spreads_hubs_at_least_min_sep_apart() -> None:
