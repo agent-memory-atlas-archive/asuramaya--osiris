@@ -1227,7 +1227,7 @@ async def _reattach(
         # mounted, and the bounce below is the CORRECT answer, not a gap.
         from src.ingest.sessions import cwd_of_transcript
 
-        restored_cwd = cwd_of_transcript(job_dir=job)
+        restored_cwd = await cwd_of_transcript(job_dir=job)
         if restored_cwd is None:
             return None
         rec = mounts.MountRecord(job_dir=job, agent_id="", project=None, cwd=restored_cwd,

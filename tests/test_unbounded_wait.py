@@ -101,7 +101,16 @@ _SUBPROCESS_BASELINE: dict[str, int] = {
     "src/cli.py": 85,
     "src/ingest/files.py": 3,
     "src/ingest/gitlog.py": 3,
-    "src/ingest/sessions.py": 3,
+    # 3 -> 5 (2026-09-15, Sekhmet, d2501552, blocking-transcript-read guard fix): two new
+    # `asyncio.run(...)` call sites — `asyncio.run(current_model(root=r))` in the CLI's
+    # own `whoami` branch (current_model made async, off-loop) and `asyncio.run(asyncio.
+    # to_thread(sys.stdin.read))` in the `sweep` branch's hook-JSON read (also wrapped for
+    # the same guard) — the identical false-positive class every comment above already
+    # names: the scanner's own coarse `name in ("run", "communicate")` proxy matches
+    # `asyncio.run` the same as `subprocess.run` whenever the file imports `subprocess`
+    # at all (sessions.py's own real one, line ~892), not a genuine new unbounded
+    # subprocess wait.
+    "src/ingest/sessions.py": 5,
     "src/orchestrator/deploy_guard.py": 3,
     "src/orchestrator/pulse.py": 3,
     "tests/conftest.py": 2,

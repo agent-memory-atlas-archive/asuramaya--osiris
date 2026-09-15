@@ -85,10 +85,13 @@ def _project_of(session_dir: Path) -> str | None:
     return decode_claude_project_name(session_dir.parent.name) or None
 
 
-def scan_subagents(session_dir: Path) -> list[SubAgent]:
-    """Parse a session's `subagents/` tree into SubAgent nodes (pure file IO). Each node's
-    model is read from its OWN transcript tail — the fix for the collapse. Sorted by
-    (spawn_depth, handle) so a parent is always seen before its children."""
+async def scan_subagents(session_dir: Path) -> list[SubAgent]:
+    """Parse a session's `subagents/` tree into SubAgent nodes. Each node's model is read
+    from its OWN transcript tail — the fix for the collapse. Sorted by (spawn_depth, handle)
+    so a parent is always seen before its children. Every actual file read runs through
+    `asyncio.to_thread` (the blocking-transcript-read guard's own detection shape — a bare,
+    uncalled attribute passed to `to_thread`, never an inline `.read_text()` call), even
+    though these are bounded sub-agent transcripts, never the 200-470MB main-session kind."""
     subs_dir = session_dir / "subagents"
     if not subs_dir.is_dir():
         return []
@@ -100,14 +103,16 @@ def scan_subagents(session_dir: Path) -> list[SubAgent]:
         if not transcript.is_file():
             continue
         try:
-            meta = json.loads(meta_path.read_text())
+            meta_text = await asyncio.to_thread(meta_path.read_text)
+            meta = json.loads(meta_text)
         except (ValueError, OSError):
             continue
         handle = meta_path.name[len("agent-"):-len(".meta.json")]
         model: str | None = None
         history: list[str] = []
         try:  # read the whole (bounded) sub-agent transcript once: current model + swap history
-            lines = transcript.read_text("utf-8", errors="replace").splitlines()
+            text = await asyncio.to_thread(transcript.read_text, "utf-8", "replace")
+            lines = text.splitlines()
             history = models_in(lines)
             model = latest_model(lines)
         except OSError:
@@ -119,7 +124,8 @@ def scan_subagents(session_dir: Path) -> list[SubAgent]:
             agent_type=str(meta.get("agentType", "")),
             description=str(meta.get("description", "")),
             tool_use_id=str(meta.get("toolUseId", "")), transcript=transcript,
-            last_active=last_active, backed_by_observation=_has_own_observation(transcript),
+            last_active=last_active,
+            backed_by_observation=await _has_own_observation(transcript),
         ))
     out.sort(key=lambda s: (s.spawn_depth, s.handle))
     return out
@@ -134,13 +140,13 @@ def _content_blocks(rec: dict[str, Any]) -> list[Any]:
     return []
 
 
-def _emitted_tool_use_ids(transcript: Path) -> set[str]:
+async def _emitted_tool_use_ids(transcript: Path) -> set[str]:
     """Every tool_use id emitted in a transcript — the spawn calls it made live here. Resolves
     a child's `toolUseId` to the SIBLING that spawned it; a miss means the root did. Lines are
     pre-filtered cheaply so only the few tool_use records are JSON-parsed."""
     ids: set[str] = set()
     try:
-        text = transcript.read_text("utf-8", errors="replace")
+        text = await asyncio.to_thread(transcript.read_text, "utf-8", "replace")
     except OSError:
         return ids
     for line in text.splitlines():
@@ -161,7 +167,7 @@ def _emitted_tool_use_ids(transcript: Path) -> set[str]:
 _HEARD_CONDUITS = frozenset({"Agent", "Task"})
 
 
-def _has_own_observation(transcript: Path) -> bool:
+async def _has_own_observation(transcript: Path) -> bool:
     """Tier-1 of the act-detection ladder (ruling 108ff2e8): did this agent perform ANY act of its
     own, or is everything it knows hearsay? An agent whose ONLY tool_uses are Agent/Task returns
     cannot have looked — it merely heard its children. Any other tool_use is the agent observing or
@@ -169,7 +175,7 @@ def _has_own_observation(transcript: Path) -> bool:
     deferred, and this coarse floor is the conservative signal the credence rebuttal reads (we only
     clamp an ancestor that provably never looked, so a genuine verification is never deflated)."""
     try:
-        text = transcript.read_text("utf-8", errors="replace")
+        text = await asyncio.to_thread(transcript.read_text, "utf-8", "replace")
     except OSError:
         return False
     for line in text.splitlines():
@@ -186,7 +192,7 @@ def _has_own_observation(transcript: Path) -> bool:
     return False
 
 
-def resolve_parents(subs: list[SubAgent]) -> dict[str, str]:
+async def resolve_parents(subs: list[SubAgent]) -> dict[str, str]:
     """Map each sub-agent's agent_id → its DIRECT PARENT agent_id. A child's `toolUseId` is the
     spawn call that made it; whichever transcript EMITTED that id is the parent. Only SIBLING
     sub-agent transcripts are scanned (small); a miss means the root session spawned it (its
@@ -196,7 +202,7 @@ def resolve_parents(subs: list[SubAgent]) -> dict[str, str]:
     root = _root_agent_id(subs[0].session)
     emitter: dict[str, str] = {}
     for s in subs:
-        for tid in _emitted_tool_use_ids(s.transcript):
+        for tid in await _emitted_tool_use_ids(s.transcript):
             emitter[tid] = s.agent_id
     return {s.agent_id: emitter.get(s.tool_use_id, root) for s in subs}
 
@@ -229,10 +235,10 @@ async def register_swarm(
     sub-agents mounting. Mints an Agent per sub-agent (its OWN model, DIRECT_OBSERVATION),
     wires `spawned_by` → its direct parent (delegation) and `acts_for` → the root principal
     (authority — distinct edges, per the ruling). Idempotent (find-or-create + byte-dup skip)."""
-    subs = await asyncio.to_thread(scan_subagents, session_dir)
+    subs = await scan_subagents(session_dir)
     if not subs:
         return {"agents": 0, "spawned_by": 0}
-    parents = await asyncio.to_thread(resolve_parents, subs)
+    parents = await resolve_parents(subs)
     now = datetime.now(UTC)
     principal = principal or await _root_principal(actions, _root_agent_id(subs[0].session))
     counts = {"agents": 0, "spawned_by": 0}
@@ -376,12 +382,11 @@ async def register_spawn(
             await _link_once(actions, a, proj, "works_in", now)
     model: str | None = None
     if transcript is not None:
-        def _read_model(path: Path = transcript) -> str | None:
-            try:
-                return latest_model(path.read_text("utf-8", errors="replace").splitlines())
-            except OSError:
-                return None
-        model = await asyncio.to_thread(_read_model)
+        try:
+            text = await asyncio.to_thread(transcript.read_text, "utf-8", "replace")
+            model = latest_model(text.splitlines())
+        except OSError:
+            model = None
         if model:
             await prop("source_model", model)
         # the disk is a witness: a path the harness named but never materialized stamps the

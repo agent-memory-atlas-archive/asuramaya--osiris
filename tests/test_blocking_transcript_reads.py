@@ -60,17 +60,21 @@ _BLOCKING_READ_METHODS = frozenset({"read_text", "read_bytes", "readlines", "rea
 # member (Thoth's own carve-out, mail 10628: a worker job has no event loop shared
 # with osiris-mcp to freeze).
 _TRANSCRIPT_MODULES: dict[str, int] = {
-    # scan_subagents/_emitted_tool_use_ids/_has_own_observation each do a direct
-    # transcript.read_text(...) on a sub-agent's own .jsonl (comment there calls it
-    # "bounded" — a sub-agent transcript, not a 470MB main-session one — but still
-    # unwrapped, still worth a real fix, not assumed safe by this guard).
-    "src/orchestrator/lineage.py": 5,
-    # THE INCIDENT'S OWN CALL SITE — already fixed (asyncio.to_thread-wrapped) before
-    # this guard was written. Zero is the whole point: a regression here is exactly
-    # what this ratchet exists to catch first.
+    # d2501552 CLOSED (Thoth mail 10988, 2026-09-15): all 13 pre-existing gaps this
+    # guard's own first run found are fixed — lineage.py's three sub-agent-transcript
+    # readers made async, wrapped via asyncio.to_thread; sessions.py's two genuinely
+    # UNBOUNDED whole-transcript reads (774/793) made bounded AND streaming, not just
+    # off-loop (Thoth: "memory is the second hazard"), its bounded tail/chunk readers
+    # and CLI stdin read wrapped for ratchet-cleanliness; claude_jsonl.py's two small
+    # file reads switched to a file-object line iterator / json.load(f) (streams from
+    # the file object, never a literal .read_text()/.read() in this source at all —
+    # no async/Protocol change needed since HarnessAdapter.enumerate() stays sync).
+    # Every entry below reads 0 — a regression here is exactly what this ratchet exists
+    # to catch first, same law "src/orchestrator/provenance_backfill.py": 0 already set.
+    "src/orchestrator/lineage.py": 0,
     "src/orchestrator/provenance_backfill.py": 0,
-    "src/ingest/sessions.py": 6,
-    "src/ingest/harness/claude_jsonl.py": 2,
+    "src/ingest/sessions.py": 0,
+    "src/ingest/harness/claude_jsonl.py": 0,
 }
 
 

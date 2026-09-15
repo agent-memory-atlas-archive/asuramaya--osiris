@@ -24,6 +24,14 @@ from src.parsers.base import EvidenceClass
 _SD = EvidenceClass.SELF_DECLARED.value
 
 
+def _async_const(value: Any):
+    """A monkeypatch replacement for an async function that just returns `value` — matches
+    `cwd_of_transcript`'s own now-async signature (blocking-transcript-read guard fix)."""
+    async def _fn(root: Any = None, job_dir: Any = None) -> Any:
+        return value
+    return _fn
+
+
 async def test_save_find_upsert(actions: Actions) -> None:
     p = actions.pool
     await mounts.save_mount(p, job_dir="/x/jobs/aaaa1111", agent_id="agent:aaaa1111",
@@ -374,8 +382,7 @@ async def test_reattach_self_restores_from_a_real_transcript_when_no_row_survive
     job_dir = str(tmp_path / "jobs" / "restore1")
     restored_cwd = str(tmp_path / "demo")
     monkeypatch.setattr(
-        "src.ingest.sessions.cwd_of_transcript",
-        lambda root=None, job_dir=None: restored_cwd)
+        "src.ingest.sessions.cwd_of_transcript", _async_const(restored_cwd))
 
     assert await mounts.find_mount(actions.pool, job_dir=job_dir) is None  # nothing yet
     srv._agents.pop("sid:restored", None)
@@ -413,8 +420,7 @@ async def test_reattach_self_restore_flags_an_unattributed_revisit_to_a_known_pr
     job_dir = str(tmp_path / "jobs" / "restore2")
     restored_cwd = str(tmp_path / "demo2")
     monkeypatch.setattr(
-        "src.ingest.sessions.cwd_of_transcript",
-        lambda root=None, job_dir=None: restored_cwd)
+        "src.ingest.sessions.cwd_of_transcript", _async_const(restored_cwd))
 
     srv._agents.pop("sid:restored2", None)
     ident = await srv._reattach(actions.pool, "sid:restored2", job_dir)
@@ -445,7 +451,7 @@ async def test_reattach_stays_none_when_no_transcript_exists_to_restore_from(
     from src import mcp_server as srv
 
     monkeypatch.setattr(
-        "src.ingest.sessions.cwd_of_transcript", lambda root=None, job_dir=None: None)
+        "src.ingest.sessions.cwd_of_transcript", _async_const(None))
 
     job_dir = str(tmp_path / "jobs" / "nevermnt")
     srv._agents.pop("sid:nomatch", None)

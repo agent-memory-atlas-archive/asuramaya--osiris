@@ -670,18 +670,18 @@ def test_locate_anchors_on_job_id_over_newest(tmp_path: Path) -> None:
 # read directly off its transcript, no agent_mounts row required ═══
 
 
-def test_cwd_of_transcript_reads_the_first_cwd_line(tmp_path: Path) -> None:
+async def test_cwd_of_transcript_reads_the_first_cwd_line(tmp_path: Path) -> None:
     from src.ingest.sessions import cwd_of_transcript
 
     proj = tmp_path / "-home-x-code-osiris"
     proj.mkdir()
     (proj / "ad1a1cb0-5985-491e-9ac2-abcdef012345.jsonl").write_text(
         "\n".join(_dialogue("hello", "hi back")) + "\n")
-    got = cwd_of_transcript(tmp_path, "/home/u/.claude/jobs/ad1a1cb0")
+    got = await cwd_of_transcript(tmp_path, "/home/u/.claude/jobs/ad1a1cb0")
     assert got == _CWD
 
 
-def test_cwd_of_transcript_is_anchored_only_never_a_neighbors_file(tmp_path: Path) -> None:
+async def test_cwd_of_transcript_is_anchored_only_never_a_neighbors_file(tmp_path: Path) -> None:
     """The same identity-path law `current_model`'s own anchored callers already follow: a
     job id that matches no transcript restores NOTHING, never a co-tenant's cwd — reading a
     neighbor's cwd as ours would restore the WRONG identity."""
@@ -691,23 +691,23 @@ def test_cwd_of_transcript_is_anchored_only_never_a_neighbors_file(tmp_path: Pat
     proj.mkdir()
     (proj / "99999999-0000-0000-0000-000000000000.jsonl").write_text(
         "\n".join(_dialogue("hello", "hi back")) + "\n")
-    assert cwd_of_transcript(tmp_path, "/home/u/.claude/jobs/ad1a1cb0") is None
+    assert await cwd_of_transcript(tmp_path, "/home/u/.claude/jobs/ad1a1cb0") is None
 
 
-def test_cwd_of_transcript_none_when_no_transcript_exists(tmp_path: Path) -> None:
+async def test_cwd_of_transcript_none_when_no_transcript_exists(tmp_path: Path) -> None:
     from src.ingest.sessions import cwd_of_transcript
 
-    assert cwd_of_transcript(tmp_path, "/home/u/.claude/jobs/nevermnt") is None
+    assert await cwd_of_transcript(tmp_path, "/home/u/.claude/jobs/nevermnt") is None
 
 
-def test_cwd_of_transcript_none_when_no_line_ever_carries_cwd(tmp_path: Path) -> None:
+async def test_cwd_of_transcript_none_when_no_line_ever_carries_cwd(tmp_path: Path) -> None:
     proj = tmp_path / "-home-x-code-osiris"
     proj.mkdir()
     from src.ingest.sessions import cwd_of_transcript
 
     (proj / "ad1a1cb0-5985-491e-9ac2-abcdef012345.jsonl").write_text(
         json.dumps({"type": "user", "message": {"content": "no cwd field at all"}}) + "\n")
-    assert cwd_of_transcript(tmp_path, "/home/u/.claude/jobs/ad1a1cb0") is None
+    assert await cwd_of_transcript(tmp_path, "/home/u/.claude/jobs/ad1a1cb0") is None
 
 
 def test_repo_from_cwd_walks_to_the_git_root(tmp_path: Path) -> None:
