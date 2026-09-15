@@ -6,7 +6,7 @@ Postgres for the graph reads/writes."""
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -171,9 +171,9 @@ async def test_summary_classifies_matched_no_ledger_and_no_transcript(
         actions, dry_run=True, transcript_root=tmp_path)
 
     assert report["summary"]["candidates"] == {
-        "matched": 1, "no_ledger": 1, "no_transcript": 1}
+        "matched": 1, "no_ledger": 1, "no_transcript": 1, "too_large": 0}
     assert report["summary"]["writers"] == {
-        "matched": 1, "no_ledger": 1, "no_transcript": 1}
+        "matched": 1, "no_ledger": 1, "no_transcript": 1, "too_large": 0}
     assert report["edges_by_door"]
     assert sum(report["edges_by_door"].values()) == report["edges_to_mint"]
 
@@ -272,9 +272,59 @@ async def test_a_transcript_over_the_cap_is_skipped_unopened(
         actions, dry_run=True, transcript_root=tmp_path, max_scan_bytes=64 * 1024 * 1024)
 
     assert report["edges_to_mint"] == 0
-    assert report["summary"]["candidates"]["no_transcript"] == 1
-    assert "over ingest.transcript_scan_max_bytes" in report["skipped"][0]["reason"]
+    assert report["summary"]["candidates"]["too_large"] == 1
+    assert "ingest.transcript_scan_max_bytes" in report["skipped"][0]["reason"]
     assert not _sidecar_for(big).exists()  # never opened, so never cached either
+
+
+async def test_a_writer_with_three_sessions_matches_via_the_second(
+    actions: Actions, tmp_path: Path,
+) -> None:
+    """Thoth mail 10716, "looked up, not searched": a writer with THREE session
+    transcripts, none the freshest, carries the write's own receipt — the per-writer
+    receipt index (built once, merging every one of the writer's resolvable files) must
+    find it regardless of which sid is tried first, never give up after one miss."""
+    now = datetime.now(UTC)
+    writer = "agent:writer-three-sessions"
+    obj = await actions.create_or_find_object("Agent", writer, "test")
+
+    sid1 = "sidfirst1deadbeef"
+    sid2 = "sidsecnd2deadbeef"
+    sid3 = "sidthird3deadbeef"
+    proj_dir = tmp_path / "-home-someone-code-testrepo"
+    proj_dir.mkdir(parents=True, exist_ok=True)
+    (proj_dir / f"{sid1}.jsonl").write_text(
+        _tool_result(json.dumps({"canonical": "decision:unrelated111111"})) + "\n")
+    (proj_dir / f"{sid2}.jsonl").write_text(
+        _tool_result(json.dumps({"canonical": "decision:2222222aaaaa"})) + "\n")
+    (proj_dir / f"{sid3}.jsonl").write_text(
+        _tool_result(json.dumps({"canonical": "decision:unrelated333333"})) + "\n")
+
+    # Distinct, explicitly ordered timestamps — sid1 freshest, sid3 oldest — so
+    # `_anchor_sids`' own freshest-first ordering tries sid1, then sid2, then sid3;
+    # the receipt sits only in the MIDDLE one.
+    await actions.assert_property(
+        obj, f"anchor_sid:{sid1[:8]}", sid1, "test",
+        now, 0.9, evidence_class="direct_observation")
+    await actions.assert_property(
+        obj, f"anchor_sid:{sid2[:8]}", sid2, "test",
+        now - timedelta(seconds=1), 0.9, evidence_class="direct_observation")
+    await actions.assert_property(
+        obj, f"anchor_sid:{sid3[:8]}", sid3, "test",
+        now - timedelta(seconds=2), 0.9, evidence_class="direct_observation")
+
+    decision = await actions.create_or_find_object(
+        "Decision", "decision:2222222aaaaa", writer)
+    await actions.assert_property(
+        decision, "summary", "a write whose receipt sits in the middle session",
+        writer, now, 0.9)
+
+    report = await backfill_possible_upstream(
+        actions, dry_run=True, transcript_root=tmp_path)
+
+    assert report["edges_to_mint"] == 0  # decision:2222222aaaaa is itself the candidate
+    assert report["summary"]["candidates"]["matched"] == 1
+    assert report["summary"]["candidates"]["no_transcript"] == 0
 
 
 async def test_a_10mb_transcript_streams_and_finds_the_receipt(

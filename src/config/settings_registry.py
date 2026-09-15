@@ -493,7 +493,12 @@ _INGEST_SETTINGS: tuple[SettingSpec, ...] = (
     # (the same `next_tick`-key escape hatch `wake.trigger.enabled` already established),
     # never baked into a live env var the way a `restart:<unit>` knob is — no `env_field`,
     # since nothing reads this off a live `Settings` object.
-    SettingSpec("ingest.transcript_scan_max_bytes", "int", 64 * 1024 * 1024,
+    # Raised 64MB -> 1GB (Thoth mail 10716, 2026-09-15): the cap existed for the MCP
+    # loop-thread stall this ruling's own fix already ended — the scan is now off-loop,
+    # streaming, and worker-side. Real transcripts on this box run 200-470MB; the old
+    # 64MB cap silently folded almost every real writer into "no_transcript" (measured:
+    # 30/30 sampled candidates were present-but-unresolved, not pruned — thread e332177f).
+    SettingSpec("ingest.transcript_scan_max_bytes", "int", 1024 * 1024 * 1024,
                effect="next_tick", authority="operator_or_ruling", requires_because=False,
                consequence="low", write_name="daemon_unit_literals"),
 )
