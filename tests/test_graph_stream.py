@@ -122,33 +122,53 @@ def test_encode_snapshot_rejects_a_mismatched_labels_length() -> None:
         )
 
 
-# --- _short_label: THE LEGIBILITY PASS, tip 2g ----------------------------------------
+# --- _short_label: THE LEGIBILITY PASS, tip 2g/2c --------------------------------------
 
 
 def test_short_label_agent_uses_handle_never_the_id() -> None:
-    assert _short_label("Agent", "agent:deadbeef-g1", "Khnum", None) == "Khnum"
+    assert _short_label("Agent", "agent:deadbeef-g1", "Khnum", None, None) == "Khnum"
 
 
 def test_short_label_software_project_strips_the_repo_scheme() -> None:
-    assert _short_label("SoftwareProject", "repo:osiris", None, None) == "osiris"
+    assert _short_label("SoftwareProject", "repo:osiris", None, None, None) == "osiris"
 
 
 def test_short_label_person_uses_name() -> None:
-    assert _short_label("Person", "principal:xyz", None, "Ada Lovelace") == "Ada Lovelace"
+    assert _short_label(
+        "Person", "principal:xyz", None, "Ada Lovelace", None) == "Ada Lovelace"
 
 
-def test_short_label_falls_back_to_type_plus_canonical() -> None:
-    assert _short_label("Thread", "thread:abc123", None, None) == "Thread thread:abc123"
+def test_short_label_uses_title_when_present_never_canonical() -> None:
+    """THE LIVE FIX (Thoth mail 10892): a Decision/Thread/Message (or any type
+    carrying a summary/title/subject/name assertion) must show that TITLE, not
+    "Decision decision:91da77..." -- the operator's original complaint in a new
+    coat, caught live on the deployed space."""
+    assert _short_label(
+        "Decision", "decision:91da776625f9", None, None,
+        "THE LEGIBILITY PASS lands") == "Decision THE LEGIBILITY PASS lands"
 
 
-def test_short_label_agent_without_a_handle_falls_back() -> None:
-    assert _short_label("Agent", "agent:deadbeef-g1", None, None) == (
+def test_short_label_collapses_embedded_newlines_to_one_line() -> None:
+    assert _short_label(
+        "Thread", "thread:x", None, None, "line one\nline two") == "Thread line one line two"
+
+
+def test_short_label_falls_back_to_type_plus_canonical_only_when_no_title(
+) -> None:
+    assert _short_label(
+        "Thread", "thread:abc123", None, None, None) == "Thread thread:abc123"
+
+
+def test_short_label_agent_without_a_handle_falls_back_to_title_then_canonical() -> None:
+    assert _short_label("Agent", "agent:deadbeef-g1", None, None, None) == (
         "Agent agent:deadbeef-g1")
+    assert _short_label("Agent", "agent:deadbeef-g1", None, None, "a real title") == (
+        "Agent a real title")
 
 
 def test_short_label_hard_truncates_at_40_chars_with_an_ellipsis() -> None:
     long_canonical = "thread:" + "x" * 60
-    label = _short_label("Thread", long_canonical, None, None)
+    label = _short_label("Thread", long_canonical, None, None, None)
     assert len(label) == 40
     assert label.endswith("…")
 
@@ -211,6 +231,36 @@ async def test_fetch_snapshot_labels_index_align_with_object_ids(actions: Action
     out = decode_snapshot(await fetch_snapshot(actions.pool))
     idx = out["object_ids"].index(str(oid))
     assert out["labels"][idx] == "Thread thread:gs-label"
+
+
+async def test_fetch_snapshot_labels_use_the_real_title_not_the_canonical(
+    actions: Actions,
+) -> None:
+    """THE LIVE FIX (Thoth mail 10892): a Decision, a Thread, and a Commit each
+    carrying a title-shaped assertion (summary/title/subject) must show it, never
+    the bare canonical -- the exact regression caught live on the deployed space."""
+    now = datetime.now(UTC)
+    decision = await actions.create_or_find_object(
+        "Decision", "decision:gs-title-a", "test")
+    await actions.assert_property(
+        decision, "summary", "a real decision summary", "test", now, 0.9)
+    thread_obj = await actions.create_or_find_object("Thread", "thread:gs-title-b", "test")
+    await actions.assert_property(
+        thread_obj, "summary", "a real thread summary", "test", now, 0.9)
+    commit_obj = await actions.create_or_find_object("Commit", "commit:gs-title-c", "test")
+    await actions.assert_property(
+        commit_obj, "subject", "a real commit subject", "test", now, 0.9)
+
+    await layout_batch(actions, limit=1000)
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+
+    for oid, expected in (
+        (decision, "Decision a real decision summary"),
+        (thread_obj, "Thread a real thread summary"),
+        (commit_obj, "Commit a real commit subject"),
+    ):
+        idx = out["object_ids"].index(str(oid))
+        assert out["labels"][idx] == expected
 
 
 async def test_fetch_snapshot_aggregates_carry_every_placed_object(
