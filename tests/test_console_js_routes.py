@@ -223,6 +223,40 @@ def test_browse_load_more_reuses_the_exact_same_helper_as_the_initial_load() -> 
     assert "runBrowseSelect({ created_at: last.created_at, id: last.id })" in body
 
 
+# THE TABLE FILTER QUERY SHAPE (thread 0be2f790's own operator-finding follow-up, Thoth DM
+# 10711): the type-filter pill bar and the omnibox's status:/free-text portion now drive
+# browseScope() server-side, instead of only re-filtering whatever page was already loaded —
+# the fix for the operator paging through 26,351 of 30,290 rows to find 5 matches.
+
+
+def test_browse_scope_carries_the_selected_types_and_parsed_search() -> None:
+    body = _JS.split("function browseScope(cursor) {", 1)[1].split("\n}", 1)[0]
+    assert "scope.types = Array.from(SELECTED_ENTITY_TYPES)" in body
+    assert "scope.status = parsed.status" in body
+    assert "scope.q = parsed.text" in body
+
+
+def test_toggle_entity_type_refetches_the_server_scope_not_just_a_local_rerender() -> None:
+    body = _JS.split("function toggleEntityType(t) {", 1)[1].split("\n}", 1)[0]
+    assert "refetchFilteredObjectSet()" in body
+
+
+def test_filter_entity_search_debounces_the_refetch() -> None:
+    body = _JS.split("function filterEntitySearch(q) {", 1)[1].split("\n}", 1)[0]
+    assert "setTimeout(refetchFilteredObjectSet, 250)" in body
+
+
+def test_refetch_filtered_object_set_clears_and_reloads_the_scoped_set() -> None:
+    body = _JS.split("async function refetchFilteredObjectSet()", 1)[1].split("\n}", 1)[0]
+    assert "SET = []" in body
+    assert "await loadObjectSet()" in body
+
+
+def test_entity_toolbar_total_badge_reads_the_scoped_count_when_a_filter_is_active() -> None:
+    body = _JS.split("function renderEntityToolbar()", 1)[1].split("\nfunction ", 1)[0]
+    assert "filterActive ? SET.length" in body
+
+
 def test_browse_bridges_composition_items_onto_the_shape_rendering_already_expects() -> None:
     body = _JS.split("async function runBrowseSelect(", 1)[1].split("\nfunction ", 1)[0]
     assert "name: it.display_label || it.label" in body

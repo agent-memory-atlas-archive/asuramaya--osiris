@@ -163,6 +163,43 @@ async def test_objects_list_resolves_labels_via_the_full_chain_and_disambiguates
     assert row["display_label"]
 
 
+async def test_objects_types_param_is_the_multi_select_sibling_of_type(
+    client: httpx.AsyncClient, actions: Actions,
+) -> None:
+    """THE TABLE FILTER QUERY SHAPE (thread 0be2f790's own operator-finding follow-up,
+    Thoth DM 10711): the browse table's pill bar allows more than one type selected at
+    once — `types` (repeatable) is that multi-select's own server-side lever, sibling to
+    the legacy singular `type` (unchanged, still equality-only, still exercised by
+    test_list_and_get_object above)."""
+    thread = await actions.create_or_find_object("Thread", "thread:objs-types-a", "test")
+    decision = await actions.create_or_find_object("Decision", "decision:objs-types-b", "test")
+    other = await actions.create_or_find_object("Reference", "ref:objs-types-c", "test")
+
+    r = await client.get("/objects", params={"types": ["Thread", "Decision"]})
+    assert r.status_code == 200
+    ids = {o["id"] for o in r.json()}
+    assert str(thread) in ids
+    assert str(decision) in ids
+    assert str(other) not in ids
+
+
+async def test_objects_status_param_narrows_on_top_of_the_terminal_status_exclusion(
+    client: httpx.AsyncClient, actions: Actions,
+) -> None:
+    """`status` is an EXTRA equality narrowing, layered on top of — never replacing —
+    /objects' own historical unconditional "not archived/merged/retired" rule."""
+    proposed = await actions.create_or_find_object("Thread", "thread:objs-status-proposed",
+                                                    "test")
+    await actions.pool.execute("UPDATE objects SET status='proposed' WHERE id=$1", proposed)
+    active = await actions.create_or_find_object("Thread", "thread:objs-status-active", "test")
+
+    r = await client.get("/objects", params={"type": "Thread", "status": "proposed"})
+    assert r.status_code == 200
+    ids = {o["id"] for o in r.json()}
+    assert str(proposed) in ids
+    assert str(active) not in ids
+
+
 async def test_object_edge_counts_batches_by_id(
     client: httpx.AsyncClient, actions: Actions,
 ) -> None:

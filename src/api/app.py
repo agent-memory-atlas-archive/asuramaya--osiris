@@ -474,6 +474,8 @@ def create_app(pool: asyncpg.Pool | None = None) -> FastAPI:
         p: asyncpg.Pool = Depends(get_pool),
         case_id: uuid.UUID | None = None,
         type: str | None = None,
+        types: list[str] | None = Query(None),
+        status: str | None = None,
         q: str | None = None,
         exclude_types: str | None = None,
         project: list[str] | None = Query(None),
@@ -491,8 +493,16 @@ def create_app(pool: asyncpg.Pool | None = None) -> FastAPI:
         # composition system's `select` op can gain the exact same capability as a set of
         # opt-in args rather than a second, drifting copy of this query. Pure refactor —
         # same params, same defaults, same two-branch (keyset vs. capped) behavior.
+        #
+        # THE TABLE FILTER QUERY SHAPE (thread 0be2f790's own operator-finding follow-up,
+        # Thoth DM 10711): `types` (repeatable) is the multi-select sibling of the legacy
+        # singular `type` — a caller passing both gets `types`, matching the browse table's
+        # own multi-pill filter bar; `status` is an extra equality narrowing, layered on top
+        # of (never replacing) list_objects_scoped's own unconditional terminal-status
+        # exclusion.
         rows = await list_objects_scoped(
-            p, case_id=case_id, object_type=type, q=q, exclude_types=excl, project=project,
+            p, case_id=case_id, object_type=type, object_types=types, status=status,
+            q=q, exclude_types=excl, project=project,
             limit=limit, before_created_at=before_created_at, before_id=before_id,
         )
         # task #97 workstream 3 (ruling 52daab71): `name` used to be a raw SQL COALESCE

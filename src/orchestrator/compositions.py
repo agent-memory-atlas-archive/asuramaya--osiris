@@ -23,11 +23,15 @@ Ops (neutral, composable — the equivalent of Notion's filter/relation/rollup):
        whenever the key is absent OR no subject is bound, so an unfiltered composition
        like `browse`'s own default run is untouched; only a subject-bound run (e.g. a
        `bind_subject` row_action's drill-in) narrows. `scope` (Thoth dispatch 9838,
-       588148bb's Browse tab cutover) opt-in: `{"case_id":?,"project":?,"q":?,
-       "exclude_types":?,"cursor":{"before_created_at":?,"before_id":?},"limit":?}` —
-       delegates to `list_objects_scoped`, the SAME function /objects' own REST route
-       calls (one definition, not a second copy) for case/project scoping (multi-repo,
-       case-insensitive), word-order-proof search, exclude_types, and keyset pagination.
+       588148bb's Browse tab cutover; extended by thread 0be2f790's DM 10711 with
+       "types"/"status") opt-in: `{"case_id":?,"project":?,"q":?,"types":[...]?,
+       "status":?,"exclude_types":?,"cursor":{"before_created_at":?,"before_id":?},
+       "limit":?}` — delegates to `list_objects_scoped`, the SAME function /objects' own
+       REST route calls (one definition, not a second copy) for case/project scoping
+       (multi-repo, case-insensitive), word-order-proof search, a multi-select type
+       filter (`types`), an extra status equality narrowing (`status`, layered on top of
+       the historical "not a terminal status" rule, never replacing it), exclude_types,
+       and keyset pagination.
        Absent = untouched, byte-identical. When present it supersedes `canonical_prefix`
        (ignored, no equivalent) and `status` (list_objects_scoped's own historical "not a
        terminal status" rule wins instead) on that ONE row-fetch step; `subject_link`
@@ -5311,6 +5315,8 @@ async def list_objects_scoped(
     *,
     case_id: uuid.UUID | None = None,
     object_type: str | None = None,
+    object_types: list[str] | None = None,
+    status: str | None = None,
     q: str | None = None,
     exclude_types: list[str] | None = None,
     project: list[str] | None = None,
@@ -5327,21 +5333,29 @@ async def list_objects_scoped(
     #196/msg 5600 — OFFSET paging would re-sort the whole table per page). This is the EXACT
     SQL app.py's `/objects` route ran inline before this extraction, parameterized and moved
     here so `select`'s own new opt-in args (project/case_id/q/exclude_types/cursor) and
-    `/objects` itself share one implementation instead of two that can drift. Status filter is
-    NOT the `select` op's own `status` opt-in (active-only default, explicit-list narrowing) —
-    it stays `/objects`' own historical "not a terminal status" rule (NOT IN archived/merged/
-    retired), unconditional, matching every existing `/objects` caller byte-for-byte. Returns
-    raw rows ({id, type, canonical, status, created_at}), no name/display_label — presentation
-    (resolve_label/disambiguate_labels) stays each caller's own concern, unchanged from today."""
+    `/objects` itself share one implementation instead of two that can drift.
+
+    THE TABLE FILTER QUERY SHAPE (thread 0be2f790's own operator-finding follow-up, Thoth DM
+    10711): `object_types` is the multi-select sibling of the legacy singular `object_type` —
+    a caller may pass either (never both meaningfully; `object_types` wins when both are
+    given), matching the browse table's own multi-pill type-filter bar. `status`, when given,
+    is an EXTRA equality narrowing layered on top of — never a replacement for — the
+    unconditional "not a terminal status" rule below (matching every existing `/objects`
+    caller byte-for-byte when `status` is omitted, byte-identical to today).
+    Returns raw rows ({id, type, canonical, status, created_at}), no name/display_label —
+    presentation (resolve_label/disambiguate_labels) stays each caller's own concern,
+    unchanged from today."""
     tokens = (q.split()[:6] if q else None) or None
+    types_arr = list(object_types) if object_types else ([object_type] if object_type else None)
     proj_canons, proj_names = _project_filter_arrays(project)
     if before_created_at is not None:
         rows = await pool.fetch(
             "SELECT id, type, canonical, status, created_at FROM objects o "
             "WHERE status NOT IN ('archived','merged','retired') "
+            "  AND ($10::text IS NULL OR o.status = $10) "
             "  AND ($1::uuid IS NULL OR EXISTS (SELECT 1 FROM case_objects co "
             "        WHERE co.object_id = o.id AND co.case_id = $1)) "
-            "  AND ($2::text IS NULL OR type = $2) "
+            "  AND ($2::text[] IS NULL OR type = ANY($2::text[])) "
             "  AND ($5::text[] IS NULL OR NOT (type = ANY($5::text[]))) "
             "  AND ($6::text[] IS NULL OR ("
             "        o.canonical = ANY($6::text[]) OR o.canonical = ANY($7::text[]) "
@@ -5366,8 +5380,8 @@ async def list_objects_scoped(
             "  AND (o.created_at, o.id) < "
             "      ($8, COALESCE($9, '00000000-0000-0000-0000-000000000000'::uuid)) "
             "ORDER BY created_at DESC, id DESC LIMIT $4",
-            case_id, object_type, tokens, limit, exclude_types, proj_canons, proj_names,
-            before_created_at, before_id,
+            case_id, types_arr, tokens, limit, exclude_types, proj_canons, proj_names,
+            before_created_at, before_id, status,
         )
     else:
         rows = await pool.fetch(
@@ -5377,9 +5391,10 @@ async def list_objects_scoped(
             "           PARTITION BY type ORDER BY created_at DESC) as type_rn "
             "  FROM objects o "
             "  WHERE status NOT IN ('archived','merged','retired') "
+            "    AND ($8::text IS NULL OR o.status = $8) "
             "    AND ($1::uuid IS NULL OR EXISTS (SELECT 1 FROM case_objects co "
             "          WHERE co.object_id = o.id AND co.case_id = $1)) "
-            "    AND ($2::text IS NULL OR type = $2) "
+            "    AND ($2::text[] IS NULL OR type = ANY($2::text[])) "
             "    AND ($5::text[] IS NULL OR NOT (type = ANY($5::text[]))) "
             "    AND ($6::text[] IS NULL OR ("
             "          o.canonical = ANY($6::text[]) OR o.canonical = ANY($7::text[]) "
@@ -5405,9 +5420,9 @@ async def list_objects_scoped(
             ") "
             "SELECT id, type, canonical, status, created_at "
             "FROM scoped_objects "
-            "WHERE type_rn <= (CASE WHEN $2::text IS NOT NULL THEN $4 ELSE 300 END) "
+            "WHERE type_rn <= (CASE WHEN $2::text[] IS NOT NULL THEN $4 ELSE 300 END) "
             "ORDER BY created_at DESC LIMIT $4",
-            case_id, object_type, tokens, limit, exclude_types, proj_canons, proj_names,
+            case_id, types_arr, tokens, limit, exclude_types, proj_canons, proj_names, status,
         )
     return [dict(r) for r in rows]
 
@@ -5558,7 +5573,8 @@ async def _eval(pool: asyncpg.Pool, node: dict[str, Any], subject: uuid.UUID | N
                 pool,
                 case_id=(uuid.UUID(raw_case_id) if isinstance(raw_case_id, str)
                         else raw_case_id),
-                object_type=ot, q=scope.get("q"),
+                object_type=ot, object_types=scope.get("types"), status=scope.get("status"),
+                q=scope.get("q"),
                 exclude_types=scope.get("exclude_types"), project=scope.get("project"),
                 limit=int(scope.get("limit", 100)),
                 before_created_at=(datetime.fromisoformat(raw_before_created_at)

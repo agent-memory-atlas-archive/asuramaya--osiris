@@ -169,12 +169,40 @@ function objectScopeParams() {
 // there is truly one definition, not a REST caller and a composition caller drifting apart.
 // Type pills/search/sort stay client-side residue (unchanged, over whatever SET holds) —
 // per Thoth's own dispatch shape, same discipline the Projects swap used.
+// THE TABLE FILTER QUERY SHAPE (thread 0be2f790's own operator-finding follow-up, Thoth DM
+// 10711): shared by browseScope() (drives the server query) and getFilteredEntities() (the
+// client-side re-check kept for defense in depth — see browseScope's own comment below).
+// Only the `status:`/free-text portions are parsed here; a typed `type:` tag stays a
+// client-only substring convenience over whatever the pill bar already scoped server-side
+// (pills are the exact-match multi-select; the inline tag was always a fuzzy refinement, and
+// pushing it server-side as an equality filter would silently break a partial match like
+// "type:pers").
+function parseEntitySearchQuery(raw) {
+  var q = (raw || '').trim();
+  var tMatch = q.match(/\btype:([a-zA-Z0-9_-]+)/i), sMatch = q.match(/\bstatus:([a-zA-Z0-9_-]+)/i);
+  var type = tMatch ? tMatch[1] : null, status = sMatch ? sMatch[1] : null;
+  if (tMatch) q = q.replace(tMatch[0], '').trim();
+  if (sMatch) q = q.replace(sMatch[0], '').trim();
+  return { type: type, status: status, text: q };
+}
 function browseScope(cursor) {
   var s = objectScopeParams();
   var scope = { limit: OBJECTS_LIMIT };
   if (!SHOW_AGENTS) scope.exclude_types = ['Agent'];
   if (s.case_id) scope.case_id = s.case_id;
   if (s.project.length) scope.project = s.project;
+  // THE TABLE FILTER QUERY SHAPE: the type-filter pill bar and the omnibox's own free-text/
+  // status: portion now drive the SERVER-side scope, not just an in-memory re-filter over
+  // whatever page happened to already be loaded — the fix for the operator paging through
+  // 26,351 of 30,290 rows to find 5 matches. getFilteredEntities() still re-applies the same
+  // predicates client-side: a no-op once the server has already scoped SET to them, but
+  // still load-bearing for the props/free-text match nuance and for the reachable-set
+  // narrowing renderEntityExplorerStage layers on top for a canvas path focus (no server
+  // equivalent).
+  if (SELECTED_ENTITY_TYPES.size) scope.types = Array.from(SELECTED_ENTITY_TYPES);
+  var parsed = parseEntitySearchQuery(ENTITY_SEARCH_QUERY);
+  if (parsed.status) scope.status = parsed.status;
+  if (parsed.text) scope.q = parsed.text;
   // KEYSET continuation (#93 step 3, Thoth msg 5668) — the cursor #196 built and proved
   // (before_created_at/before_id, migration 0054's objects_type_created_idx). Omitted for
   // the initial load (unchanged behavior); passed here only by loadMoreObjects() below —
@@ -263,11 +291,9 @@ async function loadMoreObjects() {
 
 // ── Entity Explorer ──────────────────────────────────────────────────────────
 function getFilteredEntities() {
-  let q = (ENTITY_SEARCH_QUERY || '').trim();
-  const tMatch = q.match(/\btype:([a-zA-Z0-9_-]+)/i), sMatch = q.match(/\bstatus:([a-zA-Z0-9_-]+)/i);
-  let fType = tMatch ? tMatch[1].toLowerCase() : null, fStatus = sMatch ? sMatch[1].toLowerCase() : null;
-  if (tMatch) q = q.replace(tMatch[0], '').trim(); if (sMatch) q = q.replace(sMatch[0], '').trim();
-  const textQ = q.toLowerCase(), isAllOn = SELECTED_ENTITY_TYPES.size === 0;
+  const parsed = parseEntitySearchQuery(ENTITY_SEARCH_QUERY);
+  const fType = parsed.type ? parsed.type.toLowerCase() : null, fStatus = parsed.status ? parsed.status.toLowerCase() : null;
+  const textQ = (parsed.text || '').toLowerCase(), isAllOn = SELECTED_ENTITY_TYPES.size === 0;
   return (SET || []).filter(o => {
     const ot = (o.type || '').toLowerCase(), os = (o.status || 'active').toLowerCase();
     if (fType && !ot.includes(fType)) return false;
@@ -283,7 +309,18 @@ function renderEntityToolbar() {
   // TRUE_COUNTS (#196) is the uncapped census over the same scope; SET-derived counts
   // are a fallback for when it hasn't loaded (or failed) — never the primary source,
   // since SET is capped at 1500 and silently understates any type/scope past that.
-  const trueTotal = TRUE_COUNTS ? TRUE_COUNTS.total : SET.length;
+  //
+  // THE TABLE FILTER QUERY SHAPE (Thoth DM 10711): TRUE_COUNTS itself is never scoped by
+  // type/status/q (it stays the honest, uncapped census across ALL types, so every pill's
+  // own count keeps showing the full landscape regardless of what's currently selected) —
+  // once a type/status/text filter is active, SET *is* the scoped population (browseScope()
+  // now fetches exactly that from the server), so the big total badge reads SET.length
+  // instead of the unscoped global total. Same honesty caveat as SET-derived counts
+  // generally: if the scoped population itself exceeds OBJECTS_LIMIT (OBJECTS_HAS_MORE),
+  // this undercounts — no uncapped *scoped* census endpoint exists yet, disclosed rather
+  // than silently wrong.
+  const filterActive = SELECTED_ENTITY_TYPES.size > 0 || !!(ENTITY_SEARCH_QUERY || '').trim();
+  const trueTotal = filterActive ? SET.length : (TRUE_COUNTS ? TRUE_COUNTS.total : SET.length);
   if ($('entity-total-num')) $('entity-total-num').textContent = trueTotal.toLocaleString();
   const typeCounts = TRUE_COUNTS ? Object.assign({}, TRUE_COUNTS.by_type) : {};
   if (!TRUE_COUNTS) SET.forEach(o => { typeCounts[o.type] = (typeCounts[o.type] || 0) + 1; });
@@ -297,7 +334,26 @@ function renderEntityToolbar() {
     return '<button class="tax-tab' + sel + '" onclick="toggleEntityType(\'' + t + '\')"><span class="tax-title">' + esc(dl) + '</span><span class="tax-count">' + count.toLocaleString() + '</span></button>';
   }).join('');
 }
-function toggleEntityType(t) { if (t === 'All') SELECTED_ENTITY_TYPES.clear(); else { if (SELECTED_ENTITY_TYPES.has(t)) SELECTED_ENTITY_TYPES.delete(t); else SELECTED_ENTITY_TYPES.add(t); } renderEntityExplorer(); syncSpaceTypeFilter(); }
+// THE TABLE FILTER QUERY SHAPE (Thoth DM 10711) + THE LEGIBILITY PASS TIP 1(e) (ruling
+// e1cb9e3b), merged: a pill toggle now does THREE things — re-render locally for
+// immediate pill/search-box feedback, sync the canvas's own hidden-type set
+// (syncSpaceTypeFilter, landed w268), and re-fetch the scoped row set from the server
+// (refetchFilteredObjectSet, this tip) rather than only re-filtering whatever page was
+// already loaded. All three read the SAME SELECTED_ENTITY_TYPES — one selection, three
+// consumers, never a second notion of "what's currently filtered."
+let ENTITY_FILTER_DEBOUNCE = null;
+async function refetchFilteredObjectSet() {
+  SET = [];
+  await loadObjectSet();
+  renderEntityExplorer();
+}
+function toggleEntityType(t) {
+  if (t === 'All') SELECTED_ENTITY_TYPES.clear();
+  else { if (SELECTED_ENTITY_TYPES.has(t)) SELECTED_ENTITY_TYPES.delete(t); else SELECTED_ENTITY_TYPES.add(t); }
+  renderEntityExplorer();
+  syncSpaceTypeFilter();
+  refetchFilteredObjectSet();
+}
 // THE LEGIBILITY PASS, TIP 1(e) (ruling e1cb9e3b): the header taxonomy pills drive the
 // canvas through the same per-instance visibility flag the legend's own node-type
 // checkboxes use (space.js's setHiddenTypes) -- SELECTED_ENTITY_TYPES is an ALLOWLIST
@@ -310,7 +366,17 @@ function syncSpaceTypeFilter() {
   const hidden = new Set([...present].filter(t => !SELECTED_ENTITY_TYPES.has(t)));
   space.setHiddenTypes(hidden);
 }
-function filterEntitySearch(q) { ENTITY_SEARCH_QUERY = q; renderEntityExplorer(); }
+function filterEntitySearch(q) {
+  ENTITY_SEARCH_QUERY = q;
+  renderEntityExplorer();
+  // Debounced (250ms): the omnibox drives this on every keystroke (handleOmniSearchInput),
+  // and status:/free-text now hits list_objects_scoped's real query — a refetch per
+  // keystroke would hammer the DB for no benefit while the operator is still typing. Free
+  // text/status: don't touch the canvas — only the type-pill allowlist drives
+  // syncSpaceTypeFilter, unchanged from w268.
+  clearTimeout(ENTITY_FILTER_DEBOUNCE);
+  ENTITY_FILTER_DEBOUNCE = setTimeout(refetchFilteredObjectSet, 250);
+}
 function toggleTableSort(col) { TABLE_SORT_DIR = TABLE_SORT_COL === col ? (TABLE_SORT_DIR === 'asc' ? 'desc' : 'asc') : 'asc'; TABLE_SORT_COL = col; renderEntityExplorerStage(); }
 function inspectAndToggleRow(id) { inspectOnly(id); EXPANDED_ROWS.has(id) ? EXPANDED_ROWS.delete(id) : EXPANDED_ROWS.add(id); renderEntityExplorerStage(); }
 function sortIcon(col) { return TABLE_SORT_COL === col ? (TABLE_SORT_DIR === 'asc' ? ' \u25b4' : ' \u25be') : ''; }
