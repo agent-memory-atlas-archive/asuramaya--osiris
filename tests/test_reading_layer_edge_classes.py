@@ -100,10 +100,12 @@ def test_legend_checkboxes_rebuild_edge_lines_on_change() -> None:
     # rebuild the base layer too, so unreachable edges actually disappear on focus instead
     # of only nodes — seven call sites total. TIP 3 briefly added an eighth (refreshLOD,
     # Thoth mail 10930, rebuilding the edge layer under its own zoom-tier budget); TIP 4
-    # (operator ruling "DENSITY NOT DISCS", mail 11011) retired that budget outright — every
-    # edge draws at every tier now, so refreshLOD no longer needs to touch the edge layer at
-    # all, back to seven. This slice runs unbounded to end-of-file (no closing boundary in
-    # the split above), so it catches every function defined after renderLegend, not just
-    # renderLegend's own body — noted rather than silently re-scoping an existing test's own
-    # slicing choice.
-    assert body.count("buildEdgeLines(idToNode, edges);") == 7
+    # (operator ruling "DENSITY NOT DISCS", mail 11011) retired that budget outright, back to
+    # seven. THE DRILL (Thoth mail 11048) added two more of its own: renderContainerDrill
+    # (a container-scale focus rebuilds the base layer same as an ordinary focus) and
+    # revealProjectStub (a stub reveal changes nodeVisible for the revealed ids, so the base
+    # layer must rebuild too) — nine call sites total now. This slice runs unbounded to
+    # end-of-file (no closing boundary in the split above), so it catches every function
+    # defined after renderLegend, not just renderLegend's own body — noted rather than
+    # silently re-scoping an existing test's own slicing choice.
+    assert body.count("buildEdgeLines(idToNode, edges);") == 9

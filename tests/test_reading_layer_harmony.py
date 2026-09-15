@@ -42,7 +42,8 @@ def test_a_table_row_click_always_focuses() -> None:
 def test_a_canvas_click_focuses_the_same_way_a_table_row_does() -> None:
     # window widened for TIP 3 (Thoth mail 10930): a far/mid-tier glyph drill-in branch now
     # runs first; the near-tier focusObject(hit.id) call sits after it.
-    click_body = _SPACE_JS.split('addEventListener("click", (ev) => {', 1)[1][:500]
+    click_body = _SPACE_JS.split(
+        'renderer.domElement.addEventListener("click", (ev) => {', 1)[1][:500]
     assert "focusObject(hit.id)" in click_body
 
 

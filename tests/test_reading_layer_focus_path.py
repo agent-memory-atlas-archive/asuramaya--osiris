@@ -83,7 +83,8 @@ def test_a_single_click_is_the_whole_focus_gesture() -> None:
     # window widened for TIP 3 (Thoth mail 10930): at the far/mid LOD tiers a click drills
     # into a glyph instead (no individual object to focus at that zoom) -- the near-tier
     # focusObject(hit.id) branch now sits after that.
-    click_body = _SPACE_JS.split('addEventListener("click", (ev) => {', 1)[1][:500]
+    click_body = _SPACE_JS.split(
+        'renderer.domElement.addEventListener("click", (ev) => {', 1)[1][:500]
     assert "focusObject(hit.id)" in click_body
     assert 'addEventListener("dblclick"' not in _SPACE_JS
 
@@ -129,7 +130,7 @@ def test_focus_hides_unreachable_outright_not_a_softer_dim() -> None:
 def test_focus_is_never_empty_a_lone_reachable_node_widens_one_structural_hop() -> None:
     # Thoth's own live measurement (mail 10708): a degree-8 Decision with no PATH_EDGE_TYPES
     # links reached only itself and fit the camera to a point at 300x.
-    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:2000]
+    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:2300]
     assert "if (pathReachable.size <= 1) {" in body
     assert 'if (e.edgeClass !== "structural") continue;' in body
 
@@ -141,14 +142,20 @@ def test_reachable_path_edges_draw_with_a_directional_gradient() -> None:
     assert "PATH_EDGE_DIM.r" in body
 
 
-def test_the_focused_nodes_own_structural_edges_draw_on_focus_only() -> None:
+def test_the_structural_edges_of_focus_carve_out_is_retired() -> None:
+    # RETIRED by THE LAST RENDERER (operator ruling d7d55257, Thoth mail 11066): "an edge
+    # draws only when both ends are visible, no structural-hop exception." updatePathEdges
+    # used to draw every structural edge touching the focus regardless of whether the other
+    # end was ever positioned or visible -- for a container-scale focus that meant thousands
+    # of lines fanning to scattered positions, "a solid disc of edges." Only the real
+    # PATH_EDGE_TYPES overlay (`onPath`, both ends reachable) remains.
     body = _SPACE_JS.split("function updatePathEdges()", 1)[1][:1400]
-    assert 'e.edgeClass === "structural"' in body
-    assert "e.source === pathFocusId || e.target === pathFocusId" in body
+    assert "if (!onPath) continue;" in body
+    assert "structuralOfFocus" not in _SPACE_JS
 
 
 def test_camera_fits_to_the_reachable_set_not_a_fixed_view() -> None:
-    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:4300]
+    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:4700]
     assert "for (const rid of pathReachable)" in body
     assert "Math.min(maxViewSize, span * 1.6 + 40)" in body
 

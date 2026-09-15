@@ -36,36 +36,14 @@ _OSIRIS_CSS = (_STATIC / "osiris.css").read_text()
 
 # --- (a)+(b): world-unit radius, floor/cap in screen px, log-scale degree curve -----------
 
-def test_node_radius_is_computed_in_world_units_not_pixels() -> None:
-    assert "function nodeRadiusWorld(nd)" in _SPACE_JS
-    assert "const CATEGORY_BASE_WORLD = { agent: 8, object: 5 };" in _SPACE_JS
-
-
-def test_screen_floor_and_cap_exist_and_are_reasonable() -> None:
-    # TIP 4 (operator ruling "DENSITY NOT DISCS", mail 11011): the floor is a literal 1px
-    # now -- every object draws at every zoom as a point, never fully vanishing.
-    assert "const NODE_MIN_SCREEN_PX = 1;" in _SPACE_JS
-    assert "const NODE_MAX_SCREEN_PX = 48;" in _SPACE_JS
-
-
-def test_degree_factor_is_log_scale_not_the_old_asymptotic_curve() -> None:
-    body = _SPACE_JS.split("function degreeFactor(nd)", 1)[1].split("\n  }\n", 1)[0]
-    assert "Math.log2(" in body
-    assert "1 / (1 +" not in body  # the old asymptotic 1/(1+x) shape is gone
-
-
-def test_degree_curve_matches_thoths_own_anchors() -> None:
-    # degree 3 -> ~1x, 30 -> ~2x, 300 -> ~3.5x, 20,000 -> ~6x (Thoth DM 10708).
-    import math
-    k, d0 = 0.43, 6
-    def factor(d: float) -> float:
-        return 1 + max(0.0, k * math.log2(max(d, 1e-9) / d0))
-    assert abs(factor(3) - 1.0) < 0.05
-    assert abs(factor(30) - 2.0) < 0.15
-    assert abs(factor(300) - 3.5) < 0.2
-    assert abs(factor(20000) - 6.0) < 0.2
-    assert f"const DEGREE_LOG_K = {k};" in _SPACE_JS
-    assert f"const DEGREE_LOG_D0 = {d0};" in _SPACE_JS
+def test_node_size_is_a_constant_screen_px_degree_curve_not_world_units() -> None:
+    # THE LAST RENDERER (operator ruling d7d55257, Thoth mail 11066) retired the world-unit
+    # sizing scheme this test used to assert -- "points at a constant SCREEN size in px on a
+    # steep degree curve... no world-unit sizing, no 48px cap." See
+    # test_legibility_pass_tip5.py for the new nodeScreenPx curve's own tests.
+    assert "function nodeRadiusWorld(nd)" not in _SPACE_JS
+    assert "CATEGORY_BASE_WORLD" not in _SPACE_JS
+    assert "function nodeScreenPx(nd)" in _SPACE_JS
 
 
 # --- (c): labels are names, per-type formatting, hard truncation, a hover card ------------
@@ -110,22 +88,22 @@ def test_focus_uses_a_per_instance_visibility_flag_not_a_dim_scalar() -> None:
 
 
 def test_a_focused_node_with_no_semantic_edges_still_lights_its_structural_neighbours() -> None:
-    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:2200]
+    # THE DRILL (ruling d7d55257) inserted a container-focus dispatch and clearDrillState()
+    # call at the top of focusObject, pushing this fallback further into the body.
+    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:2500]
     assert "if (pathReachable.size <= 1) {" in body
     assert 'if (e.edgeClass !== "structural") continue;' in body
     assert "pathReachable.add(other);" in body
 
 
 def test_base_edge_layer_hides_edges_touching_an_invisible_node() -> None:
-    body = _SPACE_JS.split("function nodeVisible(nd)", 1)[1][:400]
+    body = _SPACE_JS.split("function nodeVisible(nd)", 1)[1][:600]
     assert "hiddenNodeTypes.has(nd.type)" in body
     # CONSOLE CHROME CLEANUP piece 2 (decision 31717ca7): the repo selector's own
     # hidden-set must ALSO gate edge-geometry visibility here, the same as applyDim's
     # own per-instance flag — an edge touching a project-hidden node must not still draw.
     assert "hiddenProjects.has(nd.project)" in body
     assert "pathReachable.has(nd.id)" in body
-    # TIP 4 (operator ruling "DENSITY NOT DISCS", mail 11011) reverted the parameter back
-    # to edgeList -- there's no more zoom-tier edge budget for it to apply first.
     build_body = _SPACE_JS.split("function buildEdgeLines(nodes, edgeList)", 1)[1][:700]
     assert "nodeVisible(byId.get(e.source))" in build_body
     assert "nodeVisible(byId.get(e.target))" in build_body
@@ -194,7 +172,8 @@ def test_status_line_and_legend_panel_moved_off_the_drawers_bottom_band() -> Non
 # --- AMENDMENT item 1: a single click is the whole gesture --------------------------------
 
 def test_click_on_empty_canvas_still_clears() -> None:
-    click_body = _SPACE_JS.split('addEventListener("click", (ev) => {', 1)[1][:300]
+    click_body = _SPACE_JS.split(
+        'renderer.domElement.addEventListener("click", (ev) => {', 1)[1][:300]
     assert "else clearFocus();" in click_body
 
 
@@ -205,7 +184,11 @@ def test_the_visual_work_is_synchronous_the_inspector_fetch_is_awaited_last() ->
     # every `await` inside focusObject's own body must be the final `await inspect(id);` --
     # no earlier await (a network call) can gate the synchronous select/hide/fit work above.
     fn_body = body.split("\n  async function inspect(id)", 1)[0]
-    awaits = [ln.strip() for ln in fn_body.splitlines() if "await " in ln]
+    # THE DRILL (ruling d7d55257) inserted an early-exit container dispatch at the top -- a
+    # SEPARATE branch (renderContainerDrill owns its own synchronous-then-one-await shape)
+    # that returns before any of the ordinary ego-walk work below ever runs, excluded here.
+    awaits = [ln.strip() for ln in fn_body.splitlines()
+              if "await " in ln and "renderContainerDrill" not in ln]
     assert awaits, "expected at least one await in focusObject"
     assert awaits[-1] == "await inspect(id);"
     assert len(awaits) == 1  # the ONLY await is the trailing inspector fetch
@@ -219,7 +202,7 @@ def test_depth_is_unlimited_by_default_until_roots() -> None:
 
 def test_downstream_is_a_toggle_off_by_default() -> None:
     assert "let includeDownstream = false;" in _SPACE_JS
-    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:900]
+    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:1200]
     assert "includeDownstream ? bfsHops(inAdjPath, id, focusDepth) : new Map([[id, 0]])" in body
     btn_body = _SPACE_JS.split("if (downstreamBtn) {", 1)[1][:500]
     assert "includeDownstream = !includeDownstream;" in btn_body

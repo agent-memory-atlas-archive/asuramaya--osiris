@@ -101,8 +101,12 @@ function toggleRepo(name) {
   if (idx === -1) SELECTED_REPOS.push(name);
   else SELECTED_REPOS.splice(idx, 1);
   applyRepoFilter();
-  renderRepoDropdown();
   updateRepoPill();
+  // THE LAST RENDERER (Thoth mail 11066/11087): "the header dropdown closes on pick" --
+  // it used to stay open and re-render itself in place (renderRepoDropdown), which read
+  // as a pick doing nothing. A pick is a real commit to the selection now, same as every
+  // other single-gesture commit in this console; re-open the dropdown for a second pick.
+  closeAllDropdowns();
 }
 function selectRepos(list) {
   SELECTED_REPOS = list || [];

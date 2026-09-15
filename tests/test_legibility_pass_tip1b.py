@@ -41,7 +41,7 @@ async def test_ui_static_assets_force_revalidation() -> None:
 # --- flaw #1: focus rebuilds the BASE edge layer too, not just node visibility ------------
 
 def test_focus_rebuilds_the_base_edge_layer_not_just_node_visibility() -> None:
-    focus_body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:4400]
+    focus_body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:4700]
     assert "buildEdgeLines(idToNode, edges); // review flaw #1" in focus_body
     clear_body = _SPACE_JS.split("function clearFocus()", 1)[1][:900]
     assert "buildEdgeLines(idToNode, edges);" in clear_body
@@ -73,8 +73,13 @@ def test_gpu_pick_has_tolerance_not_exact_pixel_only() -> None:
 # --- flaw #5: labels respect the type filter -----------------------------------------------
 
 def test_labels_respect_the_type_filter() -> None:
+    # THE LAST RENDERER (Thoth mail 11066): pickLabels' own candidacy pool now reuses
+    # nodeVisible -- the same viewport filter that already checks hiddenNodeTypes (and, for
+    # free, hiddenProjects/focus-reachability too), rather than a separate type-only filter.
     body = _SPACE_JS.split("function pickLabels()", 1)[1][:600]
-    assert ".filter((nd) => !hiddenNodeTypes.has(nd.type));" in body
+    assert "nodeVisible(nd) &&" in body
+    nv_body = _SPACE_JS.split("function nodeVisible(nd)", 1)[1][:300]
+    assert "hiddenNodeTypes.has(nd.type)" in nv_body
     # the pool filter alone is not enough -- nothing re-picks labels when a filter changes
     # unless setHiddenTypes/the legend's own checkbox handler also calls scheduleLabelPick.
     sht_body = _SPACE_JS.split("function setHiddenTypes(types)", 1)[1][:250]
