@@ -803,6 +803,54 @@ async def test_select_scope_exclude_types_drops_the_matching_type(actions: Actio
     assert str(agent) not in ids
 
 
+async def test_select_scope_types_narrows_to_the_multi_select(actions: Actions) -> None:
+    """THE TABLE FILTER QUERY SHAPE (thread 0be2f790's own operator-finding follow-up,
+    Thoth DM 10711): the browse table's pill bar allows more than one type selected at
+    once — `scope.types` is that multi-select's own server-side lever, sibling to the
+    node-level singular `object_type` (which stays untouched, still equality-only)."""
+    now = datetime.now(UTC)
+    thread = await actions.create_or_find_object("Thread", "thread:scope-types", "test")
+    await actions.assert_property(thread, "summary", "a thread", "test", now, 0.9,
+                                  evidence_class="self_declared")
+    decision = await actions.create_or_find_object("Decision", "decision:scope-types", "test")
+    await actions.assert_property(decision, "summary", "a decision", "test", now, 0.9,
+                                  evidence_class="self_declared")
+    other = await actions.create_or_find_object("Reference", "ref:scope-types", "test")
+    await actions.assert_property(other, "summary", "a reference", "test", now, 0.9,
+                                  evidence_class="self_declared")
+
+    spec = {"op": "select", "scope": {"types": ["Thread", "Decision"]}}
+    out = await run_composition(actions.pool, await _save(actions, "sel-scope-types", spec))
+    ids = {i["id"] for i in out["items"]}
+    assert str(thread) in ids
+    assert str(decision) in ids
+    assert str(other) not in ids
+
+
+async def test_select_scope_status_narrows_on_top_of_the_terminal_status_exclusion(
+    actions: Actions,
+) -> None:
+    """`scope.status` is an EXTRA equality narrowing, layered on top of — never replacing
+    — list_objects_scoped's own unconditional "not archived/merged/retired" rule: a
+    proposed Thread matches `status: 'proposed'`, an active one does not, and an archived
+    one matches neither (the base exclusion still wins)."""
+    now = datetime.now(UTC)
+    proposed = await actions.create_or_find_object("Thread", "thread:scope-status-proposed",
+                                                    "test")
+    await actions.assert_property(proposed, "summary", "proposed one", "test", now, 0.9,
+                                  evidence_class="self_declared")
+    await actions.pool.execute("UPDATE objects SET status='proposed' WHERE id=$1", proposed)
+    active = await actions.create_or_find_object("Thread", "thread:scope-status-active", "test")
+    await actions.assert_property(active, "summary", "active one", "test", now, 0.9,
+                                  evidence_class="self_declared")
+
+    spec = {"op": "select", "object_type": "Thread", "scope": {"status": "proposed"}}
+    out = await run_composition(actions.pool, await _save(actions, "sel-scope-status", spec))
+    ids = {i["id"] for i in out["items"]}
+    assert str(proposed) in ids
+    assert str(active) not in ids
+
+
 async def test_select_scope_cursor_paginates_strictly_older(actions: Actions) -> None:
     base = datetime.now(UTC)
     older = await actions.create_or_find_object("Thread", "thread:scope-cursor-older", "test")
