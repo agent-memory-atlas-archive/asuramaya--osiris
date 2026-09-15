@@ -1,10 +1,12 @@
 """THE GRAPH VISUALIZER (wave B item 1) + NAVIGABLE SPACE, THE SERVER piece A (rulings
 f832c3a4 + 0a3d6719, thread b6cb1d7c0b36), the DECLUMP FIX (Thoth mail 10582,
-PRIORITY), and THE READING LAYER (Thoth mail 10595, ruling c5953bb1): the layout
-heartbeat places every object under a rank-based sunflower rule (never a
-hash-into-a-fixed-circle), nudged by a bounded intra-project SEMANTIC-only relax that
-ends with a hard minimum-separation pass; project centers come from a weighted force
-layout over the contracted project graph, never a rank."""
+PRIORITY), THE READING LAYER (Thoth mail 10595, ruling c5953bb1), and THE LEGIBILITY
+PASS (ruling e1cb9e3b, tip 2h): the layout heartbeat places every object under a
+rank-based sunflower rule (never a hash-into-a-fixed-circle), nudged by a bounded
+intra-project SEMANTIC-only relax that ends with a hard minimum-separation pass;
+project centers come from a weighted force layout over the contracted project graph,
+never a rank; within a project, placement is by semantic adjacency (connected inner
+disc vs zero-semantic-edge outer halo), never a type ring."""
 from __future__ import annotations
 
 import math
@@ -15,6 +17,7 @@ from src.actions.core import Actions
 from src.orchestrator.graph_layout import (
     _LAYOUT_VERSION_PROP,
     _MIN_SEPARATION,
+    _adjacency_ranks,
     _declump,
     _hub_ids,
     _intra_project_neighbors,
@@ -23,7 +26,7 @@ from src.orchestrator.graph_layout import (
     _relax_projects,
     _release_layout_lock,
     _try_acquire_layout_lock,
-    base_position,
+    adjacency_position,
     layout_batch,
     positions_for,
     project_center,
@@ -88,28 +91,30 @@ def test_project_center_ranks_never_collide_across_a_realistic_range() -> None:
             assert math.dist(points[i], points[j]) > 100
 
 
-def test_base_position_is_deterministic_and_pure() -> None:
+def test_adjacency_position_is_deterministic_and_pure() -> None:
     center = project_center(3)
-    p1 = base_position(center, "Thread", 7)
-    p2 = base_position(center, "Thread", 7)
+    p1 = adjacency_position(center, True, 7)
+    p2 = adjacency_position(center, True, 7)
     assert p1 == p2
 
 
-def test_base_position_never_lands_two_types_on_the_same_base_radius() -> None:
+def test_adjacency_position_halo_band_clears_the_connected_bands_own_extent() -> None:
+    """THE LEGIBILITY PASS (ruling e1cb9e3b): a zero-semantic-edge object sits in an
+    outer halo, strictly beyond even a large connected disc's own worst-case extent."""
     center = project_center(0)
-    thread_pos = base_position(center, "Thread", 0)
-    decision_pos = base_position(center, "Decision", 0)
-    r_thread = math.dist(center, thread_pos)
-    r_decision = math.dist(center, decision_pos)
-    assert round(r_thread, 6) != round(r_decision, 6)
+    connected_pos = adjacency_position(center, True, 5000)
+    halo_pos = adjacency_position(center, False, 0)
+    r_connected = math.dist(center, connected_pos)
+    r_halo = math.dist(center, halo_pos)
+    assert r_halo > r_connected
 
 
-def test_base_position_ranks_within_one_group_never_collide_at_realistic_scale() -> None:
-    """The declump fix's whole point at the object level: a (project, type) group in
-    the low thousands (this house's own real worst case is in the tens of thousands)
-    still gets every rank a distinct, well-separated point."""
+def test_adjacency_position_ranks_within_one_band_never_collide_at_realistic_scale() -> None:
+    """The declump fix's whole point at the object level: a (project, connected) band
+    in the low thousands (this house's own real worst case is in the tens of
+    thousands) still gets every rank a distinct, well-separated point."""
     center = project_center(0)
-    points = [base_position(center, "Thread", r) for r in range(500)]
+    points = [adjacency_position(center, True, r) for r in range(500)]
     seen: set[tuple[float, float]] = set()
     for p in points:
         rounded = (round(p[0], 3), round(p[1], 3))
@@ -392,8 +397,9 @@ async def test_layout_batch_never_pulls_two_objects_together_over_a_structural_e
 
     proj_pos = (await positions_for(actions, [proj]))[proj]
     member_pos = await positions_for(actions, members)
-    # members sit on their own type's ring around the project center, not collapsed
-    # onto the project's own position the way an in_repo-as-attraction bug would do
+    # members carry no semantic edge at all (only the structural in_repo link), so
+    # they sit in the outer HALO band around the project center, not collapsed onto
+    # the project's own position the way an in_repo-as-attraction bug would do
     for oid in members:
         assert math.dist(proj_pos, member_pos[oid]) > 10
 
@@ -475,8 +481,9 @@ async def test_layout_batch_pins_a_hub_at_rank_zero_of_its_own_group(
     from src.orchestrator.graph_layout import _HUB_DEGREE_THRESHOLD
 
     now = datetime.now(UTC)
-    # seed enough OTHER Persons first (same TYPE as the hub -- same (project, type)
-    # group) so a naive creation-order rank would NOT be 0
+    # seed enough OTHER halo objects first (no semantic edge, same unfiled project --
+    # same (project, connected=False) band the hub itself falls in, since acts_for is
+    # structural, not semantic) so a naive creation-order rank would NOT be 0
     for i in range(5):
         await actions.create_or_find_object("Person", f"principal:gl-rl-pin-filler-{i}", "test")
     hub = await actions.create_or_find_object("Person", "principal:gl-rl-pin-hub", "test")
@@ -487,13 +494,72 @@ async def test_layout_batch_pins_a_hub_at_rank_zero_of_its_own_group(
     while await layout_batch(actions, limit=1000) > 0:
         pass
 
-    from src.orchestrator.graph_layout import base_position as _bp
+    from src.orchestrator.graph_layout import adjacency_position as _ap
     from src.orchestrator.graph_layout import project_center as _pc
 
-    expected_rank_0 = _bp(_pc(0), "Person", 0)
-    expected_naive_rank_5 = _bp(_pc(0), "Person", 5)
+    expected_rank_0 = _ap(_pc(0), False, 0)
+    expected_naive_rank_5 = _ap(_pc(0), False, 5)
     got = (await positions_for(actions, [hub]))[hub]
     # a small declump/relax nudge is expected and fine -- what matters is landing
     # near rank 0's own point, not near where its true creation-order rank (5) would
     # otherwise have put it
     assert math.dist(expected_rank_0, got) < math.dist(expected_naive_rank_5, got)
+
+
+# --- THE LEGIBILITY PASS (ruling e1cb9e3b, tip 2h): semantic adjacency, no type rings --
+
+
+async def test_adjacency_ranks_splits_connected_and_halo_into_separate_bands(
+    actions: Actions,
+) -> None:
+    a = await actions.create_or_find_object("Thread", "thread:gl-lp-connected", "test")
+    b = await actions.create_or_find_object("Thread", "thread:gl-lp-connected-friend", "test")
+    halo = await actions.create_or_find_object("Thread", "thread:gl-lp-halo", "test")
+    await actions.create_link(a, b, "cites", "test", datetime.now(UTC), 1.0)  # semantic
+
+    out = await _adjacency_ranks(actions, [a, halo])
+    a_connected, a_rank = out[a]
+    halo_connected, halo_rank = out[halo]
+    assert a_connected is True
+    assert halo_connected is False
+    # each band ranks independently -- never assume the hermetic test DB's own
+    # unfiled/halo band is empty, just that both ranks are real, non-negative values
+    assert a_rank >= 0
+    assert halo_rank >= 0
+
+
+async def test_adjacency_ranks_object_with_only_a_structural_edge_is_halo(
+    actions: Actions,
+) -> None:
+    now = datetime.now(UTC)
+    proj = await actions.create_or_find_object("SoftwareProject", "repo:gl-lp-struct", "test")
+    oid = await actions.create_or_find_object("Thread", "thread:gl-lp-struct-member", "test")
+    await actions.create_link(oid, proj, "in_repo", "test", now, 1.0)  # structural only
+
+    out = await _adjacency_ranks(actions, [oid])
+    connected, _rank = out[oid]
+    assert connected is False
+
+
+async def test_layout_batch_clusters_semantically_connected_objects_closer_than_halo(
+    actions: Actions,
+) -> None:
+    """THE LEGIBILITY PASS's own acceptance shape: within one project, an object with
+    a real semantic edge sits closer to the project center than a same-project object
+    with no semantic edge at all."""
+    now = datetime.now(UTC)
+    proj = await actions.create_or_find_object("SoftwareProject", "repo:gl-lp-cluster", "test")
+    connected = await actions.create_or_find_object("Thread", "thread:gl-lp-cl-a", "test")
+    connected_friend = await actions.create_or_find_object(
+        "Thread", "thread:gl-lp-cl-b", "test")
+    halo = await actions.create_or_find_object("Thread", "thread:gl-lp-cl-halo", "test")
+    for oid in (connected, connected_friend, halo):
+        await actions.create_link(oid, proj, "in_repo", "test", now, 1.0)
+    await actions.create_link(connected, connected_friend, "cites", "test", now, 1.0)
+
+    while await layout_batch(actions, limit=1000) > 0:
+        pass
+
+    proj_pos = (await positions_for(actions, [proj]))[proj]
+    pos = await positions_for(actions, [connected, halo])
+    assert math.dist(proj_pos, pos[connected]) < math.dist(proj_pos, pos[halo])

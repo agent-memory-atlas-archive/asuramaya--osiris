@@ -14,6 +14,7 @@ from src.actions.core import Actions
 from src.api.app import create_app
 from src.orchestrator.graph_layout import layout_batch
 from src.orchestrator.graph_stream import (
+    _short_label,
     decode_snapshot,
     deltas_since,
     encode_snapshot,
@@ -47,6 +48,9 @@ def test_snapshot_round_trips_through_the_decoder_with_the_exact_count() -> None
         status_flag=[0, 2, 0], edge_src=[0, 1], edge_dst=[1, 2], edge_type_code=[0, 1],
         types=["Thread", "Decision"], projects=["repo:x", "repo:y"],
         edge_types=["cites", "in_repo"], link_type_class=["semantic", "structural"],
+        labels=["Thread abc", "Decision def", "Thread ghi"],
+        project_aggregates=[{"project": 0, "count": 2, "cx": 1.5, "cy": 4.5, "radius": 1.0}],
+        cluster_edges=[{"a": 0, "b": 1, "class": "semantic", "count": 1}],
     )
     out = decode_snapshot(data)
     assert out["count"] == 3
@@ -56,6 +60,11 @@ def test_snapshot_round_trips_through_the_decoder_with_the_exact_count() -> None
     assert out["projects"] == ["repo:x", "repo:y"]
     assert out["edge_types"] == ["cites", "in_repo"]
     assert out["link_type_class"] == ["semantic", "structural"]
+    assert out["labels"] == ["Thread abc", "Decision def", "Thread ghi"]
+    assert out["project_aggregates"] == [
+        {"project": 0, "count": 2, "cx": 1.5, "cy": 4.5, "radius": 1.0}]
+    assert out["type_aggregates"] == []
+    assert out["cluster_edges"] == [{"a": 0, "b": 1, "class": "semantic", "count": 1}]
     assert out["x"] == pytest.approx([1.0, 2.0, 3.0])
     assert out["y"] == pytest.approx([4.0, 5.0, 6.0])
     assert out["type_code"] == [0, 1, 0]
@@ -72,11 +81,15 @@ def test_snapshot_with_no_edges_still_round_trips() -> None:
         object_ids=["only"], x=[0.0], y=[0.0], type_code=[0], project_code=[0],
         weight=[0.0], status_flag=[0], edge_src=[], edge_dst=[], edge_type_code=[],
         types=["Thread"], projects=["unfiled"], edge_types=[], link_type_class=[],
+        labels=["Thread only"],
     )
     out = decode_snapshot(data)
     assert out["count"] == 1
     assert out["edge_count"] == 0
     assert out["edge_src"] == []
+    assert out["project_aggregates"] == []
+    assert out["type_aggregates"] == []
+    assert out["cluster_edges"] == []
 
 
 def test_encode_snapshot_rejects_a_mismatched_node_column_length() -> None:
@@ -85,7 +98,7 @@ def test_encode_snapshot_rejects_a_mismatched_node_column_length() -> None:
             object_ids=["a", "b"], x=[1.0], y=[1.0, 2.0], type_code=[0, 0],
             project_code=[0, 0], weight=[0.0, 0.0], status_flag=[0, 0],
             edge_src=[], edge_dst=[], edge_type_code=[], types=[], projects=[],
-            edge_types=[], link_type_class=[],
+            edge_types=[], link_type_class=[], labels=["a", "b"],
         )
 
 
@@ -95,8 +108,49 @@ def test_encode_snapshot_rejects_a_mismatched_edge_column_length() -> None:
             object_ids=["a"], x=[1.0], y=[1.0], type_code=[0], project_code=[0],
             weight=[0.0], status_flag=[0], edge_src=[0, 0], edge_dst=[0],
             edge_type_code=[0, 0], types=[], projects=[], edge_types=[],
-            link_type_class=[],
+            link_type_class=[], labels=["a"],
         )
+
+
+def test_encode_snapshot_rejects_a_mismatched_labels_length() -> None:
+    with pytest.raises(ValueError, match="labels has"):
+        encode_snapshot(
+            object_ids=["a", "b"], x=[1.0, 2.0], y=[1.0, 2.0], type_code=[0, 0],
+            project_code=[0, 0], weight=[0.0, 0.0], status_flag=[0, 0],
+            edge_src=[], edge_dst=[], edge_type_code=[], types=[], projects=[],
+            edge_types=[], link_type_class=[], labels=["only-one"],
+        )
+
+
+# --- _short_label: THE LEGIBILITY PASS, tip 2g ----------------------------------------
+
+
+def test_short_label_agent_uses_handle_never_the_id() -> None:
+    assert _short_label("Agent", "agent:deadbeef-g1", "Khnum", None) == "Khnum"
+
+
+def test_short_label_software_project_strips_the_repo_scheme() -> None:
+    assert _short_label("SoftwareProject", "repo:osiris", None, None) == "osiris"
+
+
+def test_short_label_person_uses_name() -> None:
+    assert _short_label("Person", "principal:xyz", None, "Ada Lovelace") == "Ada Lovelace"
+
+
+def test_short_label_falls_back_to_type_plus_canonical() -> None:
+    assert _short_label("Thread", "thread:abc123", None, None) == "Thread thread:abc123"
+
+
+def test_short_label_agent_without_a_handle_falls_back() -> None:
+    assert _short_label("Agent", "agent:deadbeef-g1", None, None) == (
+        "Agent agent:deadbeef-g1")
+
+
+def test_short_label_hard_truncates_at_40_chars_with_an_ellipsis() -> None:
+    long_canonical = "thread:" + "x" * 60
+    label = _short_label("Thread", long_canonical, None, None)
+    assert len(label) == 40
+    assert label.endswith("…")
 
 
 # --- DB-backed: fetch_snapshot ---------------------------------------------------------
@@ -148,6 +202,57 @@ async def test_fetch_snapshot_watermark_matches_the_live_outbox_tip(
     await actions.create_or_find_object("Thread", "thread:gs-watermark", "test")
     out = decode_snapshot(await fetch_snapshot(actions.pool))
     assert out["watermark"] == await outbox_watermark(actions.pool)
+
+
+async def test_fetch_snapshot_labels_index_align_with_object_ids(actions: Actions) -> None:
+    """THE LEGIBILITY PASS, tip 2g."""
+    oid = await actions.create_or_find_object("Thread", "thread:gs-label", "test")
+    await layout_batch(actions, limit=1000)
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    idx = out["object_ids"].index(str(oid))
+    assert out["labels"][idx] == "Thread thread:gs-label"
+
+
+async def test_fetch_snapshot_aggregates_carry_every_placed_object(
+    actions: Actions,
+) -> None:
+    """THE LEGIBILITY PASS, tip 2i: every project_aggregates entry's own count sums to
+    the snapshot's total object count -- nothing dropped, nothing double-counted."""
+    await actions.create_or_find_object("Thread", "thread:gs-agg", "test")
+    await layout_batch(actions, limit=1000)
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    assert sum(a["count"] for a in out["project_aggregates"]) == out["count"]
+    assert sum(a["count"] for a in out["type_aggregates"]) == out["count"]
+
+
+async def test_fetch_snapshot_cluster_edges_only_cover_cross_project_pairs(
+    actions: Actions,
+) -> None:
+    """THE LEGIBILITY PASS, tip 2j: a real cross-project semantic edge shows up as one
+    cluster_edges record naming both projects' own codes and the edge's class."""
+    now = datetime.now(UTC)
+    proj_a = await actions.create_or_find_object("SoftwareProject", "repo:gs-cl-a", "test")
+    proj_b = await actions.create_or_find_object("SoftwareProject", "repo:gs-cl-b", "test")
+    a = await actions.create_or_find_object("Thread", "thread:gs-cl-a-member", "test")
+    b = await actions.create_or_find_object("Thread", "thread:gs-cl-b-member", "test")
+    await actions.create_link(a, proj_a, "in_repo", "test", now, 1.0)
+    await actions.create_link(b, proj_b, "in_repo", "test", now, 1.0)
+    await actions.create_link(a, b, "cites", "test", now, 1.0)  # semantic, cross-project
+
+    while await layout_batch(actions, limit=1000) > 0:
+        pass
+
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    # a's/b's own MEMBERSHIP project code (via in_repo), not proj_a's/proj_b's own
+    # code as objects (a SoftwareProject carries no in_repo link of its own, so it
+    # sits in the "unfiled" bucket -- a different axis from which project it names)
+    pa = out["project_code"][out["object_ids"].index(str(a))]
+    pb = out["project_code"][out["object_ids"].index(str(b))]
+    assert out["projects"][pa] == "repo:gs-cl-a"
+    assert out["projects"][pb] == "repo:gs-cl-b"
+    lo, hi = (pa, pb) if pa <= pb else (pb, pa)
+    matches = [e for e in out["cluster_edges"] if e["a"] == lo and e["b"] == hi]
+    assert any(e["class"] == "semantic" and e["count"] >= 1 for e in matches)
 
 
 # --- DB-backed: deltas_since ------------------------------------------------------------

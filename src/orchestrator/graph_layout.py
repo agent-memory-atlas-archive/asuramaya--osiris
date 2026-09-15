@@ -81,6 +81,27 @@ distant objects toward the hub. Two changes fix this:
     the hub" acceptance line.
 
 graph_layout_v bumped again (3 -> 4) to force the one-time migration this change needs.
+
+THE LEGIBILITY PASS, Khnum tip 2 (operator ruling e1cb9e3b, 2026-09-14 evening, on
+screenshots and Thoth's own live measurement -- median nearest-neighbour 19 units at
+the fitted zoom, "the pink giant is the osiris project's 19,035-agent sunflower disc
+drawn solid, the purple onions are type rings"). Piece (h): TYPE RINGS ARE GONE.
+Placement within a project is now by SEMANTIC ADJACENCY alone: an object carrying ANY
+live semantic edge (globally, not just within this project -- the same reading
+`_hub_ids`'s own structural-degree check already uses) is CONNECTED and seeds inside
+the project's own inner disc (base radius 0); an object with zero semantic edges of any
+kind is HALO and seeds in a fixed outer ring well clear of the worst-case inner disc's
+own extent. Only INTRA-project semantic edges ever pull during relax (unchanged from
+THE READING LAYER above) -- a connected object with only cross-project semantic edges
+still seeds in the inner disc, it just isn't pulled by anything there, identical to how
+an ordinary unconnected object behaved before this pass. Both bands use the SAME
+sunflower/declump machinery as before, just keyed on a (project, connected) partition
+instead of (project, type) -- `_adjacency_ranks` replaces `_group_ranks`,
+`adjacency_position` replaces `base_position`. A hub (`_hub_ids`) still pins to rank 0
+of its OWN band (connected or halo, whichever it actually falls in) rather than an
+ordinary creation-order rank.
+
+graph_layout_v bumped again (4 -> 5) to force the one-time migration this change needs.
 """
 from __future__ import annotations
 
@@ -97,7 +118,6 @@ import numpy as np
 
 from src.actions.core import Actions
 from src.ontology.link_classes import STRUCTURAL_LINK_TYPES
-from src.ontology.schema import _OBJECT_TYPES
 
 GRAPH_LAYOUT_SOURCE = "cron:graph_layout"
 _BATCH_SIZE = 1000
@@ -107,11 +127,9 @@ _MAX_STEP = 10.0
 
 # NAVIGABLE SPACE, piece A additions ---------------------------------------------------
 _LAYOUT_VERSION_PROP = "graph_layout_v"
-_LAYOUT_VERSION = 4  # bump this to force one migration pass over every already-placed object
+_LAYOUT_VERSION = 5  # bump this to force one migration pass over every already-placed object
 _RELAX_ITERATIONS = 6  # "a FEW iterations" -- a nudge on top of the deterministic base,
                        # never enough to erase the sunflower structure
-_RING_BASE = 40.0
-_RING_GAP = 50.0
 _UNFILED_KEY = "unfiled"  # the same sentinel /graph/supernodes already uses for no-in_repo
 _GOLDEN_ANGLE = math.pi * (3.0 - math.sqrt(5.0))
 
@@ -120,11 +138,18 @@ _GOLDEN_ANGLE = math.pi * (3.0 - math.sqrt(5.0))
 # worst single (project,type) group is Agent/unfiled at 18,978 (sunflower radius at that
 # rank, spacing 15.0, is ~2,067); worst real project is osiris itself at 11,768 objects
 # (Commit alone 6,273, radius ~1,188 at the same spacing) across 40 real projects total.
-_NODE_SPACING = 15.0  # minimum pairwise spacing within one (project, type) sunflower disc
+_NODE_SPACING = 15.0  # minimum pairwise spacing within one (project, connected) sunflower disc
 _MIN_SEPARATION = _NODE_SPACING  # hard floor the post-relax declump pass enforces
 _PROJECT_SPACING = 5000.0  # unfiled's own fixed seed spacing (see _UNFILED_KEY below) --
                            # real projects are placed by _relax_projects instead, below
-_TYPE_RING_INDEX: dict[str, int] = {t.name: i for i, t in enumerate(_OBJECT_TYPES)}
+
+# THE LEGIBILITY PASS additions (ruling e1cb9e3b, tip 2h) -------------------------------
+_INNER_BASE = 0.0  # the CONNECTED band starts right at the project center -- no ring offset
+_HALO_BASE = 6000.0  # the HALO band's own fixed offset, sized to comfortably clear the
+                     # worst-case CONNECTED disc's own extent even well beyond today's
+                     # population: at spacing 15.0, 50,000 connected members in one project
+                     # (today's worst single group, Agent/unfiled, is 18,978) reach only
+                     # ~3,354 units out -- 6,000 leaves a real margin, not a bare clearance
 
 # THE READING LAYER additions ----------------------------------------------------------
 _PROJECT_GUTTER = 300.0  # fixed clearance ON TOP of two projects' own combined content
@@ -170,32 +195,18 @@ def project_center(rank: int) -> tuple[float, float]:
     return _sunflower_point(rank, _PROJECT_SPACING)
 
 
-def _type_ring_index(type_name: str) -> int:
-    """Base ring index for an object's TYPE around its project's center -- schema.py's
-    own declared object-type order (already a stable, code-defined enumeration every
-    other consumer of OBJECT_TYPES reuses), so every project draws the same type at
-    the same base radius. An extension type outside the static catalog still needs a
-    stable index: falls back to a hash-derived ring beyond the known count --
-    deterministic, and a shared base ring between two unknown types is a label
-    overlap, never a positioning bug (the sunflower disc built on top of it still
-    keeps individual OBJECTS apart)."""
-    idx = _TYPE_RING_INDEX.get(type_name)
-    if idx is not None:
-        return idx
-    return len(_TYPE_RING_INDEX) + int(_hash01(f"type:{type_name}") * 20)
-
-
-def base_position(
-    center: tuple[float, float], type_name: str, rank_in_group: int,
+def adjacency_position(
+    center: tuple[float, float], connected: bool, rank_in_group: int,
 ) -> tuple[float, float]:
-    """The deterministic placement rule itself: a sunflower disc for the object's own
-    (project, type) group, keyed on its permanent rank within that group, offset
-    outward from the type's own base radius (so a small group still reads as a tight
-    ring near that radius, and only a group large enough to need it spirals past it).
-    A pure function of (center, type, rank) alone -- recomputing it for the same
-    rank always lands on the same point."""
+    """THE LEGIBILITY PASS (ruling e1cb9e3b, tip 2h): the placement rule itself, TYPE
+    RINGS GONE -- a sunflower disc for the object's own (project, connected) band,
+    keyed on its permanent rank within that band, offset outward from the band's own
+    fixed base radius (`_INNER_BASE` for connected, `_HALO_BASE` for halo -- so the
+    halo band always starts well clear of the inner disc's own worst-case extent). A
+    pure function of (center, connected, rank) alone -- recomputing it for the same
+    inputs always lands on the same point."""
     cx, cy = center
-    base_r = _RING_BASE + _type_ring_index(type_name) * _RING_GAP
+    base_r = _INNER_BASE if connected else _HALO_BASE
     lx, ly = _sunflower_point(rank_in_group, _NODE_SPACING)
     local_r = math.hypot(lx, ly)
     angle = math.atan2(ly, lx)
@@ -263,36 +274,52 @@ async def _project_and_type(
     return {r["id"]: (r["project_id"], r["type"]) for r in rows}
 
 
-async def _group_ranks(actions: Actions, ids: list[uuid.UUID]) -> dict[uuid.UUID, int]:
-    """Each id's own PERMANENT rank within its (project, type) group --
-    `ROW_NUMBER() OVER (PARTITION BY project, type ORDER BY created_at, id)`, computed
-    over the WHOLE active population in one indexed window-function scan (this
-    house's own current ~49k-object scale: a sub-second query) so a rank, once
-    assigned to an id by this formula, can never change -- a later-created sibling
-    only ever takes a higher, not-yet-used rank in the SAME group. The inner
-    DISTINCT ON mirrors `_project_and_type`'s own multi-in_repo-link tie-break
-    (lowest link id wins) so a rare multi-membership object is never double-counted
-    into its own group, which would otherwise corrupt every rank after it."""
+async def _adjacency_ranks(
+    actions: Actions, ids: list[uuid.UUID],
+) -> dict[uuid.UUID, tuple[bool, int]]:
+    """THE LEGIBILITY PASS (ruling e1cb9e3b, tip 2h): each id's own (connected, rank)
+    -- `connected` is whether the object carries ANY live semantic-classified edge at
+    all (globally, not scoped to this project -- the same reading `_hub_ids` already
+    uses for structural degree), `rank` is its PERMANENT rank within its (project,
+    connected) band, `ROW_NUMBER() OVER (PARTITION BY project, connected ORDER BY
+    created_at, id)`, computed over the WHOLE active population in one indexed
+    window-function scan so a rank, once assigned, can never change -- a
+    later-created sibling only ever takes a higher, not-yet-used rank in the SAME
+    band. `semantic_ids` is a flat pre-pass (every node touched by a non-structural
+    link) rather than a per-row correlated subquery -- the same shape `_hub_ids`'s
+    own UNION ALL degree count uses, cheap at this house's ~49k-object scale. The
+    inner DISTINCT ON mirrors `_project_and_type`'s own multi-in_repo-link tie-break
+    (lowest link id wins)."""
     if not ids:
         return {}
     rows = await actions.pool.fetch(
-        "WITH members AS ("
-        "  SELECT DISTINCT ON (o.id) o.id, o.type, o.created_at, "
-        "    COALESCE(p.canonical, $2) AS project_key "
+        "WITH semantic_ids AS ("
+        "  SELECT DISTINCT node FROM ("
+        "    SELECT from_id AS node, type FROM links "
+        "      WHERE valid_until IS NULL OR valid_until > now() "
+        "    UNION ALL "
+        "    SELECT to_id AS node, type FROM links "
+        "      WHERE valid_until IS NULL OR valid_until > now()"
+        "  ) x WHERE type <> ALL($3::text[])"
+        "), members AS ("
+        "  SELECT DISTINCT ON (o.id) o.id, o.created_at, "
+        "    COALESCE(p.canonical, $2) AS project_key, "
+        "    (s.node IS NOT NULL) AS connected "
         "  FROM objects o "
         "  LEFT JOIN links l ON l.from_id=o.id AND l.type='in_repo' "
         "    AND (l.valid_until IS NULL OR l.valid_until > now()) "
         "  LEFT JOIN objects p ON p.id=l.to_id AND p.type='SoftwareProject' "
+        "  LEFT JOIN semantic_ids s ON s.node = o.id "
         "  WHERE o.status NOT IN ('archived','merged','retired') "
         "  ORDER BY o.id, l.id"
         "), ranked AS ("
-        "  SELECT id, row_number() OVER ("
-        "    PARTITION BY project_key, type ORDER BY created_at, id"
+        "  SELECT id, connected, row_number() OVER ("
+        "    PARTITION BY project_key, connected ORDER BY created_at, id"
         "  ) - 1 AS rank_in_group "
         "  FROM members"
-        ") SELECT id, rank_in_group FROM ranked WHERE id = ANY($1::uuid[])",
-        ids, _UNFILED_KEY)
-    return {r["id"]: int(r["rank_in_group"]) for r in rows}
+        ") SELECT id, connected, rank_in_group FROM ranked WHERE id = ANY($1::uuid[])",
+        ids, _UNFILED_KEY, list(STRUCTURAL_LINK_TYPES))
+    return {r["id"]: (bool(r["connected"]), int(r["rank_in_group"])) for r in rows}
 
 
 async def _neighbors_of(
@@ -748,7 +775,7 @@ async def layout_batch(actions: Actions, *, limit: int | None = None) -> int:
         neighbor_ids = sorted(
             ({nb for nbs in neighbors.values() for nb in nbs} - unplaced_set), key=str)
         proj_type = await _project_and_type(actions, unplaced_regular + neighbor_ids)
-        group_ranks = await _group_ranks(actions, unplaced_regular)
+        adjacency = await _adjacency_ranks(actions, unplaced_regular)
         hub_ids = await _hub_ids(actions, unplaced_regular)
         project_ids_needed = [pid for pid, _ in proj_type.values() if pid]
         project_centers = await positions_for(actions, project_ids_needed)
@@ -756,11 +783,12 @@ async def layout_batch(actions: Actions, *, limit: int | None = None) -> int:
 
         base = {}
         for oid in unplaced_regular:
-            proj_id, type_name = proj_type.get(oid, (None, "Unknown"))
+            proj_id, _type_name = proj_type.get(oid, (None, "Unknown"))
             center = (project_centers.get(proj_id, unfiled_center)
                       if proj_id else unfiled_center)
-            rank = 0 if oid in hub_ids else group_ranks.get(oid, 0)
-            base[oid] = base_position(center, type_name, rank)
+            connected, own_rank = adjacency.get(oid, (False, 0))
+            rank = 0 if oid in hub_ids else own_rank
+            base[oid] = adjacency_position(center, connected, rank)
 
         anchors = await positions_for(actions, neighbor_ids)
         intra = _intra_project_neighbors(unplaced_regular, neighbors, proj_type)
