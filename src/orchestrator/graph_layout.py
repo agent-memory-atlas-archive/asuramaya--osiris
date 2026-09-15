@@ -533,6 +533,37 @@ def _centroid_seed(
     return cx + lx, cy + ly
 
 
+def _grid_cells(pos: np.ndarray, cell_size: float) -> dict[tuple[int, int], list[int]]:
+    """THE PHYSICS LAYOUT OOM FIX (Thoth mail 11097): the spatial-hash structure
+    `_declump` now uses instead of a full (n,n,2) pairwise array -- `_declump`'s own
+    old form built exactly that array over the WHOLE population every iteration,
+    40 GB at n=50,087 (kernel-confirmed OOM kill, anon-rss 26.3 GB before it died).
+    Bucketing by `floor(pos / cell_size)` with `cell_size == min_sep` is the
+    standard grid-hash guarantee: any two points within `min_sep` of each other are
+    either in the same cell or one of its 8 neighbors (never farther), so checking
+    only those 9 cells per point catches every real collision with no O(n^2) memory
+    anywhere -- the heartbeat's own 1000-object batches never surfaced this because
+    a 1000x1000 array (16 MB) is nothing; the physics migration's 50,087x50,087 one
+    was 40 GB."""
+    cells: dict[tuple[int, int], list[int]] = defaultdict(list)
+    if len(pos) == 0:
+        return cells
+    idx = np.floor(pos / cell_size).astype(np.int64)
+    for i, (cx, cy) in enumerate(idx):
+        cells[(int(cx), int(cy))].append(i)
+    return cells
+
+
+def _neighbor_cell_indices(
+    cells: dict[tuple[int, int], list[int]], cx: int, cy: int,
+) -> list[int]:
+    out: list[int] = []
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            out.extend(cells.get((cx + dx, cy + dy), []))
+    return out
+
+
 def _declump(
     pos: np.ndarray, anchor_pos: np.ndarray, ids: list[uuid.UUID], *,
     min_sep: float = _MIN_SEPARATION, iterations: int = 30,
@@ -546,40 +577,65 @@ def _declump(
     between two movable points; the FULL deficit onto the movable side of a
     movable/anchor pair, since the anchor never moves) -- iterates a bounded few
     times since separating one pair can nudge another pair together, and stops the
-    moment a full pass finds nothing left to fix."""
+    moment a full pass finds nothing left to fix.
+
+    SPATIAL-HASH GRID, not a pairwise array (THE PHYSICS LAYOUT OOM FIX, Thoth mail
+    11097) -- see `_grid_cells`'s own docstring for the memory story. Anchors are
+    bucketed ONCE, outside the iteration loop, since they never move; movable points
+    are re-bucketed each iteration since `pos` changes. Candidate pairs within a
+    cell-plus-neighbors group are still checked with a plain per-pair loop (numpy
+    only, no scipy) -- cheap because the grid keeps the candidate COUNT near O(n) for
+    any reasonably spread population, not because any single comparison is fast."""
+    anchor_cells = _grid_cells(anchor_pos, min_sep) if len(anchor_pos) else {}
     for _ in range(iterations):
         moved = False
-
-        delta = pos[:, None, :] - pos[None, :, :]
-        dist = np.linalg.norm(delta, axis=2)
-        np.fill_diagonal(dist, np.inf)
-        too_close = dist < min_sep
-        if too_close.any():
-            moved = True
-            safe = np.where(dist < 1e-9, 1.0, dist)
-            direction = delta / safe[:, :, None]
-            for i, j in zip(*np.where(dist < 1e-9), strict=True):
-                if i < j:
-                    a = _hash01(f"declump:{ids[i]}:{ids[j]}") * 2 * math.pi
-                    direction[i, j] = (math.cos(a), math.sin(a))
-                    direction[j, i] = (-math.cos(a), -math.sin(a))
-            deficit = np.where(too_close, min_sep - np.minimum(dist, min_sep), 0.0)
-            pos = pos + (deficit[:, :, None] / 2 * direction).sum(axis=1)
+        disp = np.zeros_like(pos)
+        cells = _grid_cells(pos, min_sep)
+        seen: set[tuple[int, int]] = set()
+        for (cx, cy), idxs in cells.items():
+            candidates = _neighbor_cell_indices(cells, cx, cy)
+            for i in idxs:
+                for j in candidates:
+                    if j <= i:
+                        continue
+                    pair = (i, j)
+                    if pair in seen:
+                        continue
+                    seen.add(pair)
+                    d = pos[i] - pos[j]
+                    dist = float(math.hypot(d[0], d[1]))
+                    if dist >= min_sep:
+                        continue
+                    moved = True
+                    if dist < 1e-9:
+                        a = _hash01(f"declump:{ids[i]}:{ids[j]}") * 2 * math.pi
+                        d = np.array([math.cos(a), math.sin(a)])
+                        dist = 1.0
+                    deficit = min_sep - dist
+                    direction = d / dist
+                    disp[i] = disp[i] + direction * deficit / 2
+                    disp[j] = disp[j] - direction * deficit / 2
+        pos = pos + disp
 
         if len(anchor_pos):
-            d2 = pos[:, None, :] - anchor_pos[None, :, :]
-            dist2 = np.linalg.norm(d2, axis=2)
-            too_close2 = dist2 < min_sep
-            if too_close2.any():
-                moved = True
-                safe2 = np.where(dist2 < 1e-9, 1.0, dist2)
-                direction2 = d2 / safe2[:, :, None]
-                for i, k in zip(*np.where(dist2 < 1e-9), strict=True):
-                    a = _hash01(f"declump-anchor:{ids[i]}:{k}") * 2 * math.pi
-                    direction2[i, k] = (math.cos(a), math.sin(a))
-                deficit2 = np.where(
-                    too_close2, min_sep - np.minimum(dist2, min_sep), 0.0)
-                pos = pos + (deficit2[:, :, None] * direction2).sum(axis=1)
+            disp2 = np.zeros_like(pos)
+            for i in range(len(pos)):
+                cx = int(math.floor(pos[i, 0] / min_sep))
+                cy = int(math.floor(pos[i, 1] / min_sep))
+                for k in _neighbor_cell_indices(anchor_cells, cx, cy):
+                    d = pos[i] - anchor_pos[k]
+                    dist = float(math.hypot(d[0], d[1]))
+                    if dist >= min_sep:
+                        continue
+                    moved = True
+                    if dist < 1e-9:
+                        a = _hash01(f"declump-anchor:{ids[i]}:{k}") * 2 * math.pi
+                        d = np.array([math.cos(a), math.sin(a)])
+                        dist = 1.0
+                    deficit = min_sep - dist
+                    direction = d / dist
+                    disp2[i] = disp2[i] + direction * deficit
+            pos = pos + disp2
 
         if not moved:
             break

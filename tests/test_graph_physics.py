@@ -7,6 +7,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
+import numpy as np
 import pytest
 from src.actions.core import Actions
 from src.orchestrator import graph_physics
@@ -15,6 +16,7 @@ from src.orchestrator.graph_physics import (
     _PHYSICS_LAYOUT_VERSION,
     _build_physics_graph,
     _detect_communities,
+    _memory_guard,
     _physics_positions,
     _project_membership,
     _seed_positions,
@@ -43,6 +45,26 @@ def test_seed_positions_real_vertices_are_spread_deterministically() -> None:
     p2 = _seed_positions(vertex_ids)
     assert (p1 == p2).all()  # deterministic
     assert tuple(p1[0]) != tuple(p1[1])  # two real vertices never seed on top of each other
+
+
+async def test_memory_guard_refuses_on_a_degenerate_all_coincident_seed(
+    actions: Actions,
+) -> None:
+    """THE PHYSICS LAYOUT OOM (Thoth mail 11097): the one remaining shape that could
+    still cost O(k^2) memory after the declump grid rewrite -- every point landing
+    in a single grid cell. 12,000 coincident points -> 12,000^2*16 ~= 2.3 GB, over
+    the default 2 GB layout.physics_max_bytes."""
+    seed = np.zeros((12_000, 2))
+    reason = await _memory_guard(actions, seed)
+    assert reason is not None
+    assert "refusing" in reason
+
+
+async def test_memory_guard_passes_for_a_well_spread_population(actions: Actions) -> None:
+    ids: list[uuid.UUID | None] = [uuid.uuid4() for _ in range(2000)]
+    seed = _seed_positions(ids)
+    reason = await _memory_guard(actions, seed)
+    assert reason is None
 
 
 def test_build_physics_graph_container_edges_get_flat_weight_semantic_get_normalised(
@@ -202,8 +224,9 @@ async def test_run_physics_migrate_writes_every_active_object_at_the_current_ver
     await actions.create_link(a, b, "cites", "test", now, 1.0)
 
     receipts = [r async for r in run_physics_migrate(actions)]
-    assert receipts[-1] == {"done": True, "placed": receipts[-1]["placed"]}
+    assert receipts[-1]["done"] is True
     assert receipts[-1]["placed"] >= 2
+    assert receipts[-1]["peak_rss_kb"] > 0
 
     placed = await positions_for(actions, [a, b])
     assert a in placed and b in placed

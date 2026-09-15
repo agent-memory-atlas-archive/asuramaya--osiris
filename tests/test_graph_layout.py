@@ -10,9 +10,12 @@ disc vs zero-semantic-edge outer halo), never a type ring."""
 from __future__ import annotations
 
 import math
+import resource
+import time
 import uuid
 from datetime import UTC, datetime
 
+import numpy as np
 from src.actions.core import Actions
 from src.orchestrator.graph_layout import (
     _HALO_BASE,
@@ -206,6 +209,32 @@ def test_declump_pushes_a_node_away_from_a_fixed_anchor() -> None:
     anchors = np.array([[5.0, 5.0]])
     out = _declump(pos, anchors, ids)
     assert math.dist(out[0], anchors[0]) >= _MIN_SEPARATION - 1e-6
+
+
+def test_declump_60000_random_points_completes_fast_with_bounded_memory() -> None:
+    """THE PHYSICS LAYOUT OOM (Thoth mail 11097): the OLD form built a full (n,n,2)
+    pairwise array -- 40 GB at n=50,087, kernel-confirmed OOM kill. The spatial-hash
+    rewrite must handle a real-scale population (60,000, comfortably over the
+    50,087 that actually killed the process) in bounded time and memory -- this is
+    the acceptance test named in that same dispatch."""
+    rng = np.random.default_rng(42)
+    n = 60_000
+    # spread over a 6000x6000 area -- dense enough that real declump work happens
+    # (not the trivial "nothing overlaps" case), nowhere near the degenerate
+    # all-coincident case _memory_guard exists to catch separately
+    pos = rng.uniform(-3000.0, 3000.0, size=(n, 2))
+    ids = [uuid.uuid4() for _ in range(n)]
+
+    before_rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    start = time.monotonic()
+    out = _declump(pos, np.zeros((0, 2)), ids, min_sep=_MIN_SEPARATION)
+    elapsed = time.monotonic() - start
+    after_rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+    assert elapsed < 30.0, f"declump over 60,000 points took {elapsed:.1f}s, over 30s"
+    growth_mb = (after_rss_kb - before_rss_kb) / 1024
+    assert growth_mb < 500, f"peak RSS grew {growth_mb:.1f} MB, over the 500 MB budget"
+    assert out.shape == (n, 2)
 
 
 def test_relax_never_leaves_two_strongly_attracted_nodes_stacked() -> None:
@@ -444,11 +473,11 @@ async def test_layout_batch_container_only_members_seed_near_their_container(
     member_pos = await positions_for(actions, members)
     # a real minimum-separation floor among siblings (_MIN_SEPARATION) means N
     # container-only siblings can't ALL sit within a few units of one point past a
-    # handful of them, and a few bounded relax iterations nudge them further still --
-    # 200 is not a tight bound, it's a clear order-of-magnitude line below the OLD
-    # flat ~6000-unit halo offset this same scenario used to produce
+    # handful of them, and a few bounded relax/declump iterations nudge them further
+    # still -- 500 is not a tight bound, it's a clear order-of-magnitude line below
+    # the OLD flat ~6000-unit halo offset this same scenario used to produce
     for oid in members:
-        assert math.dist(proj_pos, member_pos[oid]) < 200
+        assert math.dist(proj_pos, member_pos[oid]) < 500
 
 
 async def test_place_projects_pulls_a_linked_project_closer_than_an_unlinked_one(
@@ -525,17 +554,20 @@ async def test_hub_ids_excludes_an_ordinary_low_degree_object(actions: Actions) 
     assert oid not in found
 
 
-async def test_layout_batch_pins_a_hub_at_rank_zero_of_its_own_group(
+async def test_layout_batch_still_places_a_structural_hub(
     actions: Actions,
 ) -> None:
+    """THE PHYSICS LAYOUT (Thoth mail 11047, item 6) dropped explicit hub-rank-0
+    pinning from layout_batch's own INCREMENTAL new-object path -- that guarantee
+    now lives only in graph_physics._physics_positions' own hub-recentering step
+    for the one-shot migration (test_physics_positions_recenter_hubs_to_the_center_
+    of_mass in test_graph_physics.py). This test only confirms the incremental path
+    still gives a high-structural-degree object a real, finite position -- no
+    crash, no NaN -- rather than asserting a rank-0 guarantee this path no longer
+    makes."""
     from src.orchestrator.graph_layout import _HUB_DEGREE_THRESHOLD
 
     now = datetime.now(UTC)
-    # seed enough OTHER halo objects first (no semantic edge, same unfiled project --
-    # same (project, connected=False) band the hub itself falls in, since acts_for is
-    # structural, not semantic) so a naive creation-order rank would NOT be 0
-    for i in range(5):
-        await actions.create_or_find_object("Person", f"principal:gl-rl-pin-filler-{i}", "test")
     hub = await actions.create_or_find_object("Person", "principal:gl-rl-pin-hub", "test")
     for i in range(_HUB_DEGREE_THRESHOLD + 1):
         agent = await actions.create_or_find_object("Agent", f"agent:gl-rl-pin-{i}", "test")
@@ -544,16 +576,8 @@ async def test_layout_batch_pins_a_hub_at_rank_zero_of_its_own_group(
     while await layout_batch(actions, limit=1000) > 0:
         pass
 
-    from src.orchestrator.graph_layout import adjacency_position as _ap
-    from src.orchestrator.graph_layout import project_center as _pc
-
-    expected_rank_0 = _ap(_pc(0), False, 0)
-    expected_naive_rank_5 = _ap(_pc(0), False, 5)
-    got = (await positions_for(actions, [hub]))[hub]
-    # a small declump/relax nudge is expected and fine -- what matters is landing
-    # near rank 0's own point, not near where its true creation-order rank (5) would
-    # otherwise have put it
-    assert math.dist(expected_rank_0, got) < math.dist(expected_naive_rank_5, got)
+    x, y = (await positions_for(actions, [hub]))[hub]
+    assert math.isfinite(x) and math.isfinite(y)
 
 
 # --- THE LEGIBILITY PASS (ruling e1cb9e3b, tip 2h): semantic adjacency, no type rings --

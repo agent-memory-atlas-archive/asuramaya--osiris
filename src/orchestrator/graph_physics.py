@@ -41,6 +41,17 @@ jitter around the origin (structural scaffolding only, no meaning of their own).
 ENDS WITH THE SAME DECLUMP FLOOR (`graph_layout._declump`) every earlier version
 used -- FR's own repulsion approaches but never guarantees a minimum separation
 within a bounded iteration count, this is the deterministic correction that does.
+THE OOM (Thoth mail 11097, kernel-confirmed: anon-rss 26.3 GB, process killed):
+`_declump`'s OLD form built a full (n,n,2) pairwise array over the WHOLE
+population -- 40 GB at n=50,087, since this migration passes every active object
+at once (never 1000 at a time the way the heartbeat's own incremental batches do).
+Fixed in graph_layout.py itself (a spatial-hash grid, `_grid_cells`/
+`_neighbor_cell_indices`, cell size = min_sep, no O(n^2) memory anywhere) so both
+this migration and the heartbeat share the fix. `run_physics_migrate` ALSO guards
+its own remaining quadratic-shaped steps against `layout.physics_max_bytes`
+(default 2 GB) before running them, and logs peak RSS on its final receipt --
+belt-and-suspenders against a future reintroduction, not because anything left
+here still allocates that way today.
 
 WRITE PATH: reuses `graph_layout._bulk_assert_positions` unchanged (graph_x/graph_y/
 graph_layout_v as ordinary property assertions, GRAPH_LAYOUT_SOURCE the sole writer),
@@ -70,6 +81,7 @@ existing local-batch machinery almost unchanged.
 from __future__ import annotations
 
 import math
+import resource
 import uuid
 from collections import defaultdict
 from collections.abc import AsyncIterator
@@ -86,6 +98,7 @@ from src.orchestrator.graph_layout import (
     _MIN_SEPARATION,
     _bulk_assert_positions,
     _declump,
+    _grid_cells,
     _hash01,
     _hub_ids,
     _release_layout_lock,
@@ -119,6 +132,9 @@ _DEFAULT_SEMANTIC_WEIGHT = 1.0  # every semantic type shares this today -- "weig
 _PHYSICS_LAYOUT_VERSION = 7  # graph_layout._LAYOUT_VERSION must match this -- bumped
                              # together so the incremental heartbeat and this one-shot
                              # migration always agree on what "current" means.
+_DEFAULT_PHYSICS_MAX_BYTES = 2_000_000_000  # layout.physics_max_bytes' own default
+                                            # (Thoth mail 11097) -- see _memory_guard's
+                                            # own docstring for what this actually checks.
 
 
 async def _active_object_ids(actions: Actions) -> list[uuid.UUID]:
@@ -320,19 +336,53 @@ async def _physics_positions(
             for i, oid in enumerate(object_ids)}
 
 
+async def _memory_guard(actions: Actions, seed: np.ndarray) -> str | None:
+    """THE PHYSICS LAYOUT OOM guard (Thoth mail 11097): a defensive check against
+    the ONE shape that could still cost O(k^2) memory after graph_layout._declump's
+    own grid rewrite -- not the whole population `n` (the grid fix means declump's
+    real memory cost is O(n), never O(n^2), for any reasonably spread population,
+    seeded or not), but the largest SINGLE grid cell's own point count `k`: a
+    degenerate all-coincident-seed input (every point landing in one cell) is the
+    one remaining case where a future VECTORISED per-cell fallback could
+    reintroduce an (k,k,2) pairwise array. Checked against the deterministic seed
+    positions (cheap, pure, no DB) before the expensive FR/declump pass ever runs
+    -- returns a written refusal reason, or None when safe."""
+    from src.orchestrator.settings_service import current_stored_value
+
+    cells = _grid_cells(seed, _MIN_SEPARATION)
+    worst_k = max((len(v) for v in cells.values()), default=0)
+    stored = await current_stored_value(actions.pool, "layout.physics_max_bytes")
+    max_bytes = int(stored) if isinstance(stored, int | float) else _DEFAULT_PHYSICS_MAX_BYTES
+    needed = worst_k * worst_k * 16
+    if needed > max_bytes:
+        return (f"refusing: the worst single seeded grid cell holds {worst_k} points -- "
+                f"a quadratic fallback there would need ~{needed} bytes, over "
+                f"layout.physics_max_bytes={max_bytes}")
+    return None
+
+
 async def run_physics_migrate(actions: Actions) -> AsyncIterator[dict[str, Any]]:
     """THE PHYSICS LAYOUT's own migration door: a SINGLE global computation over the
     whole active population (never a batch loop -- see the module docstring for why),
     sharing `graph_layout._LAYOUT_LOCK_KEY` with the cron heartbeat and
     `run_layout_migrate` so nothing else touches graph_x/graph_y while this runs.
     Yields coarse stage receipts (not one per batch, since there are none) and a
-    final `{"done": True, "placed": N}`."""
+    final `{"done": True, "placed": N, "peak_rss_kb": N}` -- `_memory_guard` runs
+    first (THE OOM, Thoth mail 11097) and can yield a single `{"error": ...}` and
+    return instead, doing no work."""
     async with actions.pool.acquire() as lock_conn:
         if not await _try_acquire_layout_lock(lock_conn):
             yield {"error": "the layout heartbeat (or a migrate run) currently holds "
                             "the layout lock -- try again shortly"}
             return
         try:
+            object_ids = await _active_object_ids(actions)
+            if object_ids:
+                seed_vertex_ids: list[uuid.UUID | None] = list(object_ids)
+                reason = await _memory_guard(actions, _seed_positions(seed_vertex_ids))
+                if reason:
+                    yield {"error": reason}
+                    return
             yield {"stage": "computing"}
             positions = await _physics_positions(actions)
             yield {"stage": "writing", "count": len(positions)}
@@ -343,6 +393,7 @@ async def run_physics_migrate(actions: Actions) -> AsyncIterator[dict[str, Any]]
                 batch_ids = ids[start:start + chunk]
                 await _bulk_assert_positions(
                     actions, {oid: positions[oid] for oid in batch_ids}, now)
-            yield {"done": True, "placed": len(positions)}
+            peak_rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            yield {"done": True, "placed": len(positions), "peak_rss_kb": peak_rss_kb}
         finally:
             await _release_layout_lock(lock_conn)
