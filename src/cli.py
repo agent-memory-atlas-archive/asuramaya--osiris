@@ -785,6 +785,24 @@ async def cmd_layout(
                 rss_note = (
                     f" [peak {receipt['peak_rss_kb'] / 1024:.0f} MB]"
                     if "peak_rss_kb" in receipt else "")
+                top5_note = ""
+                if "layout_top5_linked_pairs" in receipt:
+                    lines = "".join(
+                        f"\n    {p['link_count']:.0f} links: dist {p['centroid_distance']:.1f} "
+                        f"vs. 2x radii-sum {2 * p['radii_sum']:.1f} "
+                        f"({'OK' if p['within_2x_radii_sum'] else 'FAR'})"
+                        for p in receipt["layout_top5_linked_pairs"])
+                    top5_note = f"\n  top-5 most-linked project pairs:{lines}"
+                long_edge_note = ""
+                if "layout_long_edge_total" in receipt:
+                    by_type = "".join(
+                        f"\n    {t['type']}: {t['count']}"
+                        for t in receipt.get("layout_long_edge_by_type_top8", []))
+                    relocated = receipt.get("layout_container_vertices_relocated", "n/a")
+                    long_edge_note = (
+                        f"\n  edges over 20k units: {receipt['layout_long_edge_total']}"
+                        f"{by_type}"
+                        f"\n  container vertices relocated to hub zone: {relocated}")
                 acceptance_note = (
                     f"\n  bbox width {receipt['layout_bbox_width']}"
                     f"\n  min top-10 centroid gap vs. R_a+R_b: "
@@ -793,7 +811,8 @@ async def cmd_layout(
                     f"{receipt['layout_biggest_project_5nn_purity']}"
                     f"\n  communities: {receipt.get('community_count', 'n/a')} "
                     f"({receipt.get('community_seed_scheme', 'n/a')})"
-                    if "layout_bbox_width" in receipt else "")
+                    f"{top5_note}{long_edge_note}"
+                    if "layout_bbox_width" in receipt else f"{top5_note}{long_edge_note}")
                 if "error" in receipt:
                     print(f"osiris layout: {receipt['error']}{rss_note}{declump_note}"
                           f"{acceptance_note}", file=sys.stderr)

@@ -311,6 +311,24 @@ async def test_fetch_snapshot_nameless_agent_falls_back_to_seat_handle_and_gener
     assert out["labels"][idx] == "Nefer"
 
 
+async def test_fetch_snapshot_nameless_seat_holder_generation_is_uppercase_roman(
+    actions: Actions,
+) -> None:
+    """Thoth mail 11283: "unify the roman case... 'Thoth CVI' and 'Sekhmet
+    XXXVIII' is how the fleet already writes them" -- the seat-branch's own
+    generation display, previously lowercase."""
+    now = datetime.now(UTC)
+    seat = await actions.create_or_find_object("Seat", "seat:gs-nameless-roman", "test")
+    await actions.assert_property(seat, "handle", "Thoth", "test", now, 0.9)
+    agent = await actions.create_or_find_object("Agent", "agent:gs-nameless-roman-vii", "test")
+    await actions.create_link(agent, seat, "holds", "test", now, 1.0)
+
+    await layout_batch(actions, limit=1000)
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    idx = out["object_ids"].index(str(agent))
+    assert out["labels"][idx] == "Thoth VII"
+
+
 async def test_fetch_snapshot_nameless_agent_without_a_seat_falls_back_to_patronym_and_model(
     actions: Actions,
 ) -> None:

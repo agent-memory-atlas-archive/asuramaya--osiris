@@ -223,6 +223,16 @@ _HUB_DEGREE_THRESHOLD = 1000  # this house's own measured population: 11 objects
                               # 1,000 structural-degree, 84 over 100 -- 1,000 catches the
                               # unambiguous hubs (principal Persons, the biggest projects)
                               # without pulling in every moderately-busy object
+_MEMBERSHIP_CONTAINER_LINK_TYPES = frozenset({"in_repo", "works_in", "holds", "member_of"})
+                              # THE LONG EDGES RULING tip (d): the subset of
+                              # CONTAINER_LINK_TYPES that names an actual
+                              # membership home (a SoftwareProject, a Seat) --
+                              # deliberately excludes acts_for/spawned_by, which
+                              # model delegation/lineage, not membership, and
+                              # whose own targets (a Person, a coordinator) are
+                              # exactly the operator's own "keep the zone" case.
+                              # See `_hub_ids`'s own docstring for why this is
+                              # narrower than the module-wide constant.
 
 
 def _hash01(key: str) -> float:
@@ -771,7 +781,28 @@ async def _hub_ids(actions: Actions, ids: list[uuid.UUID]) -> set[uuid.UUID]:
     """Objects whose STRUCTURAL-edge degree meets `_HUB_DEGREE_THRESHOLD` -- these get
     pinned to rank 0 within their own (project, type) group (dead center of that
     group's own sunflower disc) rather than an ordinary creation-order rank, per THE
-    READING LAYER's own "the hub's cluster contains the hub" acceptance line."""
+    READING LAYER's own "the hub's cluster contains the hub" acceptance line.
+
+    THE LONG EDGES RULING tip (d) (operator, grounds d7d55257): a MEMBERSHIP
+    container (any object that is the TARGET of a live in_repo/works_in/holds/
+    member_of link -- a SoftwareProject, a Seat) is NEVER a hub-zone candidate,
+    however high its own structural degree measures -- ruling d7d55257 already
+    says "the container node is placed AT the centroid it earns", and
+    `graph_physics`'s own level-2 machinery (or, for a non-project container,
+    `_place_unfiled`'s now-widened neighbour-mean) already gives it exactly that
+    position. Pulling a container into the hub zone on top of that doesn't just
+    relocate one vertex -- it breaks every one of ITS OWN members' container
+    edges at once (measured live: 9 of 43 active projects were hub-classified
+    this way, in_repo alone contributing 12,063 of 37,810 edges over 20k world
+    units).
+
+    DELIBERATELY NARROWER than `CONTAINER_LINK_TYPES` (which also includes
+    acts_for/spawned_by): those two model delegation/lineage, not membership,
+    and their own targets are exactly the "non-container hubs (a Person, a
+    coordinator) keep the zone" case the operator's own ruling named --
+    `test_hub_ids_finds_a_structural_high_degree_object`'s own Person-via-
+    acts_for specimen would silently stop being a hub under the wider set,
+    caught by running that test before committing to which subset this meant."""
     if not ids:
         return set()
     rows = await actions.pool.fetch(
@@ -782,8 +813,14 @@ async def _hub_ids(actions: Actions, ids: list[uuid.UUID]) -> set[uuid.UUID]:
         "  SELECT to_id AS node, type FROM links "
         "    WHERE valid_until IS NULL OR valid_until > now()"
         ") x WHERE type = ANY($2::text[]) AND node = ANY($1::uuid[]) "
+        "  AND node NOT IN ("
+        "    SELECT DISTINCT to_id FROM links "
+        "    WHERE type = ANY($4::text[]) "
+        "      AND (valid_until IS NULL OR valid_until > now())"
+        "  ) "
         "GROUP BY node HAVING count(*) >= $3",
-        ids, list(STRUCTURAL_LINK_TYPES), _HUB_DEGREE_THRESHOLD)
+        ids, list(STRUCTURAL_LINK_TYPES), _HUB_DEGREE_THRESHOLD,
+        list(_MEMBERSHIP_CONTAINER_LINK_TYPES))
     return {r["node"] for r in rows}
 
 

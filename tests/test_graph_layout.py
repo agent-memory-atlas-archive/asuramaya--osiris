@@ -506,6 +506,29 @@ async def test_hub_ids_finds_a_structural_high_degree_object(actions: Actions) -
     assert hub in found
 
 
+async def test_hub_ids_excludes_a_high_degree_membership_container(
+    actions: Actions,
+) -> None:
+    """THE LONG EDGES RULING tip (d) (operator, grounds d7d55257): a
+    SoftwareProject with high structural degree (every member's own in_repo
+    edge counts toward it) must NEVER be classified as a hub -- pulling its
+    own identity vertex into the hub zone would break every one of its
+    members' in_repo edges at once. `acts_for`'s own Person target (the test
+    above) stays a hub unchanged -- only membership containers are excluded."""
+    from src.orchestrator.graph_layout import _HUB_DEGREE_THRESHOLD
+
+    proj = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gl-rl-container-hub", "test")
+    now = datetime.now(UTC)
+    for i in range(_HUB_DEGREE_THRESHOLD + 1):
+        member = await actions.create_or_find_object(
+            "Thread", f"thread:gl-rl-container-hub-{i}", "test")
+        await actions.create_link(member, proj, "in_repo", "test", now, 1.0)
+
+    found = await _hub_ids(actions, [proj])
+    assert proj not in found
+
+
 async def test_hub_ids_excludes_an_ordinary_low_degree_object(actions: Actions) -> None:
     oid = await actions.create_or_find_object("Thread", "thread:gl-rl-not-a-hub", "test")
     found = await _hub_ids(actions, [oid])
