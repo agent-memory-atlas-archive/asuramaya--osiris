@@ -107,7 +107,7 @@ def test_ego_layout_uses_the_stable_whole_graph_scale_not_the_transient_zoom() -
 
 
 def test_ego_fit_has_a_real_minimum_view_size() -> None:
-    body = _SPACE_JS.split("function renderFocusEgoGroups(id, hopsUp, hopsDown)", 1)[1][:1600]
+    body = _SPACE_JS.split("function renderFocusEgoGroups(id, hopsUp, hopsDown)", 1)[1][:2000]
     assert "const EGO_FIT_MIN_VIEWSIZE = 400;" in body
     assert "viewSize = Math.max(EGO_FIT_MIN_VIEWSIZE, " \
         "Math.min(maxViewSize, span * 1.6 + 40));" in body

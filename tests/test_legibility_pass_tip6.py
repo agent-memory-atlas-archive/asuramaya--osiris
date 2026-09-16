@@ -99,7 +99,7 @@ def test_focus_label_is_bigger_than_a_merely_lit_label() -> None:
     for html in ("index.html", "space.html"):
         page = (_STATIC / html).read_text()
         assert ".lbl.focus-label { font-size: 13px" in page
-    body = _SPACE_JS.split("function positionLabels()", 1)[1][:1500]
+    body = _SPACE_JS.split("function positionLabels()", 1)[1][:2200]
     assert '(nd.id === pathFocusId ? " focus-label" : "")' in body
     assert "positionFocusRing();" in body
 
@@ -202,3 +202,74 @@ def test_bundle_threshold_is_measured_in_real_screen_pixels_not_world_units() ->
     body = _SPACE_JS.split("function updatePathEdges()", 1)[1][:900]
     assert "const wpp = worldPerPx();" in body
     assert "const screenLen = worldLen / wpp;" in body
+
+
+# --- w306 review BLOCKER (Thoth mail 11308): focus-set physics diverges to a non-finite --
+# camera on a real high-degree Thread/Decision -------------------------------------------
+
+def test_repulsion_has_a_real_minimum_separation_not_a_1_unit_floor() -> None:
+    # live-verified root cause: buildEgoGroups' own angle-only fan at a constant radius put
+    # genuinely different members at the exact same (x,y) once a bucket's own angular
+    # spread wrapped past 2*PI (a real 154-member Message bucket, or repeated "more" clicks
+    # growing `take` past ~79 at the old 0.08 rad step) -- dozens of exactly-coincident
+    # pairs each computing a force under the old d2=max(d2,1) floor summed to an enormous
+    # single-iteration displacement, compounding over 180 iterations into non-finite
+    # territory. EGO_MIN_SEP2=400 bounds any ONE pair's force to EGO_REPULSION/400=8.
+    assert "const EGO_MIN_SEP2 = 400;" in _SPACE_JS
+    body = _SPACE_JS.split("function relaxPositions(seed, springs, fixedId)", 1)[1][:900]
+    assert "if (d2 < EGO_MIN_SEP2) d2 = EGO_MIN_SEP2;" in body
+
+
+def test_per_iteration_displacement_is_capped_regardless_of_pileup_size() -> None:
+    # a hard ceiling independent of the min-separation fix above -- even a bounded PER-PAIR
+    # force can still sum to something enormous if enough pairs pile onto one point in the
+    # same iteration; this caps the TOTAL displacement a single node can take in one step.
+    assert "const EGO_MAX_DISPLACEMENT = 400;" in _SPACE_JS
+    body = _SPACE_JS.split("function relaxPositions(seed, springs, fixedId)", 1)[1][:1700]
+    assert "if (mag > EGO_MAX_DISPLACEMENT) {" in body
+
+
+def test_a_diverged_relax_falls_back_to_the_finite_pre_relax_seed() -> None:
+    # the last-resort net: if positions STILL go non-finite despite the two guards above,
+    # feed the camera fit the original (always-finite, pure arithmetic) seed instead of
+    # NaN/Infinity -- what actually produced the black-canvas symptom live.
+    body = _SPACE_JS.split("function relaxedOrSeed(seed, relaxed)", 1)[1][:400]
+    assert "if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) return seed;" in body
+    for fn in ("function applyEgoLayout(focusId, hopsUp, hopsDown, extraSeed)",
+               "async function renderContainerDrill(id, opts)"):
+        call_body = _SPACE_JS.split(fn, 1)[1][:5700]
+        assert "relaxedOrSeed(seed, relaxPositions(seed, springs," in call_body
+
+
+def test_group_seeding_spirals_instead_of_a_constant_radius_circle() -> None:
+    # structural defence alongside the physics-side fixes: a growing radius per index means
+    # no two members can land at the exact same seed regardless of how large a bucket or a
+    # repeatedly-"more"-clicked page gets.
+    body = _SPACE_JS.split("function buildEgoGroups(id, hub)", 1)[1][:4300]
+    assert "const r2 = ringR * 1.3 + k * 2;" in body
+    assert "const r2 = ringR + i * 2;" in body
+
+
+# --- w306 review: chain labels still walled up, expansion left the table stale -----------
+
+def test_chain_labels_declutter_past_generation_1_not_every_single_one() -> None:
+    # live-verified: "lit labels always win their spot" flooded the view once a real
+    # succession chain (up to 50+ pinned members, ALL lit since they're all in
+    # pathReachable) tried to show every single one at once. A chain member keeps the
+    # always-shown guarantee only at generation 1 or a multiple of 5.
+    body = _SPACE_JS.split("function positionLabels()", 1)[1][:1700]
+    assert "const generation = lit ? computeGeneration(nd) : null;" in body
+    assert "const chainDeclutters = generation != null && generation !== 1 " \
+        "&& generation % 5 !== 0;" in body
+    assert "if ((!lit || chainDeclutters) && overlapsPlaced(x, y))" in body
+
+
+def test_group_expansion_notifies_the_table_not_just_the_initial_focus() -> None:
+    # live-verified: onFocus (console.js's own onSpaceFocus -> renderEntityExplorerStage ->
+    # hydrateFocusReachable) used to fire only from focusObject's own initial call; a
+    # group/"more" click re-renders through renderFocusEgoGroups directly and never told
+    # the table pathReachable had grown, so it stayed at the pre-expansion row count.
+    # Live-verified after the fix: table rows == pathReachable.size (281 == 281) after a
+    # real expansion, not stuck at the pre-expansion count.
+    body = _SPACE_JS.split("function renderFocusEgoGroups(id, hopsUp, hopsDown)", 1)[1][:900]
+    assert "if (onFocus) onFocus(id);" in body
