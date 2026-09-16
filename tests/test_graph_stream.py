@@ -329,6 +329,30 @@ async def test_fetch_snapshot_nameless_seat_holder_generation_is_uppercase_roman
     assert out["labels"][idx] == "Thoth VII"
 
 
+async def test_fetch_snapshot_seat_succession_canonical_reads_the_real_generation(
+    actions: Actions,
+) -> None:
+    """THE SEAT-GENERATION FIX (Thoth mail 11309, w306 review): a seat-succession
+    canonical (agent:seat-<id>-g<N>) stamps its own ordinal as a seat_generation
+    ASSERTION, not in the canonical string the way an ordinary lineage id is --
+    _generation(canonical) silently read 1 for a low "-g3" suffix (it only
+    recognizes "-g<N>" as a generation marker for N > 39, the numeric-overflow
+    escape hatch), dropping the numeral and printing a bare "Sekhmet" instead of
+    "Sekhmet III". live specimen: agent:seat-af50a33e-g45 and kin."""
+    now = datetime.now(UTC)
+    seat = await actions.create_or_find_object("Seat", "seat:gs-succession-gen", "test")
+    await actions.assert_property(seat, "handle", "Sekhmet", "test", now, 0.9)
+    agent = await actions.create_or_find_object(
+        "Agent", "agent:seat-gs-succession-gen-g3", "test")
+    await actions.assert_property(agent, "seat_generation", "3", "test", now, 0.9)
+    await actions.create_link(agent, seat, "holds", "test", now, 1.0)
+
+    await layout_batch(actions, limit=1000)
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    idx = out["object_ids"].index(str(agent))
+    assert out["labels"][idx] == "Sekhmet III"
+
+
 async def test_fetch_snapshot_nameless_agent_without_a_seat_falls_back_to_patronym_and_model(
     actions: Actions,
 ) -> None:
