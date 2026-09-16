@@ -143,12 +143,20 @@ project/type/connected-band ranking), a new object now seeds at the CENTROID of 
 already-placed semantic neighbours and live container objects (`_live_containers_of`/
 `_centroid_seed`) -- "initialise at the centroid of placed neighbours (or the
 container centroid)" -- then the SAME bounded local relax as before nudges it from
-that seed, with every already-placed object still pinned. The old sunflower
-functions (`_adjacency_ranks`, `adjacency_position`, `_project_halo_base`,
-`_project_connected_counts`, `_place_projects`, `_relax_projects`, `project_center`)
-are DELIBERATELY LEFT IN PLACE, now unused by any live code path -- a disclosed
-cleanup debt (flagged to Thoth, not silently carried) rather than a large destructive
-removal pass bundled into this same change; their own tests still pass unchanged.
+that seed, with every already-placed object still pinned.
+
+THE DEAD SUNFLOWER CODE REMOVAL (bbox compactness follow-up, decision cc2f2ea7):
+the ADJACENCY/HALO band scheme this section replaced (`_adjacency_ranks`,
+`adjacency_position`, `_project_halo_base`, `_project_connected_counts`, plus the
+`_INNER_BASE`/`_HALO_BASE`/`_HALO_MARGIN`/`_HALO_MIN`/`_UNFILED_KEY` constants that
+existed only to feed it) genuinely had zero callers anywhere and has been removed.
+`_place_projects`, `_relax_projects` and `project_center` were WRONGLY grouped with
+that dead scheme by an earlier version of this same paragraph -- a stale claim,
+caught before it caused a live deletion: all three are THE READING LAYER's own
+(ruling c5953bb1) still-live machinery, called directly by `layout_batch` below for
+every newly-arriving SoftwareProject and the unfiled sentinel's own center. A
+comment naming its own dead siblings is exactly the kind of claim that needs a real
+grep before it's trusted, not just re-quoted forward.
 
 graph_layout_v bumped again (6 -> 7) to force the one-time migration this change
 needs -- run via graph_physics.run_physics_migrate, NOT `run_layout_migrate`'s own
@@ -183,7 +191,6 @@ _LAYOUT_VERSION_PROP = "graph_layout_v"
 _LAYOUT_VERSION = 8  # bump this to force one migration pass over every already-placed object
 _RELAX_ITERATIONS = 6  # "a FEW iterations" -- a nudge on top of the deterministic base,
                        # never enough to erase the sunflower structure
-_UNFILED_KEY = "unfiled"  # the same sentinel /graph/supernodes already uses for no-in_repo
 _GOLDEN_ANGLE = math.pi * (3.0 - math.sqrt(5.0))
 
 # spacing constants, sized against this house's OWN measured population (live, via
@@ -193,15 +200,8 @@ _GOLDEN_ANGLE = math.pi * (3.0 - math.sqrt(5.0))
 # (Commit alone 6,273, radius ~1,188 at the same spacing) across 40 real projects total.
 _NODE_SPACING = 15.0  # minimum pairwise spacing within one (project, connected) sunflower disc
 _MIN_SEPARATION = _NODE_SPACING  # hard floor the post-relax declump pass enforces
-_PROJECT_SPACING = 5000.0  # unfiled's own fixed seed spacing (see _UNFILED_KEY below) --
+_PROJECT_SPACING = 5000.0  # unfiled's own fixed seed spacing for `project_center` --
                            # real projects are placed by _relax_projects instead, below
-
-# THE LEGIBILITY PASS additions (ruling e1cb9e3b, tip 2h) -------------------------------
-_INNER_BASE = 0.0  # the CONNECTED band starts right at the project center -- no ring offset
-_HALO_BASE = 6000.0  # the DEFAULT/fallback halo offset (unfiled, and any caller that
-                     # doesn't have a per-project count handy, e.g. this module's own
-                     # pure-function tests) -- superseded per real project by
-                     # `_project_halo_base` below (DENSITY NOT DISCS tip (g))
 
 # THE READING LAYER additions ----------------------------------------------------------
 _PROJECT_GUTTER = 50.0  # small, fixed clearance on top of a pair's own spacing (DENSITY
@@ -219,13 +219,6 @@ _PROJECT_SPACING_K = 4.0  # DENSITY NOT DISCS tip (f): the old minimum inter-pro
 _PROJECT_RELAX_ITERATIONS = 300  # small N (a few dozen projects) -- cheap even at this
                                  # iteration count, and the weighted spring needs more
                                  # rounds than the object-level relax to actually settle
-_HALO_MARGIN = 1.8  # DENSITY NOT DISCS tip (g): same margin ratio the old flat 6000.0
-                    # constant carried against its own worst-case population (6000 /
-                    # ~3354 units at 50,000 connected members ~= 1.79), applied instead
-                    # to THIS project's own live connected count, so a small project's
-                    # halo wraps its own cluster tightly instead of the shared worst case
-_HALO_MIN = 200.0  # floor so a tiny or empty-of-connections project still gets a little
-                   # real clearance between its inner disc and its halo ring
 _HUB_DEGREE_THRESHOLD = 1000  # this house's own measured population: 11 objects over
                               # 1,000 structural-degree, 84 over 100 -- 1,000 catches the
                               # unambiguous hubs (principal Persons, the biggest projects)
@@ -262,42 +255,6 @@ def project_center(rank: int) -> tuple[float, float]:
     anyway. Kept as a plain sunflower point (not just a hardcoded origin) so a future
     caller with a real reason to rank unfiled-like sentinels can still do so."""
     return _sunflower_point(rank, _PROJECT_SPACING)
-
-
-def _project_halo_base(connected_count: int) -> float:
-    """DENSITY NOT DISCS tip (g): this project's OWN halo offset, tight around its own
-    connected disc's real extent instead of one flat worst-case constant shared by
-    every project regardless of size -- same margin ratio `_HALO_BASE` carried against
-    the global worst case (see `_HALO_MARGIN`'s own docstring), applied here to this
-    project's own live connected-member count. Floored at `_HALO_MIN` so a tiny or
-    empty project still gets a little real clearance rather than a halo ring sitting
-    right on top of its own (near-empty) inner disc."""
-    return max(_HALO_MIN, _HALO_MARGIN * _NODE_SPACING * math.sqrt(connected_count + 0.5))
-
-
-def adjacency_position(
-    center: tuple[float, float], connected: bool, rank_in_group: int,
-    *, halo_base: float = _HALO_BASE,
-) -> tuple[float, float]:
-    """THE LEGIBILITY PASS (ruling e1cb9e3b, tip 2h): the placement rule itself, TYPE
-    RINGS GONE -- a sunflower disc for the object's own (project, connected) band,
-    keyed on its permanent rank within that band, offset outward from the band's own
-    fixed base radius (`_INNER_BASE` for connected, `halo_base` for halo -- so the
-    halo band always starts well clear of the inner disc's own worst-case extent). A
-    pure function of (center, connected, rank, halo_base) alone -- recomputing it for
-    the same inputs always lands on the same point.
-
-    `halo_base` (DENSITY NOT DISCS tip (g)) defaults to the old flat `_HALO_BASE` for
-    any caller without a real per-project figure handy (unfiled, this module's own
-    pure-function tests) -- `layout_batch` passes `_project_halo_base`'s own per-
-    project result for every real project instead."""
-    cx, cy = center
-    base_r = _INNER_BASE if connected else halo_base
-    lx, ly = _sunflower_point(rank_in_group, _NODE_SPACING)
-    local_r = math.hypot(lx, ly)
-    angle = math.atan2(ly, lx)
-    radius = base_r + local_r
-    return cx + radius * math.cos(angle), cy + radius * math.sin(angle)
 
 
 async def unplaced_batch(actions: Actions, limit: int = _BATCH_SIZE) -> list[uuid.UUID]:
@@ -370,104 +327,6 @@ async def _project_and_type(
         "ORDER BY o.id, l.id",
         ids)
     return {r["id"]: (r["project_id"], r["type"]) for r in rows}
-
-
-async def _adjacency_ranks(
-    actions: Actions, ids: list[uuid.UUID],
-) -> dict[uuid.UUID, tuple[bool, int]]:
-    """THE LEGIBILITY PASS (ruling e1cb9e3b, tip 2h): each id's own (connected, rank)
-    -- `connected` is whether the object carries ANY live semantic-classified edge at
-    all (globally, not scoped to this project -- the same reading `_hub_ids` already
-    uses for structural degree), `rank` is its PERMANENT rank within its (project,
-    connected) band, `ROW_NUMBER() OVER (PARTITION BY project, connected ORDER BY
-    created_at, id)`, computed over the WHOLE active population in one indexed
-    window-function scan so a rank, once assigned, can never change -- a
-    later-created sibling only ever takes a higher, not-yet-used rank in the SAME
-    band. `semantic_ids` is a flat pre-pass (every node touched by a non-structural
-    link) rather than a per-row correlated subquery -- the same shape `_hub_ids`'s
-    own UNION ALL degree count uses, cheap at this house's ~49k-object scale. The
-    inner DISTINCT ON mirrors `_project_and_type`'s own multi-in_repo-link tie-break
-    (lowest link id wins). `project_key` is the SAME THE MEMBERSHIP UNION FIX
-    (ruling d7d55257, Thoth mail 11221) `_project_and_type` uses -- in_repo,
-    falling back to a `project` assertion mapped to its repo object's canonical,
-    falling back to `_UNFILED_KEY` only when neither exists."""
-    if not ids:
-        return {}
-    rows = await actions.pool.fetch(
-        "WITH semantic_ids AS ("
-        "  SELECT DISTINCT node FROM ("
-        "    SELECT from_id AS node, type FROM links "
-        "      WHERE valid_until IS NULL OR valid_until > now() "
-        "    UNION ALL "
-        "    SELECT to_id AS node, type FROM links "
-        "      WHERE valid_until IS NULL OR valid_until > now()"
-        "  ) x WHERE type <> ALL($3::text[])"
-        "), members AS ("
-        "  SELECT DISTINCT ON (o.id) o.id, o.created_at, "
-        "    COALESCE(p.canonical, ap.canonical, $2) AS project_key, "
-        "    (s.node IS NOT NULL) AS connected "
-        "  FROM objects o "
-        "  LEFT JOIN links l ON l.from_id=o.id AND l.type='in_repo' "
-        "    AND (l.valid_until IS NULL OR l.valid_until > now()) "
-        "  LEFT JOIN objects p ON p.id=l.to_id AND p.type='SoftwareProject' "
-        "  LEFT JOIN current_assertions a ON a.object_id=o.id AND a.name='project' "
-        "  LEFT JOIN objects ap ON ap.type='SoftwareProject' "
-        "    AND ap.canonical = 'repo:' || (a.value #>> '{}') "
-        "  LEFT JOIN semantic_ids s ON s.node = o.id "
-        "  WHERE o.status NOT IN ('archived','merged','retired') "
-        "  ORDER BY o.id, l.id"
-        "), ranked AS ("
-        "  SELECT id, connected, row_number() OVER ("
-        "    PARTITION BY project_key, connected ORDER BY created_at, id"
-        "  ) - 1 AS rank_in_group "
-        "  FROM members"
-        ") SELECT id, connected, rank_in_group FROM ranked WHERE id = ANY($1::uuid[])",
-        ids, _UNFILED_KEY, list(STRUCTURAL_LINK_TYPES))
-    return {r["id"]: (bool(r["connected"]), int(r["rank_in_group"])) for r in rows}
-
-
-async def _project_connected_counts(
-    actions: Actions,
-) -> dict[uuid.UUID | None, int]:
-    """DENSITY NOT DISCS tip (g): every project's own CURRENT connected-member count
-    (None key for the unfiled bucket) -- the same `members`/`semantic_ids` shape
-    `_adjacency_ranks` already builds, computed over the whole active population once
-    per tick (same cost class that function already pays, no new class of query).
-
-    NOT A PERFECT FOREVER GUARANTEE, disclosed rather than silently assumed: a
-    project's connected count only ever grows, so `_project_halo_base` computed from
-    it also only ever grows -- but an object placed EARLIER against a smaller halo
-    base keeps that fixed absolute position forever (this module's own incrementality
-    rule), while that same project's connected band keeps extending outward as more
-    connected members arrive. For a project growing fast enough, a later connected
-    member could in principle reach an earlier halo member's own fixed radius before
-    a later halo placement's own (by-then-larger) base would have cleared it. The
-    `_HALO_MARGIN` safety factor makes this a slow-growth-only risk, not a redesign
-    the way the old flat 6000.0 constant needed one -- same category of measured,
-    documented tradeoff as this module's other spacing constants, not a hidden one."""
-    rows = await actions.pool.fetch(
-        "WITH semantic_ids AS ("
-        "  SELECT DISTINCT node FROM ("
-        "    SELECT from_id AS node, type FROM links "
-        "      WHERE valid_until IS NULL OR valid_until > now() "
-        "    UNION ALL "
-        "    SELECT to_id AS node, type FROM links "
-        "      WHERE valid_until IS NULL OR valid_until > now()"
-        "  ) x WHERE type <> ALL($1::text[])"
-        "), members AS ("
-        "  SELECT DISTINCT ON (o.id) o.id, p.id AS project_id, "
-        "    (s.node IS NOT NULL) AS connected "
-        "  FROM objects o "
-        "  LEFT JOIN links l ON l.from_id=o.id AND l.type='in_repo' "
-        "    AND (l.valid_until IS NULL OR l.valid_until > now()) "
-        "  LEFT JOIN objects p ON p.id=l.to_id AND p.type='SoftwareProject' "
-        "  LEFT JOIN semantic_ids s ON s.node = o.id "
-        "  WHERE o.status NOT IN ('archived','merged','retired') "
-        "  ORDER BY o.id, l.id"
-        ") SELECT project_id, count(*) AS n FROM members WHERE connected "
-        "GROUP BY project_id",
-        list(STRUCTURAL_LINK_TYPES))
-    return {r["project_id"]: int(r["n"]) for r in rows}
 
 
 async def _neighbors_of(

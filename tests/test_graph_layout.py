@@ -18,23 +18,17 @@ from datetime import UTC, datetime
 import numpy as np
 from src.actions.core import Actions
 from src.orchestrator.graph_layout import (
-    _HALO_BASE,
-    _HALO_MIN,
     _LAYOUT_VERSION_PROP,
     _MIN_SEPARATION,
-    _adjacency_ranks,
     _declump,
     _hub_ids,
     _intra_project_neighbors,
     _neighbors_of,
     _place_projects,
     _project_and_type,
-    _project_connected_counts,
-    _project_halo_base,
     _relax_projects,
     _release_layout_lock,
     _try_acquire_layout_lock,
-    adjacency_position,
     layout_batch,
     positions_for,
     project_center,
@@ -97,77 +91,6 @@ def test_project_center_ranks_never_collide_across_a_realistic_range() -> None:
     for i in range(len(points)):
         for j in range(i + 1, len(points)):
             assert math.dist(points[i], points[j]) > 100
-
-
-def test_adjacency_position_is_deterministic_and_pure() -> None:
-    center = project_center(3)
-    p1 = adjacency_position(center, True, 7)
-    p2 = adjacency_position(center, True, 7)
-    assert p1 == p2
-
-
-def test_adjacency_position_halo_band_clears_the_connected_bands_own_extent() -> None:
-    """THE LEGIBILITY PASS (ruling e1cb9e3b): a zero-semantic-edge object sits in an
-    outer halo, strictly beyond even a large connected disc's own worst-case extent."""
-    center = project_center(0)
-    connected_pos = adjacency_position(center, True, 5000)
-    halo_pos = adjacency_position(center, False, 0)
-    r_connected = math.dist(center, connected_pos)
-    r_halo = math.dist(center, halo_pos)
-    assert r_halo > r_connected
-
-
-def test_adjacency_position_custom_halo_base_wraps_tighter_than_the_default() -> None:
-    """DENSITY NOT DISCS tip (g): a small project's own tight halo_base sits closer to
-    center than the old flat _HALO_BASE, still strictly beyond that project's own
-    connected disc -- the halo wraps the project's own cluster, not the whole plane."""
-    center = project_center(0)
-    tight_base = _project_halo_base(connected_count=10)
-    assert tight_base < _HALO_BASE
-    halo_pos = adjacency_position(center, False, 0, halo_base=tight_base)
-    assert math.dist(center, halo_pos) >= tight_base
-    assert tight_base >= _HALO_MIN
-
-
-def test_project_halo_base_grows_with_connected_count_but_never_below_the_floor() -> None:
-    assert _project_halo_base(0) == _HALO_MIN
-    assert _project_halo_base(1_000_000) > _project_halo_base(10)
-
-
-async def test_project_connected_counts_reflects_real_semantic_membership(
-    actions: Actions,
-) -> None:
-    project = await actions.create_or_find_object(
-        "SoftwareProject", "repo:gl-rl-halo-count", "test")
-    connected = await actions.create_or_find_object(
-        "Thread", "thread:gl-rl-halo-count-connected", "test")
-    friend = await actions.create_or_find_object(
-        "Thread", "thread:gl-rl-halo-count-friend", "test")
-    halo = await actions.create_or_find_object(
-        "Thread", "thread:gl-rl-halo-count-halo", "test")
-    now = datetime.now(UTC)
-    for oid in (connected, friend, halo):
-        await actions.create_link(oid, project, "in_repo", "test", now, 1.0)
-    await actions.create_link(connected, friend, "cites", "test", now, 1.0)
-
-    counts = await _project_connected_counts(actions)
-    assert counts.get(project, 0) == 2  # connected + friend, not halo
-
-
-def test_adjacency_position_ranks_within_one_band_never_collide_at_realistic_scale() -> None:
-    """The declump fix's whole point at the object level: a (project, connected) band
-    in the low thousands (this house's own real worst case is in the tens of
-    thousands) still gets every rank a distinct, well-separated point."""
-    center = project_center(0)
-    points = [adjacency_position(center, True, r) for r in range(500)]
-    seen: set[tuple[float, float]] = set()
-    for p in points:
-        rounded = (round(p[0], 3), round(p[1], 3))
-        assert rounded not in seen, "two ranks landed on the exact same point"
-        seen.add(rounded)
-    # a sampled spot-check of near neighbors (rank r and r+1) never collapse together
-    for r in range(0, 490, 37):
-        assert math.dist(points[r], points[r + 1]) > 0.5
 
 
 def test_intra_project_neighbors_drops_cross_project_edges() -> None:
@@ -615,41 +538,6 @@ async def test_layout_batch_still_places_a_structural_hub(
     assert math.isfinite(x) and math.isfinite(y)
 
 
-# --- THE LEGIBILITY PASS (ruling e1cb9e3b, tip 2h): semantic adjacency, no type rings --
-
-
-async def test_adjacency_ranks_splits_connected_and_halo_into_separate_bands(
-    actions: Actions,
-) -> None:
-    a = await actions.create_or_find_object("Thread", "thread:gl-lp-connected", "test")
-    b = await actions.create_or_find_object("Thread", "thread:gl-lp-connected-friend", "test")
-    halo = await actions.create_or_find_object("Thread", "thread:gl-lp-halo", "test")
-    await actions.create_link(a, b, "cites", "test", datetime.now(UTC), 1.0)  # semantic
-
-    out = await _adjacency_ranks(actions, [a, halo])
-    a_connected, a_rank = out[a]
-    halo_connected, halo_rank = out[halo]
-    assert a_connected is True
-    assert halo_connected is False
-    # each band ranks independently -- never assume the hermetic test DB's own
-    # unfiled/halo band is empty, just that both ranks are real, non-negative values
-    assert a_rank >= 0
-    assert halo_rank >= 0
-
-
-async def test_adjacency_ranks_object_with_only_a_structural_edge_is_halo(
-    actions: Actions,
-) -> None:
-    now = datetime.now(UTC)
-    proj = await actions.create_or_find_object("SoftwareProject", "repo:gl-lp-struct", "test")
-    oid = await actions.create_or_find_object("Thread", "thread:gl-lp-struct-member", "test")
-    await actions.create_link(oid, proj, "in_repo", "test", now, 1.0)  # structural only
-
-    out = await _adjacency_ranks(actions, [oid])
-    connected, _rank = out[oid]
-    assert connected is False
-
-
 async def test_project_and_type_falls_back_to_the_project_assertion(
     actions: Actions,
 ) -> None:
@@ -667,25 +555,6 @@ async def test_project_and_type_falls_back_to_the_project_assertion(
     project_id, obj_type = out[member]
     assert project_id == proj
     assert obj_type == "Thread"
-
-
-async def test_adjacency_ranks_project_key_falls_back_to_the_project_assertion(
-    actions: Actions,
-) -> None:
-    proj = await actions.create_or_find_object(
-        "SoftwareProject", "repo:gl-union-rank", "test")
-    member = await actions.create_or_find_object(
-        "Thread", "thread:gl-union-rank-member", "test")
-    now = datetime.now(UTC)
-    await actions.assert_property(member, "project", "gl-union-rank", "test", now, 1.0)
-    unfiled = await actions.create_or_find_object(
-        "Thread", "thread:gl-union-rank-unfiled", "test")
-
-    out = await _adjacency_ranks(actions, [member, unfiled, proj])
-    # a real assertion-only project_key never shares a band with the pure-unfiled
-    # sentinel -- both got SOME rank (never an exception), and they don't collide.
-    assert member in out
-    assert unfiled in out
 
 
 async def test_layout_batch_clusters_semantically_connected_objects_closer_than_halo(
