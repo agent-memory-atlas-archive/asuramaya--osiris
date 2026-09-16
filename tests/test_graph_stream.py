@@ -311,22 +311,67 @@ async def test_fetch_snapshot_nameless_agent_falls_back_to_seat_handle_and_gener
     assert out["labels"][idx] == "Nefer"
 
 
-async def test_fetch_snapshot_nameless_agent_without_a_seat_falls_back_to_model_and_project(
+async def test_fetch_snapshot_nameless_agent_without_a_seat_falls_back_to_patronym_and_model(
     actions: Actions,
 ) -> None:
-    """THE NAMELESS-AGENT LABEL FIX: no handle, no held Seat -- "Agent · <model> in
-    <project>", never the id."""
+    """THE AGENT IDENTITY FIX (operator ruling, grounds 9163b1c7): no handle, no
+    held Seat -- "<patronym> <ROMAN> · <model short>", never "?". Live count: this
+    is the 7,618-agent osiris shape the old "Agent · <model> in <project>"
+    fallback broke on, since that scheme never read `patronym` at all."""
     now = datetime.now(UTC)
-    project = await actions.create_or_find_object(
-        "SoftwareProject", "repo:gs-nameless-b", "test")
-    agent = await actions.create_or_find_object("Agent", "agent:gs-nameless-b", "test")
+    agent = await actions.create_or_find_object("Agent", "agent:gs-nameless-b-vii", "test")
     await actions.assert_property(agent, "source_model", "claude-sonnet-5", "test", now, 0.9)
-    await actions.create_link(agent, project, "works_in", "test", now, 1.0)
+    await actions.assert_property(agent, "patronym", "Sekhmet", "test", now, 0.9)
 
     await layout_batch(actions, limit=1000)
     out = decode_snapshot(await fetch_snapshot(actions.pool))
     idx = out["object_ids"].index(str(agent))
-    assert out["labels"][idx] == "Agent · claude-sonnet-5 in gs-nameless-b"
+    assert out["labels"][idx] == "Sekhmet VII · sonnet-5"
+
+
+async def test_fetch_snapshot_nameless_agent_generation_one_omits_the_roman_suffix(
+    actions: Actions,
+) -> None:
+    now = datetime.now(UTC)
+    agent = await actions.create_or_find_object("Agent", "agent:gs-nameless-gen1", "test")
+    await actions.assert_property(agent, "source_model", "claude-opus-5", "test", now, 0.9)
+    await actions.assert_property(agent, "patronym", "Imhotep", "test", now, 0.9)
+
+    await layout_batch(actions, limit=1000)
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    idx = out["object_ids"].index(str(agent))
+    assert out["labels"][idx] == "Imhotep · opus-5"
+
+
+async def test_fetch_snapshot_nameless_sidechain_agent_gets_the_sub_marker(
+    actions: Actions,
+) -> None:
+    now = datetime.now(UTC)
+    agent = await actions.create_or_find_object("Agent", "agent:gs-nameless-sub-iii", "test")
+    await actions.assert_property(agent, "source_model", "claude-sonnet-5", "test", now, 0.9)
+    await actions.assert_property(agent, "patronym", "Seshat", "test", now, 0.9)
+    await actions.assert_property(agent, "is_sidechain", True, "test", now, 0.9)
+
+    await layout_batch(actions, limit=1000)
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    idx = out["object_ids"].index(str(agent))
+    assert out["labels"][idx] == "Seshat III · sonnet-5 ⌊ sub"
+
+
+async def test_fetch_snapshot_nameless_agent_without_a_patronym_falls_back_to_canonical(
+    actions: Actions,
+) -> None:
+    """Never "?": a patronym-less, seat-less, handle-less Agent still resolves to a
+    real, resolvable name -- its own canonical short id, not a raw "?"."""
+    now = datetime.now(UTC)
+    agent = await actions.create_or_find_object("Agent", "agent:gs-nameless-nopat", "test")
+    await actions.assert_property(agent, "source_model", "claude-sonnet-5", "test", now, 0.9)
+
+    await layout_batch(actions, limit=1000)
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    idx = out["object_ids"].index(str(agent))
+    assert out["labels"][idx] == "gs-nameless-nopat"
+    assert "?" not in out["labels"][idx]
 
 
 async def test_fetch_snapshot_edge_weight_is_raw_flat_for_now(actions: Actions) -> None:
