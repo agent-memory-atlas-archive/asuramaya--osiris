@@ -201,7 +201,7 @@ def test_container_threshold_matches_the_ego_cap() -> None:
 
 def test_drill_hub_plus_one_count_node_per_member_type_paged_by_degree() -> None:
     assert "const DRILL_PAGE_SIZE = 50;" in _SPACE_JS
-    body = _SPACE_JS.split("function renderContainerDrill", 1)[1][:2200]
+    body = _SPACE_JS.split("function renderContainerDrill", 1)[1][:2600]
     assert "drillMembersByType" in body
     assert "DRILL_PAGE_SIZE * drillPageCount" in body
 
@@ -259,7 +259,7 @@ def test_the_inspector_follows_a_container_focus_too() -> None:
     # mail 11087's own second confirm ("the table drawer and the inspector follow the
     # focus set") -- the inspector half: renderContainerDrill's own trailing await mirrors
     # the ordinary focusObject's own trailing inspect(id) call.
-    body = _SPACE_JS.split("async function renderContainerDrill(id, opts)", 1)[1][:4000]
+    body = _SPACE_JS.split("async function renderContainerDrill(id, opts)", 1)[1][:5000]
     assert "await inspect(id);" in body
 
 
@@ -310,7 +310,106 @@ def test_project_stubs_are_capped_not_one_dom_div_per_boundary_node() -> None:
     # exactly this declutter problem (pickLabels' top-N-by-degree-in-viewport); stubs now
     # get the same bounded-and-sorted treatment -- keep the biggest, most-informative
     # counts, drop the rest, same "small counted stub" the doc comment always promised.
-    assert "const MAX_PROJECT_STUBS = 80;" in _SPACE_JS
-    body = _SPACE_JS.split("function buildProjectStubs()", 1)[1][:1400]
+    # Capped again to 20 (from 80) once THE STUB AGGREGATION FIX (mail 11241) made
+    # aggregation do most of the decluttering itself.
+    assert "const MAX_PROJECT_STUBS = 20;" in _SPACE_JS
+    body = _SPACE_JS.split("function buildProjectStubs()", 1)[1][:1600]
     assert "all.sort((a, b) => b.count - a.count);" in body
     assert "projectStubEntries = all.slice(0, MAX_PROJECT_STUBS);" in body
+
+
+# --- Thoth's live review of w299 (mail 11240/11241): four more real bugs live -------------
+# verification caught, all invisible to a synthetic string-presence test until now ---------
+
+def test_drill_expand_click_no_longer_wipes_its_own_just_set_state() -> None:
+    # live-verified, reproducible on every click: buildDrillDivs' own click handler sets
+    # drillExpandedType/drillPageCount THEN calls renderContainerDrill -- which used to run
+    # clearDrillState() unconditionally as its own first act, wiping exactly what the click
+    # had just set, before the function ever read it. Net effect: every type/"more" click
+    # silently did nothing (renderContainerDrill DID run, drillExpandedType came back null
+    # regardless). Now only resets on an actual container change.
+    body = _SPACE_JS.split("disposeProjectAnchors(); // a drill replaces", 1)[1][:1000]
+    assert "if (drillContainerId !== id) clearDrillState();" in body
+    assert "else disposeDrillDivs();" in body
+
+
+def test_fit_and_a_filter_change_both_refit_to_the_visible_set_not_the_whole_graph() -> None:
+    # live-verified: "after picking osiris the canvas rendered fully black until Fit, and
+    # Fit must fit the VISIBLE set, not the whole graph." fitBtn and both filter setters
+    # used to hand fitToNodes the raw, unfiltered idToNode -- correct only for the very
+    # first load (nothing is hidden yet), wrong forever after.
+    assert "function visibleNodesForFit() {" in _SPACE_JS
+    assert "return idToNode.filter(nodeVisible);" in _SPACE_JS
+    fit_body = _SPACE_JS.split('fitBtn.addEventListener("click", () => {', 1)[1][:150]
+    assert "fitToNodes(visibleNodesForFit());" in fit_body
+    # context-restore correctly still fits raw idToNode -- nothing is hidden yet right
+    # after a GPU context loss rebuild, so "visible" and "everything" are the same set;
+    # the initial load fits its own local `nodes` var (same set, different name). Only the
+    # fit button and the two filter setters had the bug.
+    assert _SPACE_JS.count("fitToNodes(idToNode);") == 1
+    types_body = _SPACE_JS.split("function setHiddenTypes(types)", 1)[1][:600]
+    assert "fitToNodes(visibleNodesForFit());" in types_body
+    projects_body = _SPACE_JS.split("function setHiddenProjects(projects)", 1)[1][:1200]
+    assert "fitToNodes(visibleNodesForFit());" in projects_body
+
+
+def test_project_stubs_are_aggregated_by_project_pair_not_by_individual_node() -> None:
+    # live-verified: 80 (now-capped) per-node stubs rooted in the same visible project all
+    # read "+N in unfiled" stacked on the same spot -- two bugs, not one. (a) "unfiled" is
+    # never a real, pickable project (the repo dropdown never lists it), so it must never
+    # read as a hidden-project boundary at all -- scoped to stub-building only, NOT to
+    # nodeVisible itself (an earlier attempt at this fix made every unfiled object ignore
+    # the project filter entirely, confirmed live as a real regression -- ~20k points that
+    # should have been hidden stayed visible -- and was reverted). (b) grouping by
+    # individual boundary node was the wrong unit; regrouped to (visible node's own
+    # project, hidden project), aggregated across every node in that pair.
+    body = _SPACE_JS.split("function buildProjectStubs()", 1)[1][:1600]
+    assert 'if (hiddenNd.project === "unfiled") continue;' in body
+    assert "const key = `${visible.project}|${hiddenNd.project}`;" in body
+    assert "visibleProject: visible.project, hiddenProject: hiddenNd.project," in body
+    # nodeVisible itself stays untouched by the unfiled carve-out -- the revert.
+    nv_body = _SPACE_JS.split("function nodeVisible(nd)", 1)[1][:400]
+    assert 'nd.project !== "unfiled"' not in nv_body
+
+
+def test_project_stubs_de_overlap_when_they_share_a_centroid() -> None:
+    # live-verified: aggregation alone still leaves every hidden-project stub rooted in the
+    # SAME visible project at roughly the same screen position ("stacked on one spot").
+    # positionProjectStubs now nudges a colliding stub down past whatever already claimed
+    # that screen slot -- the same greedy idea positionLabels' own overlapsPlaced uses.
+    body = _SPACE_JS.split("function positionProjectStubs()", 1)[1][:1100]
+    assert "placed.some((b) => Math.abs(b.x - x) < W && Math.abs(b.y - y) < H + GAP)" in body
+    assert "y += H + GAP;" in body
+
+
+def test_reveal_project_stub_matches_the_new_aggregated_entry_shape() -> None:
+    # revealProjectStub used to key off a single entry.nodeId; the aggregated entry has no
+    # such field any more (visibleProject/hiddenProject only) -- it now reveals every
+    # hidden-side node the (visibleProject, hiddenProject) pair touches, not just one node's
+    # own neighbours.
+    body = _SPACE_JS.split("function revealProjectStub(entry)", 1)[1][:700]
+    assert "entry.nodeId" not in body
+    assert "na.project === entry.visibleProject && nb.project === entry.hiddenProject" in body
+
+
+def test_table_drawer_hydrates_real_objects_for_reachable_ids_not_in_set() -> None:
+    # live-verified: expanding a drill's "Thread" count node opened 50 real Thread members
+    # (pathReachable went 1 -> 51) but the table drawer still read "No matching entities" --
+    # SET (console.js's own table data source) is a paginated recent-objects page,
+    # architecturally disjoint from a focus walk's own reachable ids in general. Bounded by
+    # the walk's own cap (MAX_EGO_NODES = 300) via the reachable set itself, never
+    # unbounded; cached per focus so re-renders don't refetch.
+    assert "async function hydrateFocusReachable(reachable, focusId)" in _CONSOLE_JS
+    assert "const FOCUS_HYDRATED_OBJECTS = new Map();" in _CONSOLE_JS
+    body = _CONSOLE_JS.split("function renderEntityExplorerStage()", 1)[1][:1400]
+    assert "hydrateFocusReachable(reachable, space.pathFocusId);" in body
+
+
+def test_edges_are_a_live_verification_debug_hook_too() -> None:
+    # added while chasing mail 11240's own "identify its link type and class" ask -- every
+    # other per-node debug fact (idToNode, drillNodeEntries, ...) was already a live getter;
+    # edges (edgeClass included) was the one live-verification kept having to reach for and
+    # not have, forcing a decodeSnapshot reimplementation each time. Same convention as the
+    # rest of this api object.
+    body = _SPACE_JS.split("const api = {", 1)[1][:400]
+    assert "get edges() { return edges; }," in body
