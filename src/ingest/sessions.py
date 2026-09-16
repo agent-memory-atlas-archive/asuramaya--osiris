@@ -163,8 +163,24 @@ def _repo_from_cwd(cwd: str | None) -> str | None:
     session working in a SUBDIRECTORY (e.g. <repo>/my) attributes to the project
     (the repo root), not the subdir basename — which minted a junk `repo:my`, caught in the
     provenance audit. Falls back to the basename when no `.git` is found (a non-repo dir).
-    Does filesystem IO (walks parents), so callers run it off the event loop."""
+    Does filesystem IO (walks parents), so callers run it off the event loop.
+
+    THE repo:seats BUG (DRAWING THE WHOLE GRAPH, thread 325ef660): the bare seat-office
+    CONTAINER (~/.osiris/seats) is not a git repo, so it fell all the way to the raw
+    basename fallback -- "seats", the exact phantom `offices.is_bare_office_root`
+    already guards `seats.resolve_project`/`agents.resolve_identity` against (ruling
+    577988ed). This is the SAME guard, applied at git-ingest's own choke point rather
+    than left unrewritten here: refuse rather than mint a phantom SoftwareProject from
+    the container root. A real seat's own office subdirectory (~/.osiris/seats/<handle>)
+    is deliberately NOT covered by this guard -- that basename guess is accepted by
+    design elsewhere in this house (`is_bare_office_root`'s own docstring), corrected
+    for a SEATED agent by the async, DB-backed `resolve_and_persist_seated_project`
+    on its next mount, not by this pure, cwd-only function."""
     if not cwd:
+        return None
+    from src.orchestrator.offices import is_bare_office_root
+
+    if is_bare_office_root(cwd):
         return None
     path = Path(cwd)
     for d in (path, *path.parents):

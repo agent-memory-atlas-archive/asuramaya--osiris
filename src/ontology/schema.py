@@ -485,6 +485,28 @@ _LINK_TYPES: tuple[LinkType, ...] = (
              "SystemSource — no source string is ever left minting a placeholder Agent "
              "again, and no closure is ever left edgeless).",
              ("Thread",), ("Agent", "Person", "SystemSource")),
+    LinkType("recorded_by", "The Agent whose source_id actually wrote this object's own "
+             "current `summary` assertion — an attribution edge, not a content claim "
+             "(the same shape as authored_by above). Minted by the ASSERTION LINKS "
+             "migration (DRAWING THE WHOLE GRAPH, thread 325ef660) from data that "
+             "already existed as an assertion's own source_id field.",
+             ("Decision", "Thread"), ("Agent",)),
+    LinkType("admitted_by", "The Agent an object's own `admitted_by` assertion names as "
+             "having admitted it. Minted by the ASSERTION LINKS migration (DRAWING "
+             "THE WHOLE GRAPH, thread 325ef660) from the pre-existing property.",
+             ("Thread",), ("Agent",)),
+    LinkType("acknowledges", "A Decision's own `prior_art_acknowledged` assertion, naming "
+             "prior art it credits — a provenance/attribution edge, not a content "
+             "claim about the target (unlike `cites` below). Minted by the ASSERTION "
+             "LINKS migration (DRAWING THE WHOLE GRAPH, thread 325ef660) from the "
+             "pre-existing property.",
+             ("Decision",), ("Decision",)),
+    LinkType("vendor_of", "The vendor entity (resolved from a Reference's own free-text "
+             "`vendor` property against an active SoftwareProject's canonical) IS "
+             "vendor of that Reference. Minted by the ASSERTION LINKS migration "
+             "(DRAWING THE WHOLE GRAPH, thread 325ef660); a vendor string that "
+             "resolves to no real project abstains rather than guessing.",
+             ("SoftwareProject",), ("Reference",)),
     LinkType("cites", "This document cites / draws from that reference — OR (task #189's "
              "derivation lane, decision bb2ddf8a) a Decision/Thread's own prose named "
              "another object by id ('ruling <id>', 'obligation <id>'), minted at the "

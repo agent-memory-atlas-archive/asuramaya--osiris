@@ -70,6 +70,12 @@ NO_MCP_EQUIVALENT = {
         "1:1, by design (Thoth's own instruction: one door, not a subcommand each).",
     "deploy": "operator devops act — an agent should not restart shared services",
     "migrate": "operator devops act — an agent should not run schema migrations",
+    "graph-migrate": "DRAWING THE WHOLE GRAPH (thread 325ef660, Thoth mail 11407/11423): "
+        "built to a CLI-only spec (`osiris migrate <name> [--dry-run]`, the dispatch's "
+        "own literal wording) for a real-population graph repair, not a routine agent-"
+        "callable verb — same operator-cautious class as deploy/migrate/retention "
+        "above. An MCP tool can follow if a live caller actually needs one; none was "
+        "asked for in this tip.",
     "retention": "operator devops act (thread e6fd3772 piece 1, Khnum 288675e) — a retention "
                  "DELETE on outbox/audit_log has no unmerge; execute=False is the only "
                  "default and the act is deliberately kept off the agent-callable surface, "

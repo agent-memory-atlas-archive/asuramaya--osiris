@@ -5367,6 +5367,59 @@ async def cmd_backfill(
     return 1 if "error" in out else 0
 
 
+async def cmd_graph_migrate(
+    target: str, *, apply: bool = False, because: str | None = None,
+    actor: str, as_json: bool = False, pool: asyncpg.Pool | None = None,
+) -> int:
+    """osiris graph-migrate <target> [--apply] [--because R] [--json] [--actor W] — the
+    console-script door onto orchestrator.graph_migrations.run_migration (DRAWING THE
+    WHOLE GRAPH, thread 325ef660): three graph-shape repairs (repo:seats' phantom
+    project, the unfiled-object fog, the assertion-pair-to-real-link mints) feeding the
+    physics layout and the renderer, the SAME dry-run-default/because-required-to-apply
+    shape `osiris backfill` already established for the identity/provenance population
+    -- a separate door, not a new backfill target, because this is a different repair
+    class (graph shape, not identity/provenance). Named `graph-migrate` rather than
+    `migrate` to avoid colliding with the pre-existing `osiris migrate` (alembic's
+    env-correct schema tool, unrelated). Dry run is the default (returns the receipt,
+    writes nothing); `--apply` performs it, and REQUIRES `--because`."""
+    from src.orchestrator.graph_migrations import run_migration
+
+    if apply and not (because or "").strip():
+        print("osiris graph-migrate: --because is required to --apply — a migration "
+              "write is testimony, same discipline every other repair door in this "
+              "house holds", file=sys.stderr)
+        return 1
+    owns_pool = pool is None
+    if pool is None:
+        from src.config.dev_env import apply_dev_fallback
+        from src.config.settings import get_settings
+        from src.db.pool import create_pool
+
+        apply_dev_fallback()
+        settings = get_settings()
+        try:
+            pool = await create_pool(
+                settings.database_url, min_size=1, max_size=4,
+                application_name="osiris-cli:graph-migrate")
+        except Exception as exc:  # noqa: BLE001 - the CLI boundary: report, no raw traceback
+            print(f"osiris graph-migrate: could not reach postgres at "
+                  f"{settings.database_url} — {exc}. Set DATABASE_URL, or start the dev "
+                  "instance.", file=sys.stderr)
+            return 1
+    try:
+        out = await run_migration(pool, target, actor=actor, dry_run=not apply, because=because)
+    finally:
+        if owns_pool:
+            await pool.close()
+    if as_json:
+        from src import cli_render as render
+        render.emit(out, as_json=True)
+        return 1 if "error" in out else 0
+    verb = "applied" if apply else "planned (dry run — pass --apply to write)"
+    print(f"graph-migrate {target} {verb}: {out}")
+    return 1 if "error" in out else 0
+
+
 async def cmd_heal_seat_transcript(
     handle: str, source_paths: list[str], *, apply: bool = False, because: str = "",
     pool: asyncpg.Pool | None = None,
@@ -6657,7 +6710,7 @@ COMMANDS, GROUPED BY WHAT YOU'RE TRYING TO DO:
                         set-project-tag, proposal, settings, retire-assertion,
                         retire-link, retire-object, cite, declare-machine-identity
   operate               deploy, migrate, seed, bootstrap, retention, rematerialize,
-                        fleet-reconcile, fleet-prune, backfill, layout
+                        fleet-reconcile, fleet-prune, backfill, graph-migrate, layout
 
 Every read verb takes --json: one compact line for a script or an agent, instead of the
 human view. Run `osiris <command> --help` for that command's own flags and a worked example.
@@ -7654,6 +7707,33 @@ def _build_parser() -> argparse.ArgumentParser:
     p_backfill.add_argument("--json", action="store_true", dest="as_json",
                             help="machine-readable receipt")
 
+    from src.orchestrator.graph_migrations import MIGRATION_TARGETS
+
+    p_graph_migrate = sub.add_parser(
+        "graph-migrate", description=_d(
+            "one of three graph-shape repair verbs, dispatched over TARGET — the same "
+            "orchestrator.graph_migrations.run_migration (DRAWING THE WHOLE GRAPH, "
+            "thread 325ef660). Dry run is the default: returns the receipt, writes "
+            "nothing"),
+        epilog="example: osiris graph-migrate repo_seats_fix\n"
+            "example, to actually write: osiris graph-migrate repo_seats_fix --apply "
+            "--because \"DRAWING THE WHOLE GRAPH, thread 325ef660\"")
+    p_graph_migrate.add_argument("target", choices=sorted(MIGRATION_TARGETS),
+                                 help="which repair to run — see graph_migrations.py's "
+                                      "own docstrings for what each target does")
+    p_graph_migrate.add_argument("--apply", action="store_true",
+                                 help="actually write — default is a dry-run report, "
+                                      "same convention as every other repair verb in "
+                                      "this house")
+    p_graph_migrate.add_argument("--because", default=None,
+                                 help="why this migration is being applied — required "
+                                      "to --apply")
+    p_graph_migrate.add_argument("--actor", default=_CONSOLE_ACTOR,
+                                 help=f"who is performing this migration — defaults to "
+                                      f"{_CONSOLE_ACTOR!r}")
+    p_graph_migrate.add_argument("--json", action="store_true", dest="as_json",
+                                 help="machine-readable receipt")
+
     p_heal_transcript = sub.add_parser(
         "heal-seat-transcript", description=_d(
             "splice a seat's session, fragmented across multiple project slugs by a "
@@ -8251,6 +8331,10 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(cmd_backfill(
             args.target, apply=args.apply, because=args.because, only_bases=only_bases,
             limit=args.limit, newest_first=args.newest_first,
+            actor=args.actor, as_json=args.as_json))
+    if args.command == "graph-migrate":
+        return asyncio.run(cmd_graph_migrate(
+            args.target, apply=args.apply, because=args.because,
             actor=args.actor, as_json=args.as_json))
     if args.command == "heal-seat-transcript":
         return asyncio.run(cmd_heal_seat_transcript(
