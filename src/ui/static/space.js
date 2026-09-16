@@ -198,10 +198,16 @@ async function fetchStreamSnapshot() {
   }
   // THE LAST RENDERER (operator ruling d7d55257, Thoth mail 11066) killed LOD entirely --
   // Khnum's own project_aggregates/type_aggregates/cluster_edges/type_pair_edges (tip
-  // 2i/2j/h) still ride the same wire header, but nothing client-side reads them any more;
-  // node.type/node.project are already resolved to name strings above, off the same
-  // types/projects tables those aggregates were keyed against.
-  return { nodes, edges, edgeClassByType };
+  // 2i/2j/h) still ride the same wire header; type_aggregates/cluster_edges/type_pair_edges
+  // remain unread client-side, but THE DRAWING TIP (mail 11408) reuses project_aggregates
+  // as exactly the district geometry it needs (a real centroid + exact member-distance-
+  // bound radius per project, already computed server-side from the same positions) --
+  // resolve its numeric project code back to a name off the same `projects` table
+  // node.project already reads, rather than re-deriving anything.
+  const districtAggregates = (snap.project_aggregates || []).map((a) => ({
+    name: snap.projects[a.project], count: a.count, cx: a.cx, cy: a.cy, radius: a.radius,
+  }));
+  return { nodes, edges, edgeClassByType, districtAggregates };
 }
 
 // resolves DOM refs from a passed-in container map, falling back to the same fixed ids
@@ -416,7 +422,7 @@ export async function initSpace(container) {
     resume();
   }, false);
 
-  let mesh = null, pickMesh = null, edgeLines = null;
+  let mesh = null, pickMesh = null, edgeLines = null, ribbonLines = null;
   let meshUniforms = null, pickUniforms = null;
   let visibleAttr = null;
   let idToNode = [];
@@ -462,14 +468,14 @@ export async function initSpace(container) {
   const _screenV = new THREE.Vector3();
 
   function disposeCurrent() {
-    for (const m of [mesh, pickMesh, edgeLines]) {
+    for (const m of [mesh, pickMesh, edgeLines, ribbonLines]) {
       if (!m) continue;
       scene.remove(m); pickScene.remove(m);
       m.geometry.dispose();
       if (Array.isArray(m.material)) m.material.forEach((x) => x.dispose());
       else m.material.dispose();
     }
-    mesh = pickMesh = edgeLines = null;
+    mesh = pickMesh = edgeLines = ribbonLines = null;
   }
 
   // THE LAST RENDERER (operator ruling d7d55257, Thoth mail 11066, freezing the renderer):
@@ -578,10 +584,247 @@ export async function initSpace(container) {
     });
   }
 
-  // legend state: which edge classes/types are hidden from the base render. Structural is
-  // hidden by DEFAULT ("not drawn at rest", ruling c5953bb1) — the legend is how a reader
-  // opts back into seeing it without needing to focus a specific node.
-  const hiddenEdgeClasses = new Set(["structural"]);
+  // THE DRAWING TIP (Thoth mail 11408, operator ruling 4a51cab1/1178e7d9, thread 325ef660):
+  // "nothing hidden, nothing drawn twice" -- caps and hides (ruling c5953bb1's own
+  // "structural hidden by default") were the OLD answer to graph density; this tip
+  // replaces the answer, not just the renderer. Membership is a REGION (a district fill),
+  // the two universal fans are LANDMARKS with a count, every other edge draws at rest
+  // (same-district as a line, cross-district aggregated into a per-(district,district,type)
+  // ribbon that resolves to individual lines once that specific ribbon's own endpoints are
+  // far enough apart on screen). Confirmed by the two numbers-first spikes this tip builds
+  // on: Seshat 57992143 (this district/ribbon/landmark model, frame 0.77ms, accounting
+  // exact) and Khnum 5f6c4db3 (hubs are already excluded as membership containers, not a
+  // separate hub-zone concern for this renderer).
+  //
+  // THE DISTRICT MODEL: `districts` is project_aggregates (already computed server-side --
+  // a real centroid + exact member-distance-bound radius per project, no new query).
+  // `DISTRICT_FILL_TYPES` are the five membership link types (item 1: the original four
+  // plus Sekhmet's new `owned_by`) -- never drawn as lines at all, the district fill IS the
+  // membership claim, drawn once as a filled region instead of once per member as a spoke.
+  // `landmarks` are the two universal-fan targets (item 3) -- found DATA-DRIVEN (the single
+  // node receiving the most edges of that type), not hardcoded by canonical id. Every edge
+  // landing on a landmark's own target, of that landmark's own type, is excluded from
+  // line-drawing and folded into that node's own badge count instead.
+  const DISTRICT_FILL_TYPES = new Set(["in_repo", "works_in", "holds", "member_of", "owned_by"]);
+  const LANDMARK_EDGE_TYPES = ["acts_for", "authored_by"];
+  let districts = []; // [{name, count, cx, cy, radius}]
+  let districtByName = new Map();
+  let landmarks = {}; // {acts_for: {id,count}|null, authored_by: {id,count}|null}
+  let ribbons = []; // [{a, b, type, count}] -- a/b are district names, a <= b
+  let ribbonsResolvedKeys = new Set(); // "a|b|type" keys currently resolved to individual lines
+  let districtLabelCandidates = []; // pseudo-nodes for pickLabels' own shared budget, below
+  function ribbonKey(r) { return `${r.a}|${r.b}|${r.type}`; }
+  function findLandmark(type) {
+    const counts = new Map();
+    for (const e of edges) { if (e.type === type) counts.set(e.target, (counts.get(e.target) || 0) + 1); }
+    let bestId = null, bestN = 0;
+    for (const [id, n] of counts) { if (n > bestN) { bestN = n; bestId = id; } }
+    return bestId ? { id: bestId, count: bestN } : null;
+  }
+  function buildDistrictModel(districtAggregates, edgeList) {
+    districts = districtAggregates || [];
+    districtByName = new Map(districts.map((d) => [d.name, d]));
+    edges = edgeList; // findLandmark reads the module-level `edges` closure
+    landmarks = {};
+    for (const t of LANDMARK_EDGE_TYPES) landmarks[t] = findLandmark(t);
+    // the real per-district-pair aggregation (computeRibbons) needs idById, not built yet
+    // at this fetch/parse stage -- deferred to buildRibbonLines, called after buildScene.
+    ribbonsResolvedKeys = new Set();
+    buildDistrictLabelCandidates();
+  }
+  function computeRibbons() {
+    const counts = new Map(); // "a|b|type" -> count
+    const meta = new Map();
+    for (const e of edges) {
+      if (DISTRICT_FILL_TYPES.has(e.type)) continue;
+      const lm = landmarks[e.type];
+      if (lm && e.target === lm.id) continue;
+      const na = idById.get(e.source), nb = idById.get(e.target);
+      if (!na || !nb || na.project === nb.project) continue; // same-district: drawn individually
+      const [a, b] = na.project <= nb.project ? [na.project, nb.project] : [nb.project, na.project];
+      if (!districtByName.has(a) || !districtByName.has(b)) continue;
+      const key = `${a}|${b}|${e.type}`;
+      counts.set(key, (counts.get(key) || 0) + 1);
+      meta.set(key, { a, b, type: e.type });
+    }
+    ribbons = [...counts.entries()]
+      .map(([key, count]) => ({ ...meta.get(key), count }))
+      .sort((x, y) => y.count - x.count);
+    return ribbons;
+  }
+  // THE PER-RIBBON RESOLVE (item 2, mail 11408: "resolving per ribbon by its own
+  // screen-space centroid distance, not one global viewSize scalar"; refined by mail 11414
+  // off the prior-art note's own §4 -- "nothing drawn twice" needs a ribbon never co-drawn
+  // beside the lines it summarises, either (a) hierarchy-routed splines that separate on
+  // zoom, or (b) a strict LOD swap, one or the other per ribbon, never both. Picked (b): a
+  // ribbon in `ribbonsResolvedKeys` is dropped from the ribbon mesh entirely and its own
+  // edges draw as individual lines instead; a ribbon NOT in the set draws only in the
+  // ribbon mesh -- edgeAccounting()'s own line/ribbon counts are exactly this swap,
+  // verified live never double-counting the same edge either way.
+  //
+  // the spike's own single median-radius-derived threshold flipped EVERY ribbon at once
+  // regardless of how far apart its own two districts actually sit -- a ribbon between two
+  // ADJACENT small districts resolved at the exact same zoom step as one spanning the whole
+  // graph. Each ribbon's own two district centroids are projected to real screen pixels (the
+  // same camera.project convention positionLandmarkBadges already uses); a ribbon resolves
+  // once its own on-screen centroid distance crosses the threshold. Recomputed on the same
+  // deliberate-step cadence buildEdgeLines' other callers already follow (a zoom step or a
+  // camera fit, never per pointermove) -- cheap, and consistent with "rebuild on a
+  // deliberate step, never per frame."
+  const RIBBON_RESOLVE_SCREEN_PX = 900;
+  function districtScreenPx(d) {
+    _screenV.set(d.cx, d.cy, 0).project(camera);
+    return { x: (_screenV.x * 0.5 + 0.5) * wrap.clientWidth, y: (-_screenV.y * 0.5 + 0.5) * wrap.clientHeight };
+  }
+  function computeResolvedRibbonKeys() {
+    const resolved = new Set();
+    for (const r of ribbons) {
+      const da = districtByName.get(r.a), db = districtByName.get(r.b);
+      if (!da || !db) continue;
+      const pa = districtScreenPx(da), pb = districtScreenPx(db);
+      if (Math.hypot(pa.x - pb.x, pa.y - pb.y) > RIBBON_RESOLVE_SCREEN_PX) resolved.add(ribbonKey(r));
+    }
+    return resolved;
+  }
+  function ribbonKeySetsEqual(a, b) {
+    if (a.size !== b.size) return false;
+    for (const k of a) if (!b.has(k)) return false;
+    return true;
+  }
+  // "accounting exact" (mail 11408's own acceptance line, echoing the spike's 11392):
+  // every live edge counted into EXACTLY one of fill/landmark/line/ribbon -- a live-
+  // verification receipt hook, not consulted by the renderer itself.
+  function edgeAccounting() {
+    let fill = 0, landmark = 0, line = 0, ribbon = 0, other = 0;
+    for (const e of edges) {
+      if (DISTRICT_FILL_TYPES.has(e.type)) { fill++; continue; }
+      const lm = landmarks[e.type];
+      if (lm && e.target === lm.id) { landmark++; continue; }
+      const na = idById.get(e.source), nb = idById.get(e.target);
+      if (na && nb && na.project !== nb.project &&
+        districtByName.has(na.project) && districtByName.has(nb.project)) {
+        const a = na.project <= nb.project ? na.project : nb.project;
+        const b = na.project <= nb.project ? nb.project : na.project;
+        if (ribbonsResolvedKeys.has(`${a}|${b}|${e.type}`)) line++; else ribbon++;
+        continue;
+      }
+      if (na && nb) { line++; continue; }
+      other++; // an endpoint missing from idById -- should never happen, disclosed not hidden
+    }
+    return { total: edges.length, fill, landmark, line, ribbon, other,
+      accounted: fill + landmark + line + ribbon + other };
+  }
+  // recomputes the resolved set and rebuilds ONLY when it actually changed -- same
+  // "rebuild on a deliberate step, not per frame" discipline as syncRibbonResolve's own
+  // callers (a zoom step, a camera fit), never wired to pointermove/pan.
+  function syncRibbonResolve() {
+    if (!ribbons.length) return;
+    const resolved = computeResolvedRibbonKeys();
+    if (ribbonKeySetsEqual(resolved, ribbonsResolvedKeys)) return;
+    ribbonsResolvedKeys = resolved;
+    buildEdgeLines(idToNode, edges);
+    buildRibbonLines();
+    markDirty();
+  }
+  const RIBBON_ALPHA_FLOOR = 0.25;
+  function buildRibbonLines() {
+    if (ribbonLines) { scene.remove(ribbonLines); ribbonLines.geometry.dispose(); ribbonLines.material.dispose(); ribbonLines = null; }
+    computeRibbons();
+    // "nothing drawn twice": a ribbon that has resolved to individual lines this frame is
+    // redundant geometry -- drop it from the ribbon mesh entirely rather than layering both.
+    const unresolved = ribbons.filter((r) => !ribbonsResolvedKeys.has(ribbonKey(r)));
+    if (!unresolved.length) return;
+    const positions = new Float32Array(unresolved.length * 6);
+    const otherPositions = new Float32Array(unresolved.length * 6);
+    const colors = new Float32Array(unresolved.length * 6);
+    const maxCount = Math.max(...unresolved.map((r) => r.count));
+    const ec = new THREE.Color();
+    let vi = 0;
+    for (const r of unresolved) {
+      const da = districtByName.get(r.a), db = districtByName.get(r.b);
+      if (!da || !db) continue;
+      // Reinhard-shaped brightness by count, same convention as the bundled-curve alpha
+      // falloff (BUNDLE_ALPHA_FLOOR) elsewhere in this file -- baked into vertex color
+      // since LineBasicMaterial has no per-vertex width/alpha attribute.
+      const bright = Math.max(RIBBON_ALPHA_FLOOR, Math.log1p(r.count) / Math.log1p(maxCount));
+      ec.set(colorForEdgeType(r.type)).multiplyScalar(bright);
+      positions[vi] = da.cx; positions[vi + 1] = da.cy; positions[vi + 2] = -0.2;
+      otherPositions[vi] = db.cx; otherPositions[vi + 1] = db.cy; otherPositions[vi + 2] = -0.2;
+      vi += 3;
+      positions[vi] = db.cx; positions[vi + 1] = db.cy; positions[vi + 2] = -0.2;
+      otherPositions[vi] = da.cx; otherPositions[vi + 1] = da.cy; otherPositions[vi + 2] = -0.2;
+      vi += 3;
+      colors[vi - 6] = ec.r; colors[vi - 5] = ec.g; colors[vi - 4] = ec.b;
+      colors[vi - 3] = ec.r; colors[vi - 2] = ec.g; colors[vi - 1] = ec.b;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(positions.subarray(0, vi), 3));
+    geo.setAttribute("otherPosition", new THREE.BufferAttribute(otherPositions.subarray(0, vi), 3));
+    geo.setAttribute("color", new THREE.BufferAttribute(colors.subarray(0, vi), 3));
+    ribbonLines = new THREE.LineSegments(geo, makeEdgeFadeMaterial());
+    scene.add(ribbonLines);
+  }
+  // THE DISTRICT LABEL BUDGET (item 4, mail 11408: "district labels earn their place by
+  // size -- one shared label budget with object labels, declutter with the same
+  // overlapsPlaced, small districts under a threshold unlabelled at rest and folded into an
+  // 'other' wash"). District labels no longer own a permanent div per district (the spike's
+  // own always-on districtLabelEntries) -- they compete for the SAME N_LABELS slots and the
+  // SAME overlapsPlaced declutter pass pickLabels/positionLabels already run for object
+  // labels, entered as label-pool CANDIDATES (see pickLabels' own DISTRICT_LABEL_MIN_COUNT
+  // gate and positionLabels' own district-label pass). `districtMeshGroup` (the fill
+  // geometry itself) is unaffected -- every district still fills, labelled or not; only the
+  // TEXT is budget-gated, and an unlabelled small district is what "folded into an 'other'
+  // wash" means here -- its fill alone, unlabeled, reads as background texture rather than
+  // a named place.
+  const DISTRICT_LABEL_MIN_COUNT = 8; // below this member count, a district never labels at rest
+  let districtMeshGroup = null;
+  function buildDistrictFills() {
+    if (districtMeshGroup) { scene.remove(districtMeshGroup); districtMeshGroup = null; }
+    if (!districts.length) return;
+    districtMeshGroup = new THREE.Group();
+    const dc = new THREE.Color("#2a3f5f");
+    for (const d of districts) {
+      const geo = new THREE.CircleGeometry(Math.max(d.radius, 1), 32);
+      const mat = new THREE.MeshBasicMaterial({ color: dc, transparent: true, opacity: 0.14, depthWrite: false });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set(d.cx, d.cy, -0.5); // behind both edges and nodes
+      districtMeshGroup.add(mesh);
+    }
+    scene.add(districtMeshGroup);
+  }
+  let landmarkBadgeEntries = []; // [{id, type, div}]
+  function buildLandmarkBadges() {
+    for (const e of landmarkBadgeEntries) e.div.remove();
+    landmarkBadgeEntries = [];
+    for (const t of LANDMARK_EDGE_TYPES) {
+      const lm = landmarks[t];
+      if (!lm) continue;
+      const div = document.createElement("div");
+      div.className = "lod-glyph-label";
+      const nd = idById.get(lm.id);
+      div.textContent = `${nd ? labelTextFor(nd) : lm.id} — ${lm.count} ${t}`;
+      labelsEl.appendChild(div);
+      landmarkBadgeEntries.push({ id: lm.id, type: t, div });
+    }
+  }
+  function positionLandmarkBadges() {
+    for (const e of landmarkBadgeEntries) {
+      const nd = idById.get(e.id);
+      if (!nd) continue;
+      _screenV.set(nd.x || 0, nd.y || 0, 0).project(camera);
+      e.div.style.left = `${(_screenV.x * 0.5 + 0.5) * wrap.clientWidth}px`;
+      e.div.style.top = `${(-_screenV.y * 0.5 + 0.5) * wrap.clientHeight}px`;
+    }
+  }
+
+  // legend state: which edge classes/types are hidden from the base render. Structural was
+  // hidden by DEFAULT under the old "not drawn at rest" rule (ruling c5953bb1); THE DRAWING
+  // TIP's own operator ruling (4a51cab1/1178e7d9) retires that rule outright -- "nothing
+  // hidden ... caps and hides are escape hatches" -- structural edges that aren't already
+  // folded into a district fill or a landmark badge (the five new types Sekhmet minted:
+  // recorded_by, owned_by [also a fill type], admitted_by, acknowledges, vendor_of) now draw
+  // at rest same as anything else; the legend remains how a reader opts back OUT.
+  const hiddenEdgeClasses = new Set();
   const hiddenEdgeTypes = new Set();
   // TIP 1(d): "focus HIDES unreachable nodes AND EDGES" — an edge whose endpoint is
   // currently invisible (focus-unreachable or type-filtered, same aVisible flag applyDim
@@ -604,9 +847,25 @@ export async function initSpace(container) {
   function buildEdgeLines(nodes, edgeList) {
     if (edgeLines) { scene.remove(edgeLines); edgeLines.geometry.dispose(); edgeLines.material.dispose(); edgeLines = null; }
     const byId = new Map(nodes.map((nd) => [nd.id, nd]));
-    const visible = edgeList.filter((e) =>
-      !hiddenEdgeClasses.has(e.edgeClass) && !hiddenEdgeTypes.has(e.type) &&
-      nodeVisible(byId.get(e.source)) && nodeVisible(byId.get(e.target)));
+    // THE DRAWING TIP: district-fill types never draw as individual lines at all (the fill
+    // IS the claim); a landmark's own incoming edges of its own type fold into that node's
+    // badge count instead of a spoke; a cross-district edge of any other type is
+    // represented once, either as a ribbon (its own key not yet in ribbonsResolvedKeys) or
+    // individually (its own ribbon HAS resolved) -- never both, per "nothing drawn twice."
+    const visible = edgeList.filter((e) => {
+      if (DISTRICT_FILL_TYPES.has(e.type)) return false;
+      const lm = landmarks[e.type];
+      if (lm && e.target === lm.id) return false;
+      const na = byId.get(e.source), nb = byId.get(e.target);
+      if (na && nb && na.project !== nb.project &&
+        districtByName.has(na.project) && districtByName.has(nb.project)) {
+        const a = na.project <= nb.project ? na.project : nb.project;
+        const b = na.project <= nb.project ? nb.project : na.project;
+        if (!ribbonsResolvedKeys.has(`${a}|${b}|${e.type}`)) return false;
+      }
+      return !hiddenEdgeClasses.has(e.edgeClass) && !hiddenEdgeTypes.has(e.type) &&
+        nodeVisible(byId.get(e.source)) && nodeVisible(byId.get(e.target));
+    });
     const positions = new Float32Array(visible.length * 6);
     const otherPositions = new Float32Array(visible.length * 6);
     const edgeColors = new Float32Array(visible.length * 6);
@@ -764,6 +1023,9 @@ export async function initSpace(container) {
     scene.add(mesh);
     pickScene.add(pickMesh);
 
+    buildDistrictFills();
+    buildLandmarkBadges();
+    buildRibbonLines(); // needs idById, built above -- first real call after buildDistrictModel
     buildEdgeLines(nodes, edges);
     applyDim();
     markDirty();
@@ -886,6 +1148,7 @@ export async function initSpace(container) {
     maxViewSize = Math.max(span * 2, 200);
     updateFrustum();
     rescaleForZoom();
+    syncRibbonResolve();
     markDirty();
   }
 
@@ -896,7 +1159,8 @@ export async function initSpace(container) {
   // positionLabels/pickLabels below for the one label rule that replaces it (viewport
   // top-N by degree, de-overlapped, at every zoom, no separate project-label pass).
   setStatus("loading the whole graph…");
-  let { nodes, edges, edgeClassByType } = await fetchStreamSnapshot();
+  let { nodes, edges, edgeClassByType, districtAggregates } = await fetchStreamSnapshot();
+  buildDistrictModel(districtAggregates, edges);
   buildScene(nodes, edges);
   fitToNodes(nodes);
   setStatus(`${nodes.length} objects, ${edges.length} edges`);
@@ -2009,6 +2273,7 @@ export async function initSpace(container) {
     camera.position.x = worldX - THREE.MathUtils.lerp(camera.left, camera.right, nx);
     camera.position.y = worldY - THREE.MathUtils.lerp(camera.top, camera.bottom, ny);
     rescaleForZoom();
+    syncRibbonResolve();
     const t2 = window.__spaceWheelTiming ? performance.now() : 0;
     scheduleLabelPick();
     markDirty();
@@ -2386,12 +2651,33 @@ export async function initSpace(container) {
     if (labelPickTimer) return;
     labelPickTimer = setTimeout(() => { labelPickTimer = null; pickLabels(); }, 150);
   }
+  // THE DISTRICT LABEL BUDGET (item 4, mail 11408): a district "earns its place by size" in
+  // the SAME N_LABELS pool object labels compete for -- built as a stable pseudo-node per
+  // district (own .x/.y/.degree so it drops into the identical sort/slice/declutter path
+  // with no special-casing there), never real graph nodes, so `.id` is namespaced
+  // (`district:<name>`) and `isLit` naturally never matches one. Rebuilt only when the
+  // district model itself changes (buildDistrictModel/buildDistrictFills), not per pick --
+  // identity stays stable across picks so labelDivs doesn't churn DOM nodes for a district
+  // that stays labeled from one pick to the next. `districtLabelCandidates` itself is
+  // declared up in THE DISTRICT MODEL block, not here -- buildDistrictModel calls this
+  // function during initSpace's own synchronous setup, well before this point in the file
+  // would otherwise execute; declaring the `let` down here hit the exact TDZ crash class
+  // THE LAST RENDERER's own commit message already named once (projectObjectByName).
+  function buildDistrictLabelCandidates() {
+    districtLabelCandidates = districts
+      .filter((d) => d.count >= DISTRICT_LABEL_MIN_COUNT)
+      .map((d) => ({
+        __isDistrict: true, id: `district:${d.name}`, name: d.name,
+        x: d.cx, y: d.cy, degree: d.count,
+      }));
+  }
   function pickLabels() {
     const halfW = (camera.right - camera.left) / 2, halfH = (camera.top - camera.bottom) / 2;
     const minX = camera.position.x - halfW, maxX = camera.position.x + halfW;
     const minY = camera.position.y - halfH, maxY = camera.position.y + halfH;
-    const pool = idToNode.filter((nd) =>
-      nodeVisible(nd) && nd.x >= minX && nd.x <= maxX && nd.y >= minY && nd.y <= maxY);
+    const inView = (nd) => nd.x >= minX && nd.x <= maxX && nd.y >= minY && nd.y <= maxY;
+    const pool = idToNode.filter((nd) => nodeVisible(nd) && inView(nd));
+    const districtPool = districtLabelCandidates.filter(inView);
     // THE FOCUS LABEL POOL FIX (Thoth mail 11359): a plain top-N-by-degree sort ignores the
     // focus entirely -- a real focus's own reachable set is mostly low-natural-degree nodes
     // (Message, chain members), so the pool filled with whatever happened to have the
@@ -2400,7 +2686,7 @@ export async function initSpace(container) {
     // highest-degree-first among themselves; only remaining slots go to the ordinary
     // degree ranking. Acceptance: every reachable node gets a label slot up to N_LABELS.
     const isLit = (nd) => nd.id === pathFocusId || pathReachable.has(nd.id) || nd.id === selectedId;
-    labeledNodes = pool.slice()
+    labeledNodes = pool.concat(districtPool)
       .sort((a, b) => (isLit(b) ? 1 : 0) - (isLit(a) ? 1 : 0) || (b.degree || 0) - (a.degree || 0))
       .slice(0, N_LABELS);
     // reconcile DOM: remove divs for nodes no longer labeled, add for newly labeled ones —
@@ -2412,8 +2698,9 @@ export async function initSpace(container) {
     for (const nd of labeledNodes) {
       if (labelDivs.has(nd)) continue;
       const div = document.createElement("div");
-      div.className = "lbl";
-      div.textContent = labelTextFor(nd); // fallback text now, swapped for the real name async
+      div.className = nd.__isDistrict ? "lbl district-label" : "lbl";
+      // fallback text now, swapped for the real name async (real nodes only)
+      div.textContent = nd.__isDistrict ? `${nd.name} (${nd.degree})` : labelTextFor(nd);
       labelsEl.appendChild(div);
       labelDivs.set(nd, div);
     }
@@ -2446,6 +2733,17 @@ export async function initSpace(container) {
       _screenV.set(nd.x || 0, nd.y || 0, 0).project(camera);
       const x = (_screenV.x * 0.5 + 0.5) * wrap.clientWidth;
       const y = (-_screenV.y * 0.5 + 0.5) * wrap.clientHeight;
+      // a district pseudo-node is never focus-reachable and never the succession-chain
+      // declutter's own concern -- it just competes for a slot and yields to overlap like
+      // any ordinary (non-lit) label, keeping its own "district-label" class untouched.
+      if (nd.__isDistrict) {
+        if (overlapsPlaced(x, y)) { div.hidden = true; continue; }
+        div.hidden = false;
+        div.style.left = `${x}px`;
+        div.style.top = `${y}px`;
+        _placed.push([x - LABEL_W / 2, y - LABEL_H, x + LABEL_W / 2, y]);
+        continue;
+      }
       const lit = nd.id === pathFocusId || pathReachable.has(nd.id) || nd.id === selectedId;
       // THE CHAIN LABEL DECLUTTER (Thoth mail 11308): "lit labels always win their spot"
       // is right for an ordinary small reachable set, but a real succession chain (up to
@@ -2469,6 +2767,7 @@ export async function initSpace(container) {
       _placed.push([x - LABEL_W / 2, y - LABEL_H, x + LABEL_W / 2, y]);
     }
     positionFocusRing();
+    positionLandmarkBadges();
     if (window.__spaceWheelTiming) {
       const t0 = performance.now();
       positionDrillDivs();
@@ -2512,6 +2811,16 @@ export async function initSpace(container) {
     get pathReachable() { return pathReachable; },
     get pathFocusId() { return pathFocusId; },
     get selectedId() { return selectedId; },
+    // DRAWING THE WHOLE GRAPH (spike, Thoth mail 11392) -- live-verification/report hooks,
+    // same convention as the rest of this debug surface.
+    get districts() { return districts.map((d) => ({ ...d })); },
+    get landmarks() { return { ...landmarks }; },
+    get ribbons() { return ribbons.map((r) => ({ ...r })); },
+    get ribbonsResolvedKeys() { return [...ribbonsResolvedKeys]; },
+    get districtLabelCandidateCount() { return districtLabelCandidates.length; },
+    edgeAccounting,
+    get edgeSegmentsDrawn() { return edgeLines ? edgeLines.geometry.attributes.position.count / 2 : 0; },
+    get ribbonSegmentsDrawn() { return ribbonLines ? ribbonLines.geometry.attributes.position.count / 2 : 0; },
     camera, pickAt, mesh: () => mesh, worldPerPx, nodeScreenPx, renderer,
     // debug/test hooks only (same convention as window.__space always being exposed) —
     // zoomAt bypasses the rAF-coalesced wheel path for direct exercise; forceRender skips

@@ -133,7 +133,7 @@ def test_point_opacity_was_raised_now_that_tone_mapping_owns_the_saturation_cap(
 # --- rule 2: an edge draws only when both ends are visible, no structural-hop exception ----
 
 def test_base_edge_layer_requires_both_ends_visible_no_exception() -> None:
-    body = _SPACE_JS.split("function buildEdgeLines(nodes, edgeList)", 1)[1][:700]
+    body = _SPACE_JS.split("function buildEdgeLines(nodes, edgeList)", 1)[1][:1700]
     assert "nodeVisible(byId.get(e.source)) && nodeVisible(byId.get(e.target))" in body
 
 
@@ -160,14 +160,19 @@ def test_edges_are_no_longer_bundled_or_density_scaled() -> None:
 
 def test_labels_are_top_n_by_degree_within_the_viewport_no_tier_gating() -> None:
     body = _SPACE_JS.split("function pickLabels()", 1)[1][:1400]
-    assert "nodeVisible(nd) && nd.x >= minX && nd.x <= maxX && nd.y >= minY && nd.y <= maxY" in body
+    # THE DRAWING TIP (mail 11408) factored the viewport bounds check into a shared `inView`
+    # predicate (district labels reuse it too) -- the underlying rule is unchanged: a node
+    # must be nodeVisible AND genuinely on screen to be a label candidate.
+    assert "const inView = (nd) => nd.x >= minX && nd.x <= maxX && nd.y >= minY && " \
+        "nd.y <= maxY;" in body
+    assert "const pool = idToNode.filter((nd) => nodeVisible(nd) && inView(nd));" in body
     assert "(b.degree || 0) - (a.degree || 0)" in body
     assert "N_LABELS" in body
     assert "const N_LABELS = 40;" in _SPACE_JS
 
 
 def test_position_labels_has_no_tier_branch_left() -> None:
-    body = _SPACE_JS.split("function positionLabels()", 1)[1][:2500]
+    body = _SPACE_JS.split("function positionLabels()", 1)[1][:3100]
     # no more tier GATE -- the loop over labeledNodes runs unconditionally, no branch on any
     # zoom tier (a lingering explanatory comment mentioning "tier" in prose is fine; a real
     # tier conditional, e.g. `if (tier ===`, is not).
