@@ -222,25 +222,6 @@ _LEVEL1_GUTTER = 3 * _MIN_SEPARATION  # extra clearance beyond R_a+R_b between a
                                       # requires >= R_a+R_b; a real gutter keeps a
                                       # bridging member's own facing-edge nudge (below)
                                       # from ever pushing it into the NEXT project.
-_CROSS_PROJECT_WEIGHT_SCALE = _LEVEL1_GUTTER  # THE LONG EDGES FIX (operator ruling,
-                                      # grounds 9163b1c7, measured live): seat:34f4e5fa
-                                      # (the seats repo) and repo:osiris sat 33k units
-                                      # apart despite ~9,500 authored_by cross-links
-                                      # between them -- a raw link count fed straight
-                                      # into FR as edge weight spans 1 to ~9,500 across
-                                      # real project pairs, a dynamic range wide enough
-                                      # that ONE extreme outlier pair can destabilise
-                                      # FR's own iteration rather than just pulling
-                                      # harder. log1p(count) compresses that range; this
-                                      # scale then rescales the compressed value back up
-                                      # so the strongest pair's own spring dominates
-                                      # `_separate_extents`' fixed `_LEVEL1_GUTTER`
-                                      # instead of getting lost at FR's own force scale
-                                      # -- chosen equal to the gutter itself as the
-                                      # starting point "beats the gutter" names most
-                                      # directly; verify-only's own new top5-linked-pair
-                                      # receipt fields are what actually confirms this,
-                                      # not the constant's own value in isolation.
 _INTRA_PROJECT_GUTTER = _MIN_SEPARATION  # THE INTRA-PROJECT GUTTER FIX (live
                                          # specimen: the first real v8 write, deployed
                                          # ba9669a4, measured as a 163k-unit bbox with
@@ -688,24 +669,6 @@ def _separate_extents(
     return pos
 
 
-def _fr_weights_from_cross_edges(
-    cross_edges: dict[tuple[uuid.UUID, uuid.UUID], float],
-) -> dict[tuple[uuid.UUID, uuid.UUID], float]:
-    """THE LONG EDGES FIX: `log1p(count) * _CROSS_PROJECT_WEIGHT_SCALE`, never the
-    raw count -- a raw cross-project link count spans 1 to ~9,500 across real
-    project pairs (measured live), a dynamic range wide enough that ONE extreme
-    outlier pair fed straight into `layout_fruchterman_reingold` as edge weight
-    can destabilise FR's own iteration instead of just pulling harder. log1p
-    compresses that range while preserving relative order (still monotonic, so
-    "the top-5 most-linked pairs" ranks identically either way); the scale then
-    rescales the compressed value back up so the strongest pair's own spring
-    actually dominates `_separate_extents`' fixed gutter rather than getting
-    lost at FR's own force scale. Never mutates `cross_edges` itself -- callers
-    that need the real count for reporting (this module's own acceptance
-    diagnostics, `_apply_bridge_nudges`) read the untransformed dict."""
-    return {k: math.log1p(v) * _CROSS_PROJECT_WEIGHT_SCALE for k, v in cross_edges.items()}
-
-
 def _level1_layout(
     project_ids: list[uuid.UUID], radii: dict[uuid.UUID, float],
     cross_edges: dict[tuple[uuid.UUID, uuid.UUID], float], *,
@@ -967,13 +930,29 @@ def _place_unfiled(
     unfiled_ids: list[uuid.UUID], link_rows: list[asyncpg.Record],
     placed: dict[uuid.UUID, np.ndarray],
     project_centroids: dict[uuid.UUID, np.ndarray] | None = None,
+    hub_ids: set[uuid.UUID] | None = None,
 ) -> dict[uuid.UUID, np.ndarray]:
-    """Unfiled objects (Thoth mail 11128 item 4): one with a live semantic link to
-    an already-placed object lands at the mean position of those neighbours; one
+    """Unfiled objects (Thoth mail 11128 item 4): one with a live link to an
+    already-placed object lands at the mean position of those neighbours; one
     with none scatters as a proper isotropic 2D Gaussian (Box-Muller polar form)
     centred on the whole placed cloud's own centroid, std from that cloud's own
     spread -- density falls off smoothly outward instead of the fixed-radius ring
     Thoth's own measurement flagged as a spike on the v7 layout.
+
+    THE LONG EDGES RULING (operator, grounds 9163b1c7, live probe): ANY live link
+    counts as a neighbour now, structural and container included -- NOT semantic
+    only. The seat:34f4e5fa/repo:osiris "beam" traced to 1,960 objects (mostly
+    Messages and Agents) whose ONLY links are structural (sent_by, acts_for,
+    works_in...); the old semantic-only filter made every one of them fall
+    through to fog, scattered far from the real neighbours those structural
+    links actually name, drawing edges tens of thousands of units long. `hub_ids`
+    (structural-degree over `_HUB_DEGREE_THRESHOLD`, the SAME "universal hub"
+    reading `_build_physics_graph` already uses) is EXCLUDED from the neighbour
+    set: a hub's own "mean position of neighbours" is meaningless -- almost
+    everything structurally touches a hub, so counting it would just centroid
+    every unfiled object back onto the hub's own position, the fixed-ring spike
+    this scheme was built to avoid in the first place. Only a genuinely
+    hub-less, link-less object is real fog.
 
     THE UNFILED-VS-PLACED FIX (live specimen, THIRD real migration attempt on
     bcf0ca63): a naive neighbour-mean placement can drop an unfiled object right
@@ -997,15 +976,14 @@ def _place_unfiled(
     (Thoth's own item-4 spec). `project_centroids`, when given, scales the fog
     off the spread of PROJECT CENTROIDS instead -- the level-1 canvas's own
     scale, not any one project's internal member spread."""
+    hubs = hub_ids or set()
     neighbours: dict[uuid.UUID, list[np.ndarray]] = defaultdict(list)
     unfiled_set = set(unfiled_ids)
     for r in link_rows:
-        f, t, lt = r["from_id"], r["to_id"], r["type"]
-        if lt in CONTAINER_LINK_TYPES or lt in STRUCTURAL_LINK_TYPES:
-            continue
-        if f in unfiled_set and t in placed:
+        f, t = r["from_id"], r["to_id"]
+        if f in unfiled_set and t in placed and t not in hubs:
             neighbours[f].append(placed[t])
-        if t in unfiled_set and f in placed:
+        if t in unfiled_set and f in placed and f not in hubs:
             neighbours[t].append(placed[f])
 
     scale_source = project_centroids if project_centroids else placed
@@ -1023,7 +1001,17 @@ def _place_unfiled(
     for oid in unfiled_ids:
         pts = neighbours.get(oid)
         if pts:
-            out[oid] = np.array(pts).mean(axis=0)
+            # small deterministic jitter (THE LONG EDGES RULING): several unfiled
+            # objects sharing the exact same single neighbour would otherwise
+            # land on the exact same point -- a real but tiny starting
+            # coincidence for the anchor-declump below to resolve from, not a
+            # spread meant to carry any visual meaning of its own.
+            ju1 = max(_hash01(f"unfiled-jitter-r1:{oid}"), 1e-9)
+            ju2 = _hash01(f"unfiled-jitter-r2:{oid}")
+            jangle = ju2 * 2 * math.pi
+            jitter = ju1 * _MIN_SEPARATION * np.array(
+                [math.cos(jangle), math.sin(jangle)])
+            out[oid] = np.array(pts).mean(axis=0) + jitter
         else:
             u1 = max(_hash01(f"fog-r1:{oid}"), 1e-9)
             u2 = _hash01(f"fog-r2:{oid}")
@@ -1229,17 +1217,13 @@ async def _physics_positions(
         radii[_HUB_ZONE_ID] = _hub_zone_radius(len(hub_order))
         level1_ids.append(_HUB_ZONE_ID)
     cross_edges = _cross_project_edges(link_rows, membership, project_id_set)
-    # THE LONG EDGES FIX (operator ruling, grounds 9163b1c7): `_cross_project_edges`
-    # keeps returning a RAW link count (unchanged, `_apply_bridge_nudges` and this
-    # function's own reporting below both still want the real count) -- the log1p
-    # scale (`_fr_weights_from_cross_edges`) is applied HERE, only for the FR
-    # weight `_level1_layout` actually sees, never touching the intra-project
-    # community-split call one level deeper (`_level2_raw_layout_for_project`'s
-    # own `_level1_layout` reuse), which was never asked for this and has its
-    # own, different weight shape.
-    fr_weights = _fr_weights_from_cross_edges(cross_edges)
-    centroids = _level1_layout(level1_ids, radii, fr_weights)
+    centroids = _level1_layout(level1_ids, radii, cross_edges)
 
+    # THE LONG EDGES RULING (operator, grounds 9163b1c7): the seat:34f4e5fa/
+    # repo:osiris beam was NEVER a level-1 spring-weight problem -- live probe
+    # traced it to unfiled fog (below), so level-1 weight stays semantic-only,
+    # unchanged (c5953bb1 stands). Only the receipt's own top-5-linked-pair
+    # reporting survives from that investigation, kept for visibility.
     if diagnostics is not None and cross_edges:
         top5 = sorted(cross_edges.items(), key=lambda kv: -kv[1])[:5]
         pair_stats = []
@@ -1279,8 +1263,8 @@ async def _physics_positions(
             iterations=_PHYSICS_DECLUMP_ITERATIONS)
         positions = {oid: pos_arr[i] for i, oid in enumerate(ids_order)}
     project_centroids_only = {pid: centroids[pid] for pid in project_ids}
-    positions.update(
-        _place_unfiled(unfiled_ids, link_rows, positions, project_centroids_only))
+    positions.update(_place_unfiled(
+        unfiled_ids, link_rows, positions, project_centroids_only, hub_ids))
 
     if hub_order:
         positions.update(_place_hubs_in_zone(hub_order, centroids[_HUB_ZONE_ID]))
@@ -1303,12 +1287,49 @@ async def _physics_positions(
         diagnostics["declump_iterations"] = declump_iters
         diagnostics["community_count"] = len({(pid, c) for pid, c in communities.values()})
         diagnostics["community_seed_scheme"] = "leiden seeded per-project from pid.int"
+        final_positions = {oid: declumped[i] for i, oid in enumerate(object_ids)}
+        diagnostics.update(_long_edge_counts(link_rows, final_positions))
         diagnostics.update(_layout_acceptance_metrics(
             declumped, object_ids, membership, groups, project_ids, radii))
     _verify_min_separation(worst_residual, min_sep=_MIN_SEPARATION)
 
     return {oid: (float(declumped[i, 0]), float(declumped[i, 1]))
             for i, oid in enumerate(object_ids)}
+
+
+_LONG_EDGE_THRESHOLD = 20_000.0  # THE LONG EDGES RULING's own acceptance line
+                                 # (operator, grounds 9163b1c7): world-unit length
+                                 # past which an edge reads as a visible "beam"
+                                 # across the rendered map -- the live probe that
+                                 # found the unfiled-fog root cause used this exact
+                                 # figure (47,866 of 136,089 edges longer than it).
+
+
+def _long_edge_counts(
+    link_rows: list[asyncpg.Record], positions: dict[uuid.UUID, np.ndarray],
+) -> dict[str, Any]:
+    """THE LONG EDGES RULING's own receipt requirement: every live link whose two
+    endpoints both have a final position and end up farther apart than
+    `_LONG_EDGE_THRESHOLD`, counted by type -- top 8 types plus the grand total
+    (acceptance: total under 5,000). Counts every real link type, not just
+    semantic ones -- exactly the population `_place_unfiled`'s own fix widened to
+    cover, so this receipt field is the direct measurement of whether that fix
+    actually worked, not a proxy."""
+    counts: dict[str, int] = defaultdict(int)
+    total = 0
+    for r in link_rows:
+        f, t, lt = r["from_id"], r["to_id"], r["type"]
+        pf, pt = positions.get(f), positions.get(t)
+        if pf is None or pt is None:
+            continue
+        if float(np.linalg.norm(pf - pt)) > _LONG_EDGE_THRESHOLD:
+            counts[lt] += 1
+            total += 1
+    top8 = sorted(counts.items(), key=lambda kv: -kv[1])[:8]
+    return {
+        "layout_long_edge_total": total,
+        "layout_long_edge_by_type_top8": [{"type": t, "count": c} for t, c in top8],
+    }
 
 
 def _layout_acceptance_metrics(

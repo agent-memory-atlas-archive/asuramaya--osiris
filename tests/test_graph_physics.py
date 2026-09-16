@@ -488,32 +488,16 @@ def test_level1_layout_places_a_single_project_at_the_origin_ish() -> None:
     assert out[pid].shape == (2,)
 
 
-def test_fr_weights_from_cross_edges_compresses_range_but_preserves_order() -> None:
-    a, b = uuid.uuid4(), uuid.uuid4()
-    c, d = uuid.uuid4(), uuid.uuid4()
-    cross_edges = {(a, b): 9500.0, (c, d): 5.0}
-    weights = graph_physics._fr_weights_from_cross_edges(cross_edges)
-    # still monotonic (heavier pair still weighs more)...
-    assert weights[(a, b)] > weights[(c, d)]
-    # ...but the RATIO is compressed relative to the raw counts' own 1900x gap
-    raw_ratio = 9500.0 / 5.0
-    weighted_ratio = weights[(a, b)] / weights[(c, d)]
-    assert weighted_ratio < raw_ratio
-    # the input dict itself is never mutated -- callers needing the real count still can
-    assert cross_edges[(a, b)] == 9500.0
-
-
-def test_long_edges_a_strongly_linked_pair_ends_up_closer_than_an_unlinked_one() -> None:
-    """THE LONG EDGES FIX (operator ruling, grounds 9163b1c7): seat:34f4e5fa and
-    repo:osiris measured 33k units apart despite ~9,500 cross-links between them.
-    Four same-sized projects: (a,b) heavily cross-linked, (c,d) not linked at all
-    -- (a,b) must end up closer together than (c,d), the acceptance shape this
-    fix exists to produce."""
+def test_level1_layout_a_semantically_linked_pair_ends_up_closer_than_an_unlinked_one() -> None:
+    """THE LONG EDGES RULING (operator, grounds 9163b1c7): the actual beam turned
+    out to be unfiled fog, not a level-1 spring-weight problem -- level-1 weight
+    stays the raw semantic cross-link count, unchanged. Regression coverage for
+    the mechanism that ruling confirmed already works: a linked pair still ends
+    up closer than an unlinked one of the same size."""
     a, b, c, d = uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     radii = {a: 500.0, b: 500.0, c: 500.0, d: 500.0}
-    raw_cross_edges = {(a, b): 9500.0}
-    weights = graph_physics._fr_weights_from_cross_edges(raw_cross_edges)
-    out = _level1_layout([a, b, c, d], radii, weights)
+    cross_edges = {(a, b): 50.0}
+    out = _level1_layout([a, b, c, d], radii, cross_edges)
     dist_ab = float(np.linalg.norm(out[a] - out[b]))
     dist_cd = float(np.linalg.norm(out[c] - out[d]))
     assert dist_ab < dist_cd
@@ -548,7 +532,52 @@ def test_place_unfiled_with_neighbours_lands_at_their_mean_position() -> None:
 
     link_rows = [_Row(from_id=a, to_id=b, type="cites"), _Row(from_id=a, to_id=c, type="cites")]
     out = _place_unfiled([a], link_rows, placed)
-    assert np.allclose(out[a], [100.0, 0.0])
+    # within the small deterministic jitter's own bound, not exact -- THE LONG
+    # EDGES RULING added a tiny jitter so several unfiled objects sharing one
+    # neighbour set don't land on the exact same point.
+    assert np.linalg.norm(out[a] - np.array([100.0, 0.0])) < _MIN_SEPARATION
+
+
+def test_place_unfiled_counts_a_structural_link_as_a_neighbour() -> None:
+    """THE LONG EDGES RULING (operator, grounds 9163b1c7): an unfiled object
+    linked ONLY by a structural type (e.g. sent_by) must still land near that
+    neighbour, not fall through to fog -- the old semantic-only filter was
+    exactly what stranded 1,960 live objects as a "beam" of long edges."""
+    a, b = uuid.uuid4(), uuid.uuid4()
+    placed = {b: np.array([500.0, 500.0])}
+
+    class _Row(dict):
+        def __getitem__(self, key: str) -> object:
+            return dict.__getitem__(self, key)
+
+    link_rows = [_Row(from_id=a, to_id=b, type="sent_by")]
+    out = _place_unfiled([a], link_rows, placed)
+    assert np.linalg.norm(out[a] - placed[b]) < 5000.0  # near, not fog-scattered far away
+
+
+def test_place_unfiled_excludes_a_hub_from_the_neighbour_mean() -> None:
+    """A hub's own "mean position of neighbours" is meaningless -- almost
+    everything structurally touches a hub. An unfiled object linked to a real
+    neighbour AND a hub must land near the real neighbour, not pulled toward
+    the hub (or the mean of both, which would be neither)."""
+    a, real_neighbour, hub = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    placed = {real_neighbour: np.array([100.0, 0.0]), hub: np.array([10_000.0, 10_000.0])}
+
+    class _Row(dict):
+        def __getitem__(self, key: str) -> object:
+            return dict.__getitem__(self, key)
+
+    link_rows = [
+        _Row(from_id=a, to_id=real_neighbour, type="cites"),
+        _Row(from_id=a, to_id=hub, type="sent_by"),
+    ]
+    out = _place_unfiled([a], link_rows, placed, hub_ids={hub})
+    dist_to_real = np.linalg.norm(out[a] - placed[real_neighbour])
+    dist_to_hub = np.linalg.norm(out[a] - placed[hub])
+    # near the real neighbour (small jitter aside), nowhere close to the hub --
+    # a mean-of-both would land near (5050, 5050), roughly equidistant instead
+    assert dist_to_real < 100.0
+    assert dist_to_hub > 5000.0
 
 
 def test_place_unfiled_never_lands_within_min_sep_of_an_already_placed_point() -> None:
@@ -635,6 +664,42 @@ def test_declump_until_converged_never_flakes_on_many_random_small_unfiled_pops(
             _declumped, worst, _iters = graph_physics._declump_until_converged_or_budget(
                 pos, ids, min_sep=_MIN_SEPARATION, budget_secs=5.0)
             _verify_min_separation(worst)  # raises on failure -- the assertion
+
+
+def test_long_edge_counts_counts_only_edges_past_the_threshold_by_type() -> None:
+    a, b, c, d, e = (uuid.uuid4() for _ in range(5))
+    positions = {
+        a: np.array([0.0, 0.0]), b: np.array([100.0, 0.0]),  # short
+        c: np.array([0.0, 0.0]), d: np.array([30_000.0, 0.0]),  # long
+        e: np.array([0.0, 30_000.0]),  # long, different type
+    }
+
+    class _Row(dict):
+        def __getitem__(self, key: str) -> object:
+            return dict.__getitem__(self, key)
+
+    link_rows = [
+        _Row(from_id=a, to_id=b, type="cites"),
+        _Row(from_id=c, to_id=d, type="cites"),
+        _Row(from_id=c, to_id=e, type="sent_by"),
+    ]
+    out = graph_physics._long_edge_counts(link_rows, positions)
+    assert out["layout_long_edge_total"] == 2
+    by_type = {t["type"]: t["count"] for t in out["layout_long_edge_by_type_top8"]}
+    assert by_type == {"cites": 1, "sent_by": 1}
+
+
+def test_long_edge_counts_skips_edges_missing_a_final_position() -> None:
+    a, b = uuid.uuid4(), uuid.uuid4()
+    positions = {a: np.array([0.0, 0.0])}  # b has no final position
+
+    class _Row(dict):
+        def __getitem__(self, key: str) -> object:
+            return dict.__getitem__(self, key)
+
+    link_rows = [_Row(from_id=a, to_id=b, type="cites")]
+    out = graph_physics._long_edge_counts(link_rows, positions)
+    assert out["layout_long_edge_total"] == 0
 
 
 def test_place_hubs_in_zone_spreads_hubs_at_least_min_sep_apart() -> None:
