@@ -788,6 +788,8 @@ async def cmd_layout(
                     f"{receipt['layout_min_top10_centroid_gap']:.1f}"
                     f"\n  biggest-project 5-NN purity: "
                     f"{receipt['layout_biggest_project_5nn_purity']}"
+                    f"\n  communities: {receipt.get('community_count', 'n/a')} "
+                    f"({receipt.get('community_seed_scheme', 'n/a')})"
                     if "layout_bbox_width" in receipt else "")
                 if "error" in receipt:
                     print(f"osiris layout: {receipt['error']}{declump_note}"

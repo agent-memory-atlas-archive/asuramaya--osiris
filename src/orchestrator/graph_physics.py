@@ -156,6 +156,7 @@ epsilon that flags ordinary residual noise as a failure.
 from __future__ import annotations
 
 import math
+import random
 import resource
 import time
 import uuid
@@ -423,7 +424,20 @@ def _detect_communities(
     a container/structural type). A project at or under the threshold, or a member in
     a community too small to be a real district, is simply absent from the returned
     dict -- the caller treats that as "attach directly to the project", no special
-    casing needed on this function's own side."""
+    casing needed on this function's own side.
+
+    THE LEIDEN SEED FIX (bbox compactness follow-up, decision cc2f2ea7, measured
+    live): igraph's `community_leiden` draws from Python's own `random` module by
+    default (its own documented behaviour, no wiring needed) with whatever state
+    that module happens to be in -- unseeded, so the SAME population could and did
+    measure a 4x-different bbox between two live `--verify-only` runs of identical
+    code, purely from a different community partition landing each time. Reseeding
+    `random` from `pid` right before each project's own Leiden call (a project's
+    community structure never depends on any OTHER project's, so a per-project
+    seed can't leak cross-project correlation) makes every project's own partition
+    -- and therefore every downstream real_extent/bbox/purity number -- reproduce
+    identically run to run, the same "SEEDED, DETERMINISTIC" guarantee
+    `_seed_positions` already gives the FR starting layout."""
     by_project: dict[uuid.UUID, list[uuid.UUID]] = defaultdict(list)
     for oid, pid in membership.items():
         if oid in active:
@@ -443,6 +457,7 @@ def _detect_communities(
         sub = ig.Graph()
         sub.add_vertices(len(members))
         sub.add_edges(edges)
+        random.seed(pid.int)
         clustering = sub.community_leiden(objective_function="modularity", n_iterations=2)
         sizes = clustering.sizes()
         for oid in members:
@@ -1227,6 +1242,8 @@ async def _physics_positions(
     if diagnostics is not None:
         diagnostics["declump_worst_residual"] = worst_residual
         diagnostics["declump_iterations"] = declump_iters
+        diagnostics["community_count"] = len({(pid, c) for pid, c in communities.values()})
+        diagnostics["community_seed_scheme"] = "leiden seeded per-project from pid.int"
         diagnostics.update(_layout_acceptance_metrics(
             declumped, object_ids, membership, groups, project_ids, radii))
     _verify_min_separation(worst_residual, min_sep=_MIN_SEPARATION)
