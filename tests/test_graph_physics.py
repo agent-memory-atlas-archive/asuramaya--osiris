@@ -251,6 +251,45 @@ async def test_detect_communities_finds_real_clusters_above_threshold(
     assert communities[a1][1] != communities[b1][1]
 
 
+async def test_detect_communities_is_deterministic_across_repeated_calls(
+    actions: Actions, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE LEIDEN SEED FIX (bbox compactness follow-up, decision cc2f2ea7): igraph's
+    `community_leiden` draws from Python's own unseeded `random` module by default,
+    so the SAME population could partition differently call to call -- measured
+    live, a 4x bbox swing on identical code. A project with several plausible,
+    roughly-balanced clusters (not one dominant pair) is what actually exercises
+    Leiden's own randomness; calling `_detect_communities` twice over the exact
+    same input must return the exact same partition now that it reseeds from
+    `pid.int` before each project's own Leiden call."""
+    monkeypatch.setattr(graph_physics, "_COMMUNITY_MIN_MEMBERS", 3)
+    monkeypatch.setattr(graph_physics, "_COMMUNITY_MIN_SIZE", 2)
+
+    proj = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gp-communities-deterministic", "test")
+    now = datetime.now(UTC)
+    clusters = [
+        [await actions.create_or_find_object("Thread", f"thread:gp-det-{c}-{i}", "test")
+         for i in range(3)]
+        for c in range(4)
+    ]
+    members = [oid for cluster in clusters for oid in cluster]
+    for oid in members:
+        await actions.create_link(oid, proj, "in_repo", "test", now, 1.0)
+    for cluster in clusters:
+        for i in range(len(cluster)):
+            for j in range(i + 1, len(cluster)):
+                await actions.create_link(cluster[i], cluster[j], "cites", "test", now, 1.0)
+
+    link_rows = await graph_physics._live_link_rows(actions)
+    membership = await _project_membership(actions)
+    active = set(members)
+
+    first = _detect_communities(link_rows, membership, active)
+    second = _detect_communities(link_rows, membership, active)
+    assert first == second
+
+
 async def test_detect_communities_below_threshold_project_yields_nothing(
     actions: Actions,
 ) -> None:
