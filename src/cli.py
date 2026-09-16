@@ -798,9 +798,11 @@ async def cmd_layout(
                     by_type = "".join(
                         f"\n    {t['type']}: {t['count']}"
                         for t in receipt.get("layout_long_edge_by_type_top8", []))
+                    relocated = receipt.get("layout_container_vertices_relocated", "n/a")
                     long_edge_note = (
                         f"\n  edges over 20k units: {receipt['layout_long_edge_total']}"
-                        f"{by_type}")
+                        f"{by_type}"
+                        f"\n  container vertices relocated to hub zone: {relocated}")
                 acceptance_note = (
                     f"\n  bbox width {receipt['layout_bbox_width']}"
                     f"\n  min top-10 centroid gap vs. R_a+R_b: "

@@ -172,6 +172,7 @@ import numpy as np
 from src.actions.core import Actions
 from src.ontology.link_classes import CONTAINER_LINK_TYPES, STRUCTURAL_LINK_TYPES
 from src.orchestrator.graph_layout import (
+    _MEMBERSHIP_CONTAINER_LINK_TYPES,
     _MIN_SEPARATION,
     _bulk_assert_positions,
     _declump,
@@ -1197,6 +1198,20 @@ async def _physics_positions(
 
     hub_ids = await _hub_ids(actions, object_ids)
     hub_order = [oid for oid in object_ids if oid in hub_ids]
+
+    if diagnostics is not None:
+        # THE LONG EDGES RULING tip (d)'s own acceptance line: a MEMBERSHIP
+        # container (any TARGET of a live in_repo/works_in/holds/member_of
+        # link) must never be a hub-zone candidate -- this must always measure
+        # 0. Matches `_hub_ids`'s own exclusion set exactly, NOT the wider
+        # `CONTAINER_LINK_TYPES` -- a legitimate acts_for/spawned_by-target hub
+        # (a Person, a coordinator) is supposed to still be here; counting it
+        # as a false "relocation" would measure a claim this tip never made.
+        container_targets = {
+            r["to_id"] for r in link_rows
+            if r["type"] in _MEMBERSHIP_CONTAINER_LINK_TYPES}
+        diagnostics["layout_container_vertices_relocated"] = len(
+            container_targets & set(hub_order))
 
     # THE RESCALE COMPRESSION FIX: raw level-2 layouts (already floor-respecting,
     # per `_level2_raw_layout_for_project`'s own local declump) computed BEFORE
