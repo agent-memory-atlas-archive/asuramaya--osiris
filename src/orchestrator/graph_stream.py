@@ -333,7 +333,13 @@ async def _nameless_agent_fallbacks(
         seat = await held_seat(pool, canonical)
         if seat and seat.get("handle"):
             gen = _generation(canonical)[1]
-            out[oid] = f"{seat['handle']} {_to_roman(gen)}" if gen > 1 else seat["handle"]
+            # UPPERCASE (Thoth mail 11283: "unify the roman case... 'Thoth CVI'
+            # and 'Sekhmet XXXVIII' is how the fleet already writes them") -- was
+            # lowercase `_to_roman`'s own raw output; the fleet's own mail/seat
+            # displays already write these uppercase, so this was the label
+            # scheme's own outlier, not the other way around.
+            out[oid] = (
+                f"{seat['handle']} {_to_roman(gen).upper()}" if gen > 1 else seat["handle"])
             continue
         detail = detail_by_id.get(oid)
         patronym = detail["patronym"] if detail else None
@@ -341,10 +347,6 @@ async def _nameless_agent_fallbacks(
             out[oid] = canonical.removeprefix("agent:")
             continue
         gen = _generation(canonical)[1]
-        # UPPERCASE roman, unlike the seat-branch above's own lowercase
-        # `_to_roman` -- disclosed inconsistency, not an oversight: the operator's
-        # own worked example (mail, grounds 9163b1c7) wrote "XXXVIII", and the
-        # seat-branch's established lowercase convention is untouched here.
         label = f"{patronym} {_to_roman(gen).upper()}" if gen > 1 else patronym
         model = detail["model"] if detail else None
         if model:

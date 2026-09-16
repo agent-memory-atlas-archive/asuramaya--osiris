@@ -488,6 +488,37 @@ def test_level1_layout_places_a_single_project_at_the_origin_ish() -> None:
     assert out[pid].shape == (2,)
 
 
+def test_fr_weights_from_cross_edges_compresses_range_but_preserves_order() -> None:
+    a, b = uuid.uuid4(), uuid.uuid4()
+    c, d = uuid.uuid4(), uuid.uuid4()
+    cross_edges = {(a, b): 9500.0, (c, d): 5.0}
+    weights = graph_physics._fr_weights_from_cross_edges(cross_edges)
+    # still monotonic (heavier pair still weighs more)...
+    assert weights[(a, b)] > weights[(c, d)]
+    # ...but the RATIO is compressed relative to the raw counts' own 1900x gap
+    raw_ratio = 9500.0 / 5.0
+    weighted_ratio = weights[(a, b)] / weights[(c, d)]
+    assert weighted_ratio < raw_ratio
+    # the input dict itself is never mutated -- callers needing the real count still can
+    assert cross_edges[(a, b)] == 9500.0
+
+
+def test_long_edges_a_strongly_linked_pair_ends_up_closer_than_an_unlinked_one() -> None:
+    """THE LONG EDGES FIX (operator ruling, grounds 9163b1c7): seat:34f4e5fa and
+    repo:osiris measured 33k units apart despite ~9,500 cross-links between them.
+    Four same-sized projects: (a,b) heavily cross-linked, (c,d) not linked at all
+    -- (a,b) must end up closer together than (c,d), the acceptance shape this
+    fix exists to produce."""
+    a, b, c, d = uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    radii = {a: 500.0, b: 500.0, c: 500.0, d: 500.0}
+    raw_cross_edges = {(a, b): 9500.0}
+    weights = graph_physics._fr_weights_from_cross_edges(raw_cross_edges)
+    out = _level1_layout([a, b, c, d], radii, weights)
+    dist_ab = float(np.linalg.norm(out[a] - out[b]))
+    dist_cd = float(np.linalg.norm(out[c] - out[d]))
+    assert dist_ab < dist_cd
+
+
 def test_apply_bridge_nudges_moves_a_bridging_member_toward_the_other_centroid() -> None:
     a, b, proj_a, proj_b = uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     positions = {a: np.array([0.0, 0.0]), b: np.array([100.0, 0.0])}

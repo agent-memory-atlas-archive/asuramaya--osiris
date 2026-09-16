@@ -222,6 +222,25 @@ _LEVEL1_GUTTER = 3 * _MIN_SEPARATION  # extra clearance beyond R_a+R_b between a
                                       # requires >= R_a+R_b; a real gutter keeps a
                                       # bridging member's own facing-edge nudge (below)
                                       # from ever pushing it into the NEXT project.
+_CROSS_PROJECT_WEIGHT_SCALE = _LEVEL1_GUTTER  # THE LONG EDGES FIX (operator ruling,
+                                      # grounds 9163b1c7, measured live): seat:34f4e5fa
+                                      # (the seats repo) and repo:osiris sat 33k units
+                                      # apart despite ~9,500 authored_by cross-links
+                                      # between them -- a raw link count fed straight
+                                      # into FR as edge weight spans 1 to ~9,500 across
+                                      # real project pairs, a dynamic range wide enough
+                                      # that ONE extreme outlier pair can destabilise
+                                      # FR's own iteration rather than just pulling
+                                      # harder. log1p(count) compresses that range; this
+                                      # scale then rescales the compressed value back up
+                                      # so the strongest pair's own spring dominates
+                                      # `_separate_extents`' fixed `_LEVEL1_GUTTER`
+                                      # instead of getting lost at FR's own force scale
+                                      # -- chosen equal to the gutter itself as the
+                                      # starting point "beats the gutter" names most
+                                      # directly; verify-only's own new top5-linked-pair
+                                      # receipt fields are what actually confirms this,
+                                      # not the constant's own value in isolation.
 _INTRA_PROJECT_GUTTER = _MIN_SEPARATION  # THE INTRA-PROJECT GUTTER FIX (live
                                          # specimen: the first real v8 write, deployed
                                          # ba9669a4, measured as a 163k-unit bbox with
@@ -667,6 +686,24 @@ def _separate_extents(
         push = np.where(mask[..., None], direction * (violation[..., None] / 2), 0.0)
         pos = pos + push.sum(axis=1)
     return pos
+
+
+def _fr_weights_from_cross_edges(
+    cross_edges: dict[tuple[uuid.UUID, uuid.UUID], float],
+) -> dict[tuple[uuid.UUID, uuid.UUID], float]:
+    """THE LONG EDGES FIX: `log1p(count) * _CROSS_PROJECT_WEIGHT_SCALE`, never the
+    raw count -- a raw cross-project link count spans 1 to ~9,500 across real
+    project pairs (measured live), a dynamic range wide enough that ONE extreme
+    outlier pair fed straight into `layout_fruchterman_reingold` as edge weight
+    can destabilise FR's own iteration instead of just pulling harder. log1p
+    compresses that range while preserving relative order (still monotonic, so
+    "the top-5 most-linked pairs" ranks identically either way); the scale then
+    rescales the compressed value back up so the strongest pair's own spring
+    actually dominates `_separate_extents`' fixed gutter rather than getting
+    lost at FR's own force scale. Never mutates `cross_edges` itself -- callers
+    that need the real count for reporting (this module's own acceptance
+    diagnostics, `_apply_bridge_nudges`) read the untransformed dict."""
+    return {k: math.log1p(v) * _CROSS_PROJECT_WEIGHT_SCALE for k, v in cross_edges.items()}
 
 
 def _level1_layout(
@@ -1192,7 +1229,29 @@ async def _physics_positions(
         radii[_HUB_ZONE_ID] = _hub_zone_radius(len(hub_order))
         level1_ids.append(_HUB_ZONE_ID)
     cross_edges = _cross_project_edges(link_rows, membership, project_id_set)
-    centroids = _level1_layout(level1_ids, radii, cross_edges)
+    # THE LONG EDGES FIX (operator ruling, grounds 9163b1c7): `_cross_project_edges`
+    # keeps returning a RAW link count (unchanged, `_apply_bridge_nudges` and this
+    # function's own reporting below both still want the real count) -- the log1p
+    # scale (`_fr_weights_from_cross_edges`) is applied HERE, only for the FR
+    # weight `_level1_layout` actually sees, never touching the intra-project
+    # community-split call one level deeper (`_level2_raw_layout_for_project`'s
+    # own `_level1_layout` reuse), which was never asked for this and has its
+    # own, different weight shape.
+    fr_weights = _fr_weights_from_cross_edges(cross_edges)
+    centroids = _level1_layout(level1_ids, radii, fr_weights)
+
+    if diagnostics is not None and cross_edges:
+        top5 = sorted(cross_edges.items(), key=lambda kv: -kv[1])[:5]
+        pair_stats = []
+        for (a, b), link_count in top5:
+            dist = float(np.linalg.norm(centroids[a] - centroids[b]))
+            radii_sum = radii.get(a, _MIN_SEPARATION) + radii.get(b, _MIN_SEPARATION)
+            pair_stats.append({
+                "pair": (str(a), str(b)), "link_count": link_count,
+                "centroid_distance": dist, "radii_sum": radii_sum,
+                "within_2x_radii_sum": dist <= 2 * radii_sum,
+            })
+        diagnostics["layout_top5_linked_pairs"] = pair_stats
 
     positions: dict[uuid.UUID, np.ndarray] = {}
     for pid in project_ids:
