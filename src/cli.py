@@ -782,6 +782,9 @@ async def cmd_layout(
                     f" (worst residual {receipt['declump_worst_residual']:.3f}, "
                     f"{receipt['declump_iterations']} declump iterations)"
                     if "declump_worst_residual" in receipt else "")
+                rss_note = (
+                    f" [peak {receipt['peak_rss_kb'] / 1024:.0f} MB]"
+                    if "peak_rss_kb" in receipt else "")
                 acceptance_note = (
                     f"\n  bbox width {receipt['layout_bbox_width']}"
                     f"\n  min top-10 centroid gap vs. R_a+R_b: "
@@ -792,7 +795,7 @@ async def cmd_layout(
                     f"({receipt.get('community_seed_scheme', 'n/a')})"
                     if "layout_bbox_width" in receipt else "")
                 if "error" in receipt:
-                    print(f"osiris layout: {receipt['error']}{declump_note}"
+                    print(f"osiris layout: {receipt['error']}{rss_note}{declump_note}"
                           f"{acceptance_note}", file=sys.stderr)
                     rc = 1
                     break
@@ -801,10 +804,11 @@ async def cmd_layout(
                           + (f" ({receipt['count']})" if "count" in receipt else ""))
                 elif receipt.get("verify_only"):
                     print(f"osiris layout: verify-only OK — {receipt['placed']} objects "
-                          f"would be placed, nothing written{declump_note}{acceptance_note}")
+                          f"would be placed, nothing written{rss_note}{declump_note}"
+                          f"{acceptance_note}")
                 elif receipt.get("done"):
                     print(f"osiris layout: done — {receipt['placed']} objects placed "
-                          f"under the physics layout{declump_note}{acceptance_note}")
+                          f"under the physics layout{rss_note}{declump_note}{acceptance_note}")
             return rc
         async for receipt in run_layout_migrate(actions, limit=limit):
             if "error" in receipt:

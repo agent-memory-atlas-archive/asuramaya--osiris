@@ -1357,7 +1357,11 @@ async def run_physics_migrate(
     final `{"done": True, "placed": N, "peak_rss_kb": N}` -- `_physics_positions` can
     raise `MemoryBudgetExceeded` (THE COLLAPSED-CONTAINER FIX, Thoth mail 11111) or
     `DeclumpVerificationFailed` (item 2, Thoth mail 11128), either turned here into a
-    single `{"error": ...}` receipt with no write.
+    single `{"error": ...}` receipt with no write. `peak_rss_kb` (THE RECEIPT-STATS
+    TIP, decision cc2f2ea7) rides on EVERY receipt shape now, not just a real
+    write's own -- `--verify-only`, this session's own standard diagnostic tool,
+    used to report nothing about memory at all despite `_memory_guard` already
+    computing it internally.
 
     `verify_only=True` (ruling 6befd2a5, Thoth mail 11178, added after the fourth
     live migration attempt needed a fourth deploy-probe-diagnose cycle just to see
@@ -1379,11 +1383,21 @@ async def run_physics_migrate(
             try:
                 positions = await _physics_positions(actions, diagnostics=diagnostics)
             except (MemoryBudgetExceeded, DeclumpVerificationFailed) as exc:
-                yield {"error": str(exc), **diagnostics}
+                peak_rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                yield {"error": str(exc), "peak_rss_kb": peak_rss_kb, **diagnostics}
                 return
+            # THE RECEIPT-STATS TIP (bbox compactness follow-up, decision cc2f2ea7):
+            # `peak_rss_kb` used to appear only on a real write's own receipt --
+            # measured AFTER the write loop below, so a `--verify-only` run (this
+            # session's own standard diagnostic tool, used every round tonight)
+            # never reported it at all, despite `_physics_positions`'s own
+            # `_memory_guard` already computing memory internally. Measuring right
+            # after `_physics_positions` returns/raises covers all three receipt
+            # shapes (error, verify-only, done) from ONE call.
+            peak_rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
             if verify_only:
                 yield {"done": True, "verify_only": True, "placed": len(positions),
-                       **diagnostics}
+                       "peak_rss_kb": peak_rss_kb, **diagnostics}
                 return
             yield {"stage": "writing", "count": len(positions)}
             now = datetime.now(UTC)
