@@ -212,13 +212,20 @@ def test_downstream_is_a_toggle_off_by_default() -> None:
 # --- AMENDMENT item 4: ego relayout while focused, temporary, restored on clear -----------
 
 def test_ego_relayout_exists_and_ranks_ancestors_leftward_roots_farthest() -> None:
-    assert "function applyEgoLayout(focusId, hopsUp, hopsDown)" in _SPACE_JS
-    body = _SPACE_JS.split("function applyEgoLayout(focusId, hopsUp, hopsDown)", 1)[1][:1600]
+    assert "function applyEgoLayout(focusId, hopsUp, hopsDown, extraSeed)" in _SPACE_JS
+    body = _SPACE_JS.split(
+        "function applyEgoLayout(focusId, hopsUp, hopsDown, extraSeed)", 1)[1][:3600]
     # ancestors (hopsUp) get a NEGATIVE signed rank -- more hops (closer to root) = further
     # negative = further left; downstream (hopsDown) gets a positive rank, mirrored right.
     assert "(byRank.get(-hop) || (byRank.set(-hop, []), byRank.get(-hop))).push(id);" in body
     assert "(byRank.get(hop) || (byRank.set(hop, []), byRank.get(hop))).push(id);" in body
-    assert "const x = cx + signedHop * colW;" in body
+    # THE SUCCESSION CHAIN COLUMN COMPRESSION (mail 11272 items 2/4) replaced the old flat
+    # `const x = cx + signedHop * colW;` with a progressive per-side accumulation (colX) so
+    # a pure succession run can use the tighter chain width instead of the full column
+    # width every hop -- still ranks ancestors leftward/roots farthest, just not at a fixed
+    # per-hop multiple any more.
+    assert "const colX = new Map([[0, cx]]);" in body
+    assert "const x = colX.get(signedHop);" in body
 
 
 def test_ego_layout_spacing_is_screen_pixels_converted_to_world_at_a_stable_scale() -> None:
@@ -228,7 +235,8 @@ def test_ego_layout_spacing_is_screen_pixels_converted_to_world_at_a_stable_scal
     # near-empty viewSize. maxViewSize (the whole graph's own stable fitted scale) fixes it.
     assert "const EGO_COL_SPACING_PX = 150;" in _SPACE_JS
     assert "const EGO_ROW_SPACING_PX = 34;" in _SPACE_JS
-    body = _SPACE_JS.split("function applyEgoLayout(focusId, hopsUp, hopsDown)", 1)[1][:900]
+    body = _SPACE_JS.split(
+        "function applyEgoLayout(focusId, hopsUp, hopsDown, extraSeed)", 1)[1][:900]
     assert "const wpp = maxViewSize / wrap.clientHeight;" in body
     assert "const colW = EGO_COL_SPACING_PX * wpp, rowH = EGO_ROW_SPACING_PX * wpp;" in body
 
@@ -239,7 +247,8 @@ def test_ego_layout_is_temporary_clear_restores_the_stored_positions() -> None:
     assert "nd.x = pos.x; nd.y = pos.y;" in restore_body
     clear_body = _SPACE_JS.split("function clearFocus()", 1)[1][:400]
     assert "restoreEgoLayout();" in clear_body
-    apply_body = _SPACE_JS.split("function applyEgoLayout(focusId, hopsUp, hopsDown)", 1)[1][:200]
+    apply_body = _SPACE_JS.split(
+        "function applyEgoLayout(focusId, hopsUp, hopsDown, extraSeed)", 1)[1][:200]
     assert "restoreEgoLayout();" in apply_body  # a fresh focus never layers onto a stale one
 
 
