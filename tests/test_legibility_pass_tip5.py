@@ -313,7 +313,7 @@ def test_project_stubs_are_capped_not_one_dom_div_per_boundary_node() -> None:
     # Capped again to 20 (from 80) once THE STUB AGGREGATION FIX (mail 11241) made
     # aggregation do most of the decluttering itself.
     assert "const MAX_PROJECT_STUBS = 20;" in _SPACE_JS
-    body = _SPACE_JS.split("function buildProjectStubs()", 1)[1][:1600]
+    body = _SPACE_JS.split("function buildProjectStubs()", 1)[1][:3900]
     assert "all.sort((a, b) => b.count - a.count);" in body
     assert "projectStubEntries = all.slice(0, MAX_PROJECT_STUBS);" in body
 
@@ -363,7 +363,7 @@ def test_project_stubs_are_aggregated_by_project_pair_not_by_individual_node() -
     # should have been hidden stayed visible -- and was reverted). (b) grouping by
     # individual boundary node was the wrong unit; regrouped to (visible node's own
     # project, hidden project), aggregated across every node in that pair.
-    body = _SPACE_JS.split("function buildProjectStubs()", 1)[1][:1600]
+    body = _SPACE_JS.split("function buildProjectStubs()", 1)[1][:3900]
     assert 'if (hiddenNd.project === "unfiled") continue;' in body
     assert "const key = `${visible.project}|${hiddenNd.project}`;" in body
     assert "visibleProject: visible.project, hiddenProject: hiddenNd.project," in body
@@ -413,3 +413,53 @@ def test_edges_are_a_live_verification_debug_hook_too() -> None:
     # rest of this api object.
     body = _SPACE_JS.split("const api = {", 1)[1][:400]
     assert "get edges() { return edges; }," in body
+
+
+def test_wheel_timing_instrumentation_is_gated_never_runs_for_a_real_user() -> None:
+    # THE WHEEL HANG INVESTIGATION (Thoth mail 11248): live-verification's own proof, not a
+    # code fix -- there was no application bug to fix. A raw dispatched wheel event, given a
+    # full uninterrupted 40 real seconds, produced zero renders and zero worldPerPx change;
+    # requestAnimationFrame simply never fired in the claude-in-chrome sandbox tab (document
+    # .hidden stayed true throughout). The instant ANY tool action forced the browser to
+    # composite that tab (a screenshot; apparently the scroll gesture's own delivery too),
+    # the queued callback ran immediately and logged its own delay: 96134.40 ms from wheel
+    # event to applyPendingWheel actually firing, computing in 4.4 ms once it did. The
+    # per-stage timers stay in the shipped file (same "debug hooks alongside the real api"
+    # convention as window.__spaceDebugTiming/forceRender/zoomAt) but must cost nothing for
+    # anyone who never sets the flag.
+    for fn in ("function renderIfDirty()", "function zoomAt(clientX, clientY, deltaY)",
+               "function applyPendingWheel()"):
+        body = _SPACE_JS.split(fn, 1)[1][:250]
+        assert "window.__spaceWheelTiming" in body
+
+
+# --- two minors from Thoth's own review of w300 (mail 11249) ------------------------------
+
+def test_fit_trims_the_outermost_percentile_not_the_exact_min_max_bbox() -> None:
+    # live-verified: a handful of far outliers in the visible set stretched the exact bbox
+    # enough that the osiris cluster sat in one corner at 67 wpp instead of filling the
+    # frame. fitToNodes now sorts each axis and trims the outermost 1% before framing --
+    # confirmed live: 87.8 wpp (whole graph, unfiltered) -> 11.0 wpp (osiris-only,
+    # percentile-trimmed), cluster genuinely fills the view.
+    body = _SPACE_JS.split("function fitToNodes(list)", 1)[1][:900]
+    assert "xs.sort((a, b) => a - b);" in body
+    assert "ys.sort((a, b) => a - b);" in body
+    assert "const lo = Math.floor(xs.length * 0.01);" in body
+    assert "const hi = Math.max(lo, Math.ceil(xs.length * 0.99) - 1);" in body
+
+
+def test_project_stubs_are_placed_at_the_boundary_toward_the_hidden_project() -> None:
+    # live-verified: aggregation + de-overlap alone still centered every stub for the same
+    # visible project on that project's own centroid, so positionProjectStubs' own greedy
+    # nudge just stacked them in one column straight down from there. Each stub now sits at
+    # the visible cluster's own boundary (its 98th-percentile radius -- the SAME trim
+    # fitToNodes uses, not the raw max, or a wide-spread project like osiris placed every
+    # stub tens of thousands of units off-screen) offset toward the specific hidden
+    # project's own real centroid, so stubs naming different hidden projects fan out by
+    # direction instead of sharing one spot. Confirmed live: 20/20 stubs on-screen, zero
+    # duplicate screen positions.
+    body = _SPACE_JS.split("function buildProjectStubs()", 1)[1][:3900]
+    assert "const centroids = new Map();" in body
+    assert "arr[Math.min(arr.length - 1, Math.floor(arr.length * 0.98))]" in body
+    assert "const dx = hc.x - vc.x, dy = hc.y - vc.y;" in body
+    assert "x = vc.x + (dx / dist) * r;" in body

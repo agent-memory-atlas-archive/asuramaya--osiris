@@ -330,10 +330,20 @@ export async function initSpace(container) {
   // place decides whether the tone-map pass runs, never duplicated.
   function renderScene() {
     if (sceneTarget) {
-      renderer.setRenderTarget(sceneTarget);
-      renderer.render(scene, camera);
-      renderer.setRenderTarget(null);
-      renderer.render(toneMapScene, toneMapCamera);
+      if (window.__spaceWheelTiming) {
+        const t0 = performance.now();
+        renderer.setRenderTarget(sceneTarget);
+        renderer.render(scene, camera);
+        const t1 = performance.now();
+        renderer.setRenderTarget(null);
+        renderer.render(toneMapScene, toneMapCamera);
+        console.debug("[wheel] renderScene: HDR pass", (t1 - t0).toFixed(2), "ms; tone-map pass", (performance.now() - t1).toFixed(2), "ms");
+      } else {
+        renderer.setRenderTarget(sceneTarget);
+        renderer.render(scene, camera);
+        renderer.setRenderTarget(null);
+        renderer.render(toneMapScene, toneMapCamera);
+      }
     } else {
       renderer.render(scene, camera);
     }
@@ -341,8 +351,22 @@ export async function initSpace(container) {
   function renderIfDirty() {
     rafPending = false;
     if (!running || !dirty) return;
-    renderScene();
-    positionLabels();
+    // WHEEL HANG INSTRUMENTATION (Thoth mail 11248): temporary, gated behind
+    // window.__spaceWheelTiming -- per-stage performance.now() around the two costs a
+    // wheel tick actually pays for (this render call, and positionLabels' own tail of
+    // drill/anchor/stub positioning), logged so a single real tick's own cost is visible
+    // stage-by-stage rather than guessed at.
+    if (window.__spaceWheelTiming) {
+      const t0 = performance.now();
+      renderScene();
+      const t1 = performance.now();
+      positionLabels();
+      const t2 = performance.now();
+      console.debug("[wheel] renderScene", (t1 - t0).toFixed(2), "ms; positionLabels", (t2 - t1).toFixed(2), "ms");
+    } else {
+      renderScene();
+      positionLabels();
+    }
     dirty = false;
   }
   function pause() { running = false; }
@@ -814,13 +838,22 @@ export async function initSpace(container) {
     return idToNode.filter(nodeVisible);
   }
   function fitToNodes(list) {
-    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    // THE 98TH-PERCENTILE FIT FIX (Thoth mail 11249): a handful of far outliers in the
+    // visible set stretched the exact min/max bbox enough that the actual cluster sat in
+    // one corner at a much-too-zoomed-out view (measured live: osiris at 67 wpp). Trim the
+    // outermost 1% on each axis before framing -- still the real bbox, just not held
+    // hostage by a few stray points.
+    const xs = [], ys = [];
     for (const nd of list) {
       if (nd.x == null || nd.y == null) continue;
-      minX = Math.min(minX, nd.x); maxX = Math.max(maxX, nd.x);
-      minY = Math.min(minY, nd.y); maxY = Math.max(maxY, nd.y);
+      xs.push(nd.x); ys.push(nd.y);
     }
-    if (!Number.isFinite(minX)) return;
+    if (!xs.length) return;
+    xs.sort((a, b) => a - b);
+    ys.sort((a, b) => a - b);
+    const lo = Math.floor(xs.length * 0.01);
+    const hi = Math.max(lo, Math.ceil(xs.length * 0.99) - 1);
+    const minX = xs[lo], maxX = xs[hi], minY = ys[lo], maxY = ys[hi];
     camera.position.x = (minX + maxX) / 2;
     camera.position.y = (minY + maxY) / 2;
     const span = Math.max(maxX - minX, maxY - minY, 0);
@@ -1337,8 +1370,7 @@ export async function initSpace(container) {
     disposeProjectStubs();
     if (hiddenProjects.size === 0) return;
     // one entry per (visible node's own PROJECT, hidden project) pair -- not per node.
-    // key -> {visibleProject, hiddenProject, count, sumX, sumY, n}
-    const groups = new Map();
+    const groups = new Map(); // key -> {visibleProject, hiddenProject, count}
     for (const e of edges) {
       const na = idById.get(e.source), nb = idById.get(e.target);
       if (!na || !nb) continue;
@@ -1348,18 +1380,56 @@ export async function initSpace(container) {
       if (!nodeVisible(visible)) continue; // the visible side must actually be shown itself
       if (hiddenNd.project === "unfiled") continue; // never a real, pickable project
       const key = `${visible.project}|${hiddenNd.project}`;
-      const g = groups.get(key) || {
-        visibleProject: visible.project, hiddenProject: hiddenNd.project,
-        count: 0, sumX: 0, sumY: 0, n: 0, seen: new Set(),
-      };
+      const g = groups.get(key) || { visibleProject: visible.project, hiddenProject: hiddenNd.project, count: 0 };
       g.count++;
-      if (!g.seen.has(visible.id)) { g.seen.add(visible.id); g.sumX += visible.x || 0; g.sumY += visible.y || 0; g.n++; }
       groups.set(key, g);
     }
-    const all = [...groups.values()].map((g) => ({
-      x: g.sumX / g.n, y: g.sumY / g.n,
-      visibleProject: g.visibleProject, hiddenProject: g.hiddenProject, count: g.count, div: null,
-    }));
+    if (!groups.size) { projectStubEntries = []; return; }
+    // THE STUB PLACEMENT FIX (Thoth mail 11249): "place each at the cluster boundary
+    // toward its hidden project's centroid" -- every project's own centroid and radius,
+    // in one pass over idToNode (real positions exist regardless of visibility), so a
+    // stub for (osiris, projA) and one for (osiris, projB) fan out toward projA's and
+    // projB's own real direction instead of both landing on osiris's own centroid and
+    // stacking there.
+    const sums = new Map(); // project -> {sx, sy, n}
+    for (const nd of idToNode) {
+      const s = sums.get(nd.project) || { sx: 0, sy: 0, n: 0 };
+      s.sx += nd.x || 0; s.sy += nd.y || 0; s.n++;
+      sums.set(nd.project, s);
+    }
+    const centroids = new Map();
+    for (const [project, s] of sums) centroids.set(project, { x: s.sx / s.n, y: s.sy / s.n });
+    // radius = the SAME 98th-percentile trim fitToNodes' own camera fit uses, not the raw
+    // max: osiris's own real max distance runs tens of thousands of units past its own
+    // tightly-fit view (a few far outliers), which placed every stub for it off-screen
+    // entirely -- worse than the "stacked in one column" this fix set out to cure.
+    const visibleProjects = new Set([...groups.values()].map((g) => g.visibleProject));
+    const distances = new Map(); // project -> sorted distances, only for projects we need
+    for (const p of visibleProjects) distances.set(p, []);
+    for (const nd of idToNode) {
+      const arr = distances.get(nd.project);
+      if (!arr) continue;
+      const c = centroids.get(nd.project);
+      arr.push(Math.hypot((nd.x || 0) - c.x, (nd.y || 0) - c.y));
+    }
+    const radii = new Map();
+    for (const [project, arr] of distances) {
+      if (!arr.length) { radii.set(project, 0); continue; }
+      arr.sort((a, b) => a - b);
+      radii.set(project, arr[Math.min(arr.length - 1, Math.floor(arr.length * 0.98))]);
+    }
+    const all = [...groups.values()].map((g) => {
+      const vc = centroids.get(g.visibleProject), hc = centroids.get(g.hiddenProject);
+      let x = vc ? vc.x : 0, y = vc ? vc.y : 0;
+      if (vc && hc) {
+        const dx = hc.x - vc.x, dy = hc.y - vc.y;
+        const dist = Math.hypot(dx, dy) || 1;
+        const r = (radii.get(g.visibleProject) || 0) + 60; // a small margin past the cluster edge
+        x = vc.x + (dx / dist) * r;
+        y = vc.y + (dy / dist) * r;
+      }
+      return { x, y, visibleProject: g.visibleProject, hiddenProject: g.hiddenProject, count: g.count, div: null };
+    });
     all.sort((a, b) => b.count - a.count);
     projectStubEntries = all.slice(0, MAX_PROJECT_STUBS);
     buildProjectStubDivs();
@@ -1493,7 +1563,9 @@ export async function initSpace(container) {
   // each one used to trigger its own full rescale; now each just accumulates a delta, and
   // ONE zoomAt() runs per frame).
   let pendingWheelDelta = 0, wheelClientX = 0, wheelClientY = 0, wheelRafPending = false;
+  let wheelReceivedAt = 0; // wheel-hang instrumentation only (Thoth mail 11248)
   function zoomAt(clientX, clientY, deltaY) {
+    const t = window.__spaceWheelTiming ? performance.now() : 0;
     const rect = wrap.getBoundingClientRect();
     const nx = rect.width ? (clientX - rect.left) / rect.width : 0.5;
     const ny = rect.height ? (clientY - rect.top) / rect.height : 0.5;
@@ -1501,24 +1573,31 @@ export async function initSpace(container) {
     const worldY = camera.position.y + THREE.MathUtils.lerp(camera.top, camera.bottom, ny);
     viewSize = Math.max(minViewSize, Math.min(maxViewSize, viewSize * Math.exp(deltaY * 0.001)));
     updateFrustum();
+    const t1 = window.__spaceWheelTiming ? performance.now() : 0;
     // re-anchor: keep the same world point under the cursor after the frustum resize.
     camera.position.x = worldX - THREE.MathUtils.lerp(camera.left, camera.right, nx);
     camera.position.y = worldY - THREE.MathUtils.lerp(camera.top, camera.bottom, ny);
     rescaleForZoom();
+    const t2 = window.__spaceWheelTiming ? performance.now() : 0;
     scheduleLabelPick();
     markDirty();
+    if (window.__spaceWheelTiming) {
+      console.debug("[wheel] zoomAt: frustum", (t1 - t).toFixed(2), "ms; rescale", (t2 - t1).toFixed(2), "ms; total", (performance.now() - t).toFixed(2), "ms");
+    }
   }
   function applyPendingWheel() {
     wheelRafPending = false;
     if (pendingWheelDelta === 0) return;
     const deltaY = pendingWheelDelta;
     pendingWheelDelta = 0;
+    if (window.__spaceWheelTiming) console.debug("[wheel] applyPendingWheel fired, rAF delay from wheel event:", (performance.now() - wheelReceivedAt).toFixed(2), "ms");
     zoomAt(wheelClientX, wheelClientY, deltaY);
   }
   renderer.domElement.addEventListener(
     "wheel",
     (ev) => {
       ev.preventDefault();
+      if (window.__spaceWheelTiming && !wheelRafPending) wheelReceivedAt = performance.now();
       pendingWheelDelta += ev.deltaY;
       wheelClientX = ev.clientX; wheelClientY = ev.clientY;
       if (!wheelRafPending) { wheelRafPending = true; requestAnimationFrame(applyPendingWheel); }
@@ -1910,9 +1989,21 @@ export async function initSpace(container) {
       div.className = "lbl" + (lit ? " lit" : "");
       _placed.push([x - LABEL_W / 2, y - LABEL_H, x + LABEL_W / 2, y]);
     }
-    positionDrillDivs();
-    positionProjectAnchors();
-    positionProjectStubs();
+    if (window.__spaceWheelTiming) {
+      const t0 = performance.now();
+      positionDrillDivs();
+      const t1 = performance.now();
+      positionProjectAnchors();
+      const t2 = performance.now();
+      positionProjectStubs();
+      const t3 = performance.now();
+      console.debug("[wheel] positionLabels tail: drillDivs", (t1 - t0).toFixed(2),
+        "ms; projectAnchors", (t2 - t1).toFixed(2), "ms; projectStubs", (t3 - t2).toFixed(2), "ms");
+    } else {
+      positionDrillDivs();
+      positionProjectAnchors();
+      positionProjectStubs();
+    }
   }
 
   // the render loop itself is defined above (markDirty/renderIfDirty, right after the
