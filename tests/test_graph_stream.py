@@ -3,6 +3,7 @@ b6cb1d7c0b36): the whole-graph typed-array snapshot and its outbox-backed delta 
 Shape frozen by DM with Seshat (mail 10439/10449/10451) before this was written."""
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -454,42 +455,74 @@ async def test_fetch_snapshot_agent_with_only_a_bare_handle_still_gets_the_ident
     assert out["labels"][idx] == "Thoth VII · sonnet-5"
 
 
-async def test_fetch_snapshot_agent_auto_shaped_model_in_project_name_never_seeds_patronym(
+async def test_fetch_snapshot_agent_name_assertion_is_never_read_for_the_stem(
     actions: Actions,
 ) -> None:
-    """THE 1,851 REMAINDER, shape 1 (Thoth mail 11326): a `name` assertion of the
-    auto-generated "<model> in <project>" shape (agents.py:4060, e.g.
-    "claude-haiku-4-5-20251001 in neo") is machinery, not a chosen name -- must
-    not seed the patronym slot, falling through to the canonical stem like a
-    patronym-less, handle-less agent always has."""
+    """STOP PATTERN-MATCHING NAME STRINGS (Thoth mail 11334, the w309
+    regression): the w309 fix chased known auto-generated `name` shapes one
+    regex at a time ("<model> in <project>", "<agent_type> spawn") and missed
+    a third ("<model> · <description>", lineage.py:247, e.g. "claude-opus-4-8
+    · Reconcile memory batch"). The `name` assertion is now never read for an
+    Agent's stem at all, regardless of shape -- covers the open-ended set in
+    one structural rule instead of chasing it one detector at a time."""
     now = datetime.now(UTC)
-    agent = await actions.create_or_find_object("Agent", "agent:gs-auto-in-project", "test")
+    agent = await actions.create_or_find_object("Agent", "agent:gs-name-never-read", "test")
     await actions.assert_property(
-        agent, "name", "claude-haiku-4-5-20251001 in neo", "test", now, 0.9)
-
-    await layout_batch(actions, limit=1000)
-    out = decode_snapshot(await fetch_snapshot(actions.pool))
-    idx = out["object_ids"].index(str(agent))
-    assert out["labels"][idx] == "gs-auto-in-project"
-
-
-async def test_fetch_snapshot_agent_auto_shaped_spawn_name_never_seeds_patronym(
-    actions: Actions,
-) -> None:
-    """THE 1,851 REMAINDER, shape 2 (Thoth mail 11326): a `name` assertion of the
-    auto-generated "<agent_type> spawn" shape (lineage.py:358, e.g. "general-
-    purpose spawn") is a subagent-type stamp, not a name -- must not seed the
-    patronym slot either."""
-    now = datetime.now(UTC)
-    agent = await actions.create_or_find_object("Agent", "agent:gs-auto-spawn", "test")
-    await actions.assert_property(agent, "name", "general-purpose spawn", "test", now, 0.9)
-    await actions.assert_property(agent, "source_model", "claude-sonnet-5", "test", now, 0.9)
+        agent, "name", "claude-opus-4-8 · Reconcile memory batches", "test", now, 0.9)
+    await actions.assert_property(agent, "source_model", "claude-opus-4-8", "test", now, 0.9)
     await actions.assert_property(agent, "is_sidechain", True, "test", now, 0.9)
 
     await layout_batch(actions, limit=1000)
     out = decode_snapshot(await fetch_snapshot(actions.pool))
     idx = out["object_ids"].index(str(agent))
-    assert out["labels"][idx] == "gs-auto-spawn"
+    label = out["labels"][idx]
+    assert "Reconcile" not in label
+    # no patronym and no handle either -- falls to the canonical stem, same as
+    # any other totally nameless agent (test_fetch_snapshot_nameless_agent_
+    # without_a_patronym_falls_back_to_canonical's own precedent).
+    assert label == "gs-name-never-read"
+
+
+async def test_fetch_snapshot_agent_handle_stripped_to_its_leading_alphabetic_run(
+    actions: Actions,
+) -> None:
+    """Thoth mail 11334, the "thoth G58" specimen: a legacy/malformed `handle`
+    assertion carrying trailing noise past the real name must not seed the
+    stem verbatim -- only its own leading alphabetic run, the "stripped to
+    letters" rule from the structural label formula."""
+    now = datetime.now(UTC)
+    agent = await actions.create_or_find_object("Agent", "agent:gs-handle-noise", "test")
+    await actions.assert_property(agent, "handle", "thoth G58", "test", now, 0.9)
+
+    await layout_batch(actions, limit=1000)
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    idx = out["object_ids"].index(str(agent))
+    label = out["labels"][idx]
+    assert re.match(r"^thoth [IVXLCDM]+$", label), label
+
+
+async def test_fetch_snapshot_compound_patronym_never_gets_a_second_numeral(
+    actions: Actions,
+) -> None:
+    """THE DOUBLE NUMERAL FIX (Thoth mail 11334, w309's live regression):
+    `patronym_for` (lineage.py) mints a spawned child's own `patronym`
+    assertion as the compound "<parent stem> <parent ROMAN>.<birth ordinal>"
+    (e.g. "Thoth I.1") -- the w309 fix appended this child's OWN
+    freshly-computed generation roman on top of that already-complete
+    compound, producing "Thoth I.1 I". The compound's own embedded
+    roman+ordinal is now read as the whole generation field; nothing is
+    appended a second time."""
+    now = datetime.now(UTC)
+    agent = await actions.create_or_find_object("Agent", "agent:gs-compound-patronym", "test")
+    await actions.assert_property(agent, "patronym", "Thoth I.1", "test", now, 0.9)
+    await actions.assert_property(
+        agent, "source_model", "claude-haiku-4-5-20251001", "test", now, 0.9)
+    await actions.assert_property(agent, "is_sidechain", True, "test", now, 0.9)
+
+    await layout_batch(actions, limit=1000)
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    idx = out["object_ids"].index(str(agent))
+    assert out["labels"][idx] == "Thoth I.1 · haiku-4-5-20251001 ⌊ sub"
 
 
 async def test_fetch_snapshot_edge_weight_is_raw_flat_for_now(actions: Actions) -> None:
