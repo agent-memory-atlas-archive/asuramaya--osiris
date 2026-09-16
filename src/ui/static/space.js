@@ -760,6 +760,10 @@ export async function initSpace(container) {
     applyDim();
     buildEdgeLines(idToNode, edges);
     scheduleLabelPick(); // review flaw #5: labels never re-picked on a filter change before
+    // THE FILTER-FIT FIX (Thoth mail 11241): a filter change refits the camera to what's
+    // now actually visible -- the camera used to just sit wherever it was, which reads as
+    // a black screen when the old view center falls inside newly-hidden content.
+    fitToNodes(visibleNodesForFit());
   }
 
   // CONSOLE CHROME CLEANUP piece 2 (decision 31717ca7): the header's repo pill's own
@@ -782,6 +786,11 @@ export async function initSpace(container) {
     // own re-pick to drop a just-hidden project's own labels immediately, not on the next
     // debounced pan/zoom.
     scheduleLabelPick();
+    // THE FILTER-FIT FIX (Thoth mail 11241, live review of w299): "after picking osiris
+    // the canvas rendered fully black until Fit" -- the camera used to just sit wherever
+    // it was before the filter, which reads as a black screen when the old view center
+    // falls inside newly-hidden content. Refit to the now-visible set immediately.
+    fitToNodes(visibleNodesForFit());
   }
 
   async function loadTypeColors() {
@@ -796,6 +805,14 @@ export async function initSpace(container) {
   // force-relax layout's small extent and reads as "zoomed into one dense cluster" against
   // Khnum's new deterministic hash-placement layout, whose extent can run tens of
   // thousands of world units wide depending on how far apart two project hashes land.
+  // THE FILTER-FIT FIX (Thoth mail 11241, live review of w299): "the canvas rendered fully
+  // black until Fit, and Fit must fit the VISIBLE set, not the whole graph." fitToNodes
+  // itself stays a pure bbox-over-a-list function (still used for the initial whole-graph
+  // load and context-restore, where "the whole graph" IS the visible set); this is what
+  // both the Fit button and a filter change now pass it, instead of raw idToNode.
+  function visibleNodesForFit() {
+    return idToNode.filter(nodeVisible);
+  }
   function fitToNodes(list) {
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
     for (const nd of list) {
@@ -1124,7 +1141,17 @@ export async function initSpace(container) {
     restoreEgoLayout();
     if (restored) syncMovedInstancePositions(restored);
     disposeProjectAnchors(); // a drill replaces the normal focus view entirely
-    clearDrillState();
+    // THE DRILL EXPANSION FIX (Thoth mail 11241, live review of w299): clearDrillState()
+    // used to run unconditionally on every call here, wiping drillExpandedType/
+    // drillPageCount the SAME turn a type/"more" click had just set them (buildDrillDivs'
+    // own click handler sets one then calls straight back into this function) -- expanding
+    // a type or paging "more" always looked like nothing happened, because the state that
+    // was supposed to drive the new render was destroyed before this function ever read
+    // it. Only reset the expand state when the container itself is actually changing; a
+    // same-container re-render (the expand/page click's own path) just needs its stale
+    // divs disposed, not its just-set intent wiped.
+    if (drillContainerId !== id) clearDrillState();
+    else disposeDrillDivs();
     selectedId = id;
     pathFocusId = id;
     drillContainerId = id;
@@ -1280,9 +1307,17 @@ export async function initSpace(container) {
   // That's the same declutter problem labels already solve (pickLabels' own top-N-by-
   // degree-in-viewport): keep the biggest, most-informative stubs, drop the rest, same as
   // the doc comment above already promises ("a small counted stub") but the code never
-  // actually bounded.
-  const MAX_PROJECT_STUBS = 80;
-  let projectStubEntries = []; // [{nodeId, hiddenProject, count, div}]
+  // actually bounded. THE STUB AGGREGATION FIX (Thoth mail 11241, live review of w299)
+  // went further: even capped, 80 divs reading "+N in unfiled" all stacked on the same
+  // spot was still noise, not signal -- two problems, not one. "unfiled" is never a real,
+  // pickable project (the repo dropdown never lists it), so it should never read as a
+  // hidden-project boundary at all. And the per-NODE grouping was the wrong unit -- a
+  // visible project can have hundreds of individual boundary nodes into the same one
+  // hidden project; the legible fact is "this project has N links into that project," not
+  // N separate one-node stubs. Regrouped to (visible node's own project, hidden project),
+  // capped tighter now that aggregation already does most of the decluttering.
+  const MAX_PROJECT_STUBS = 20;
+  let projectStubEntries = []; // [{x, y, visibleProject, hiddenProject, count, div}]
   function disposeProjectStubs() {
     for (const e of projectStubEntries) e.div.remove();
     projectStubEntries = [];
@@ -1301,7 +1336,9 @@ export async function initSpace(container) {
   function buildProjectStubs() {
     disposeProjectStubs();
     if (hiddenProjects.size === 0) return;
-    const stubs = new Map(); // nodeId -> Map<hiddenProjectName, count>
+    // one entry per (visible node's own PROJECT, hidden project) pair -- not per node.
+    // key -> {visibleProject, hiddenProject, count, sumX, sumY, n}
+    const groups = new Map();
     for (const e of edges) {
       const na = idById.get(e.source), nb = idById.get(e.target);
       if (!na || !nb) continue;
@@ -1309,42 +1346,56 @@ export async function initSpace(container) {
       if (aHidden === bHidden) continue; // both or neither hidden -- not a filter boundary
       const visible = aHidden ? nb : na, hiddenNd = aHidden ? na : nb;
       if (!nodeVisible(visible)) continue; // the visible side must actually be shown itself
-      const byProj = stubs.get(visible.id) || new Map();
-      byProj.set(hiddenNd.project, (byProj.get(hiddenNd.project) || 0) + 1);
-      stubs.set(visible.id, byProj);
+      if (hiddenNd.project === "unfiled") continue; // never a real, pickable project
+      const key = `${visible.project}|${hiddenNd.project}`;
+      const g = groups.get(key) || {
+        visibleProject: visible.project, hiddenProject: hiddenNd.project,
+        count: 0, sumX: 0, sumY: 0, n: 0, seen: new Set(),
+      };
+      g.count++;
+      if (!g.seen.has(visible.id)) { g.seen.add(visible.id); g.sumX += visible.x || 0; g.sumY += visible.y || 0; g.n++; }
+      groups.set(key, g);
     }
-    const all = [];
-    for (const [nodeId, byProj] of stubs) {
-      for (const [hiddenProject, count] of byProj) {
-        all.push({ nodeId, hiddenProject, count, div: null });
-      }
-    }
+    const all = [...groups.values()].map((g) => ({
+      x: g.sumX / g.n, y: g.sumY / g.n,
+      visibleProject: g.visibleProject, hiddenProject: g.hiddenProject, count: g.count, div: null,
+    }));
     all.sort((a, b) => b.count - a.count);
     projectStubEntries = all.slice(0, MAX_PROJECT_STUBS);
     buildProjectStubDivs();
   }
   function positionProjectStubs() {
+    // de-overlap: aggregation alone still leaves every hidden-project stub rooted in the
+    // SAME visible project at roughly the same centroid ("80 stubs ... stacked on one
+    // spot", Thoth mail 11241) -- nudge a colliding stub straight down past whatever
+    // already claimed that screen slot, same greedy idea positionLabels' own overlapsPlaced
+    // uses, kept local/independent since stubs are a bounded (<=20), separate pass.
+    const placed = [];
+    const W = 90, H = 16, GAP = 4;
     for (const entry of projectStubEntries) {
       if (!entry.div) continue;
-      const nd = idById.get(entry.nodeId);
-      entry.div.hidden = !nd || !nodeVisible(nd);
-      if (entry.div.hidden) continue;
-      _screenV.set(nd.x || 0, nd.y || 0, 0).project(camera);
-      entry.div.style.left = `${(_screenV.x * 0.5 + 0.5) * wrap.clientWidth}px`;
-      entry.div.style.top = `${(-_screenV.y * 0.5 + 0.5) * wrap.clientHeight}px`;
+      _screenV.set(entry.x, entry.y, 0).project(camera);
+      let x = (_screenV.x * 0.5 + 0.5) * wrap.clientWidth;
+      let y = (-_screenV.y * 0.5 + 0.5) * wrap.clientHeight;
+      let tries = 0;
+      while (tries < 12 && placed.some((b) => Math.abs(b.x - x) < W && Math.abs(b.y - y) < H + GAP)) {
+        y += H + GAP;
+        tries++;
+      }
+      placed.push({ x, y });
+      entry.div.style.left = `${x}px`;
+      entry.div.style.top = `${y}px`;
     }
   }
-  // reveals just the one hidden-project neighbourhood a stub named -- adds those specific
-  // ids to revealedStubIds (nodeVisible/applyDim's own override), never touches
-  // hiddenProjects itself, so the rest of that project stays hidden.
+  // reveals every hidden-project-side node this stub's own (visibleProject, hiddenProject)
+  // pair touches -- adds them to revealedStubIds (nodeVisible/applyDim's own override),
+  // never touches hiddenProjects itself, so the rest of that project stays hidden.
   function revealProjectStub(entry) {
-    const anchor = idById.get(entry.nodeId);
-    if (!anchor) return;
     for (const e of edges) {
       const na = idById.get(e.source), nb = idById.get(e.target);
       if (!na || !nb) continue;
-      if (na.id === entry.nodeId && nb.project === entry.hiddenProject) revealedStubIds.add(nb.id);
-      if (nb.id === entry.nodeId && na.project === entry.hiddenProject) revealedStubIds.add(na.id);
+      if (na.project === entry.visibleProject && nb.project === entry.hiddenProject) revealedStubIds.add(nb.id);
+      if (nb.project === entry.visibleProject && na.project === entry.hiddenProject) revealedStubIds.add(na.id);
     }
     applyDim();
     buildEdgeLines(idToNode, edges);
@@ -1591,7 +1642,7 @@ export async function initSpace(container) {
   }
 
   fitBtn.addEventListener("click", () => {
-    fitToNodes(idToNode);
+    fitToNodes(visibleNodesForFit());
     scheduleLabelPick();
   });
   upBtn.addEventListener("click", clearFocus);
@@ -1876,6 +1927,7 @@ export async function initSpace(container) {
     focusObject, clearFocus, inspect, pause, resume, goBack, setHiddenTypes,
     setHiddenProjects,
     get idToNode() { return idToNode; },
+    get edges() { return edges; },
     get pathReachable() { return pathReachable; },
     get pathFocusId() { return pathFocusId; },
     get selectedId() { return selectedId; },
@@ -1897,7 +1949,7 @@ export async function initSpace(container) {
     get drillExpandedType() { return drillExpandedType; },
     expandDrillType(type) { drillExpandedType = type; drillPageCount = 1; return renderContainerDrill(drillContainerId, { skipStackPush: true }); },
     get projectAnchorCount() { return projectAnchorEntries.length; },
-    get projectStubEntries() { return projectStubEntries.map((e) => ({ nodeId: e.nodeId, hiddenProject: e.hiddenProject, count: e.count })); },
+    get projectStubEntries() { return projectStubEntries.map((e) => ({ visibleProject: e.visibleProject, hiddenProject: e.hiddenProject, count: e.count })); },
     revealProjectStub,
   };
   window.__space = api; // kept for existing debugging/test scripts, same shape as before

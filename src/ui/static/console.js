@@ -392,6 +392,31 @@ function toggleTableDrawer() {
   TABLE_DRAWER_OPEN = !TABLE_DRAWER_OPEN;
   const el = $('browse-drawer'); if (el) el.classList.toggle('open', TABLE_DRAWER_OPEN);
 }
+// THE TABLE-DRAWER-READS-0 FIX (Thoth mail 11241, live review of w299): SET is a
+// paginated, created_at-DESC page of RECENT objects (loadObjectSet/runBrowseSelect) —
+// architecturally unrelated to a focus walk's own reachable ids, so a real focus (an
+// ordinary ego walk, and especially a container drill's expanded page) almost always lit
+// rows the table had never loaded, reading as "No matching entities" even though the
+// canvas showed plenty. Hydrated by id from the server instead of requiring SET to already
+// carry them — bounded by the walk's own cap (MAX_EGO_NODES = 300), never unbounded.
+const FOCUS_HYDRATED_OBJECTS = new Map(); // id -> object, cleared whenever the focus changes
+let FOCUS_HYDRATE_FOR = null; // the pathFocusId this cache's own in-flight fetch belongs to
+async function hydrateFocusReachable(reachable, focusId) {
+  const known = new Set(SET.map(function(o) { return o.id; }));
+  const missing = [...reachable].filter(function(id) {
+    return !known.has(id) && !FOCUS_HYDRATED_OBJECTS.has(id);
+  });
+  if (!missing.length) return;
+  const fetched = await Promise.all(missing.map(function(id) {
+    return fetch('/objects/' + id).then(function(r) { return r.ok ? r.json() : null; }).catch(function() { return null; });
+  }));
+  for (let i = 0; i < missing.length; i++) {
+    if (fetched[i]) FOCUS_HYDRATED_OBJECTS.set(missing[i], fetched[i]);
+  }
+  // the focus (or the drill's own expanded page within it) may have moved on while this
+  // was in flight -- only repaint if it's still the same one asking.
+  if (window.OsirisSpace && window.OsirisSpace.pathFocusId === focusId) renderEntityExplorerStage();
+}
 function renderEntityExplorerStage() {
   let filtered = getFilteredEntities();
   // THE READING LAYER, part C ("harmony", ruling c5953bb1): "the table filters to the
@@ -400,7 +425,13 @@ function renderEntityExplorerStage() {
   var space = window.OsirisSpace;
   if (space && space.pathFocusId) {
     var reachable = space.pathReachable;
-    filtered = filtered.filter(function(o) { return reachable.has(o.id); });
+    if (FOCUS_HYDRATE_FOR !== space.pathFocusId) { FOCUS_HYDRATED_OBJECTS.clear(); FOCUS_HYDRATE_FOR = space.pathFocusId; }
+    var known = filtered.filter(function(o) { return reachable.has(o.id); });
+    var knownIds = new Set(known.map(function(o) { return o.id; }));
+    var hydrated = [...reachable].filter(function(id) { return !knownIds.has(id) && FOCUS_HYDRATED_OBJECTS.has(id); })
+      .map(function(id) { return FOCUS_HYDRATED_OBJECTS.get(id); });
+    filtered = known.concat(hydrated);
+    hydrateFocusReachable(reachable, space.pathFocusId); // fire-and-forget; re-renders itself when it lands
   }
   setStatus(filtered.length + ' of ' + SET.length + ' entities');
   const countEl = $('browse-drawer-count'); if (countEl) countEl.textContent = filtered.length.toLocaleString();
