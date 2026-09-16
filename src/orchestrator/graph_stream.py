@@ -106,9 +106,12 @@ same tip since all three ship together here):
      own `model` lookup came back empty for 7,618 live osiris agents, rendering
      "Agent · ? in osiris". Never the raw id either way -- a patronym-less agent
      (disclosed as possible, not observed) falls back to its own canonical short
-     id rather than a bare "?". Resolved for the SMALL handle-less-Agent subset
-     only (Thoth's own live count: 49,712 of 49,766 labels already read as
-     titles), not a query added to every row.
+     id rather than a bare "?". THE IDENTITY FORMAT IS ALWAYS USED FOR AGENT
+     (Thoth mail 11317): a bare `handle`/`name` assertion used to bypass this
+     whole scheme and win as the label directly (258 live agents stuck reading
+     as a bare "Thoth"/"Sekhmet", no numeral) -- resolved for EVERY Agent row
+     now, that raw string only ever seeding the patronym slot when a real
+     `patronym` assertion is absent, never standing in for the label itself.
 """
 from __future__ import annotations
 
@@ -134,7 +137,8 @@ def _short_label(
     title: str | None, *, agent_fallback: str | None = None,
 ) -> str:
     """THE LEGIBILITY PASS (ruling e1cb9e3b, tip 2g/2c): the client never guesses a
-    label. Agent by handle (never the id), SoftwareProject by its own repo name
+    label. Agent by its own resolved identity format (never a raw handle/name/id
+    directly -- see `agent_fallback` below), SoftwareProject by its own repo name
     (canonical minus the 'repo:' scheme), Person by name, everything else its own
     type plus a short TITLE -- `title` is the object's own current summary/title/
     subject/name assertion (whichever wins by confidence then recency, one query --
@@ -150,16 +154,25 @@ def _short_label(
     ellipsis, matching Seshat's own tip 1c formatting rule exactly so the two
     renderings never disagree.
 
-    `agent_fallback` (THE NAMELESS-AGENT LABEL FIX, ruling e1cb9e3b(c)): a caller-
-    resolved "lineage handle + generation" or "Agent · <model> in <project>" string
-    for a handle-less Agent (see `fetch_snapshot`'s own resolution -- a Seat lookup
-    and a couple of assertion reads this pure function has no pool to make itself).
-    Tried BEFORE the generic title/canonical fallback chain so a nameless Agent never
-    reads its own summary/subject assertion (it wouldn't have one) or, worse,
-    canonical -- the exact id-shaped label this whole rule exists to kill."""
-    if type_name == "Agent" and handle:
-        label = handle
-    elif type_name == "Agent" and agent_fallback:
+    `agent_fallback` (`_agent_identity_labels`, computed for EVERY Agent row):
+    a caller-resolved "lineage handle + generation" or "<patronym> <roman> ·
+    <model>" string (see `fetch_snapshot`'s own resolution -- a Seat lookup and
+    a couple of assertion reads this pure function has no pool to make
+    itself). REQUIRED for type Agent, never optional, so an Agent never reads
+    its own raw handle/name/summary/subject assertion as a label directly, or,
+    worse, canonical -- the exact id-shaped label this whole rule exists to
+    kill.
+
+    THE IDENTITY FORMAT IS ALWAYS USED FOR AGENT (Thoth mail 11317, w306/w307
+    live header check): a bare `handle` assertion used to win BEFORE
+    `agent_fallback` ever ran -- 258 live Agent labels read as a bare "Thoth"/
+    "Sekhmet" with no generation, because a raw handle stamp (the lineage's own
+    name, no numeral) short-circuited past the seat/patronym resolver entirely.
+    `agent_fallback` (renamed `_agent_identity_labels`, now computed for EVERY
+    Agent row, not just handle-less ones) is REQUIRED for type Agent now; the
+    handle/name fields only ever feed it as a patronym fallback, never bypass
+    it as a label of their own."""
+    if type_name == "Agent" and agent_fallback:
         label = agent_fallback
     elif type_name == "SoftwareProject":
         label = canonical.removeprefix("repo:") or canonical
@@ -284,36 +297,42 @@ def _model_short(model: str) -> str:
     return model.removeprefix("claude-")
 
 
-async def _nameless_agent_fallbacks(
+async def _agent_identity_labels(
     pool: asyncpg.Pool, rows: list[asyncpg.Record],
 ) -> dict[uuid.UUID, str]:
-    """THE NAMELESS-AGENT LABEL FIX (ruling e1cb9e3b(c), corrected per operator
-    ruling grounds 9163b1c7): resolved ONLY for the small handle-less-Agent subset
-    of `rows` -- a per-id Seat lookup plus a couple of assertion reads this module
-    has no reason to pay for every ordinary, already-named object.
+    """THE IDENTITY FORMAT IS ALWAYS USED FOR AGENT (Thoth mail 11317, live header
+    check after w307: 258 Agent labels still read as a bare "Thoth"/"Sekhmet"
+    with no generation -- a raw `handle`/`name` assertion on the object was
+    winning in `_short_label` BEFORE this function ever ran, since this
+    function used to resolve only the handle-less subset). Now resolved for
+    EVERY Agent row, unconditionally -- `_short_label` no longer has a bypass
+    branch of its own.
 
     Lineage handle + generation when the Agent's OWN lineage currently holds a
-    Seat (unchanged) -- that's the recognisable, load-bearing name a reader
-    actually wants for a live seat-holder. Otherwise (THE AGENT IDENTITY FIX,
-    live count: 7,618 osiris agents were rendering "Agent · ? in osiris" because
-    the OLD fallback's own `model` lookup came back empty for this subset and
+    Seat -- that's the recognisable, load-bearing name a reader actually wants
+    for a live seat-holder. Otherwise (THE AGENT IDENTITY FIX, live count:
+    7,618 osiris agents were rendering "Agent · ? in osiris" because the OLD
+    fallback's own `model` lookup came back empty for this subset and
     `patronym`, which DOES carry a real name for almost all of them, was never
     read): "<Patronym> <ROMAN> · <model short>" built from the `patronym`
-    assertion, the canonical's own generation suffix (`_generation`/`_to_roman`,
-    the SAME parse the seat-branch above already trusts), and `source_model`
-    short-formed (`_model_short`) -- a sidechain fork (`is_sidechain`) gets a
-    trailing " ⌊ sub" marker on top of that same label, disclosure not
-    suppression (mailbox.py's own is_sidechain disclosure rule, obligation
-    706c27dc). NEVER "?": a patronym-less agent (no live count above zero at
-    last check, but disclosed rather than assumed impossible) falls back to its
-    own canonical short id -- still a real, resolvable name, never a raw "?"."""
-    nameless = [r for r in rows if r["type"] == "Agent" and not r["handle"]]
-    if not nameless:
+    assertion (falling back to the object's OWN raw `handle`/`name` assertion
+    when patronym is genuinely absent -- the same string that used to bypass
+    this whole scheme now only ever SEEDS it), the canonical's own generation
+    suffix (`_generation`/`_to_roman`, the SAME parse the seat-branch above
+    already trusts), and `source_model` short-formed (`_model_short`) -- a
+    sidechain fork (`is_sidechain`) gets a trailing " ⌊ sub" marker on top of
+    that same label, disclosure not suppression (mailbox.py's own is_sidechain
+    disclosure rule, obligation 706c27dc). NEVER "?" and NEVER a bare name
+    with no numeral: an agent with no patronym AND no raw handle/name (not
+    observed live, disclosed rather than assumed impossible) falls back to its
+    own canonical short id -- still a real, resolvable name."""
+    agents = [r for r in rows if r["type"] == "Agent"]
+    if not agents:
         return {}
     from src.orchestrator.agents import _generation, _to_roman
     from src.orchestrator.seats import held_seat
 
-    ids = [r["id"] for r in nameless]
+    ids = [r["id"] for r in agents]
     detail_rows = await pool.fetch(
         "SELECT o.id, "
         "  (SELECT a.value #>> '{}' FROM current_assertions a WHERE a.object_id=o.id "
@@ -331,7 +350,7 @@ async def _nameless_agent_fallbacks(
     detail_by_id = {r["id"]: r for r in detail_rows}
 
     out: dict[uuid.UUID, str] = {}
-    for r in nameless:
+    for r in agents:
         oid, canonical = r["id"], r["canonical"]
         seat = await held_seat(pool, canonical)
         if seat and seat.get("handle"):
@@ -359,7 +378,12 @@ async def _nameless_agent_fallbacks(
                 f"{seat['handle']} {_to_roman(gen).upper()}" if gen > 1 else seat["handle"])
             continue
         detail = detail_by_id.get(oid)
-        patronym = detail["patronym"] if detail else None
+        # THE NAME ASSERTION ONLY SEEDS THE PATRONYM (Thoth mail 11317): a raw
+        # `handle`/`name` assertion (the lineage's own bare stamp, e.g.
+        # "Thoth") used to bypass the whole identity format outright; now it
+        # only ever supplies the patronym slot when a real `patronym`
+        # assertion is absent, so it still gets a real generation numeral.
+        patronym = (detail["patronym"] if detail else None) or r["handle"] or r["name"]
         if not patronym:
             out[oid] = canonical.removeprefix("agent:")
             continue
@@ -426,7 +450,7 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
         "    WHERE valid_until IS NULL OR valid_until > now()"
         ") x GROUP BY node")
     weight_by_id: dict[uuid.UUID, int] = {r["node"]: int(r["n"]) for r in weight_rows}
-    agent_fallback_by_id = await _nameless_agent_fallbacks(pool, rows)
+    agent_fallback_by_id = await _agent_identity_labels(pool, rows)
 
     type_index: dict[str, int] = {}
     project_index: dict[str, int] = {}
