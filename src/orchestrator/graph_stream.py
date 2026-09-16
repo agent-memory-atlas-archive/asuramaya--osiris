@@ -380,7 +380,7 @@ async def _agent_identity_labels(
     agents = [r for r in rows if r["type"] == "Agent"]
     if not agents:
         return {}
-    from src.orchestrator.agents import _generation, _to_roman
+    from src.orchestrator.agents import _generation, _roman_display
     from src.orchestrator.seats import held_seat
 
     ids = [r["id"] for r in agents]
@@ -403,6 +403,16 @@ async def _agent_identity_labels(
     out: dict[uuid.UUID, str] = {}
     for r in agents:
         oid, canonical = r["id"], r["canonical"]
+        detail = detail_by_id.get(oid)
+        # THE MODEL SUFFIX ON EVERY LABEL (Thoth mail 11345): computed once,
+        # applied uniformly to whichever branch below resolves the stem --
+        # the seat branch used to omit it entirely (by the original design of
+        # THE NAMELESS-AGENT LABEL FIX), and the canonical-stem fallback still
+        # would have without this, same gap in a third place.
+        model = detail["model"] if detail else None
+        model_suffix = f" · {_model_short(model)}" if model else ""
+        sub_suffix = " ⌊ sub" if detail and detail["is_sidechain"] else ""
+
         seat = await held_seat(pool, canonical)
         if seat and seat.get("handle"):
             # THE SEAT-GENERATION FIX (Thoth mail 11309, w306 review): a
@@ -417,21 +427,23 @@ async def _agent_identity_labels(
             # assertion first, falling back to the canonical parse only when
             # it's genuinely absent (an agent claimed before the seat ruling,
             # `seat_label`'s own documented fallback case).
-            detail = detail_by_id.get(oid)
             seat_gen_raw = detail["seat_generation"] if detail else None
             gen = int(seat_gen_raw) if seat_gen_raw else _generation(canonical)[1]
-            # UPPERCASE (Thoth mail 11283: "unify the roman case... 'Thoth CVI'
-            # and 'Sekhmet XXXVIII' is how the fleet already writes them") -- was
-            # lowercase `_to_roman`'s own raw output; the fleet's own mail/seat
-            # displays already write these uppercase, so this was the label
-            # scheme's own outlier, not the other way around.
+            # THE WRONG ROMAN FUNCTION (Thoth mail 11345, the w310 regression):
+            # `agents._to_roman` is the CANONICAL-ID-SUFFIX formatter, capped
+            # at 39 and falling back to a raw "g<n>" escape hatch above that
+            # (agents.py's own docstring: "a lineage deeper than that gets a
+            # plain numeric suffix") -- exactly the shape it exists to produce
+            # for a mintable id, never meant to reach a human-facing label.
+            # `agents._roman_display` is the unbounded DISPLAY formatter
+            # (already uppercase) `seat_label` itself uses for "Thoth CVI" --
+            # the one this module always should have called.
             # EVERY AGENT LABEL CARRIES A NUMERAL (Thoth mail 11326): generation 1
             # used to omit the roman suffix entirely, so a first-generation
             # seat-holder read as a bare handle indistinguishable from the old
             # bypass this whole arc exists to kill -- show "I" rather than drop it.
-            out[oid] = f"{seat['handle']} {_to_roman(gen).upper()}"
+            out[oid] = f"{seat['handle']} {_roman_display(gen)}{model_suffix}{sub_suffix}"
             continue
-        detail = detail_by_id.get(oid)
         # STOP PATTERN-MATCHING NAME STRINGS (Thoth mail 11334): the `name`
         # assertion is never read here at all any more -- see the module-level
         # comment above `_LEADING_ALPHA_RE`. Stem is patronym, else handle's
@@ -452,20 +464,14 @@ async def _agent_identity_labels(
             stem = raw_patronym or (handle_match.group(0) if handle_match else None)
             gen_display = None
         if not stem:
-            out[oid] = canonical.removeprefix("agent:")
+            out[oid] = f"{canonical.removeprefix('agent:')}{model_suffix}{sub_suffix}"
             continue
         if gen_display is None:
             # EVERY AGENT LABEL CARRIES A NUMERAL (Thoth mail 11326): same rule
             # as the seat branch above -- "I" for generation 1, never a bare stem.
             gen = _generation(canonical)[1]
-            gen_display = _to_roman(gen).upper()
-        label = f"{stem} {gen_display}"
-        model = detail["model"] if detail else None
-        if model:
-            label = f"{label} · {_model_short(model)}"
-        if detail and detail["is_sidechain"]:
-            label = f"{label} ⌊ sub"
-        out[oid] = label
+            gen_display = _roman_display(gen)
+        out[oid] = f"{stem} {gen_display}{model_suffix}{sub_suffix}"
     return out
 
 
