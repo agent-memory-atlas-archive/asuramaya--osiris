@@ -62,8 +62,11 @@ function colorForEdgeType(type) {
 // structural; everything else defaults to semantic (the safer default — an edge that's
 // actually structural but misclassified just draws a bit more clutter; one that's actually
 // meaningful but misclassified as structural would go invisible, the worse failure).
-// Swaps to Khnum's real per-request `edge_classes` header field the moment it lands (DM
-// 10603), same fallback pattern as colorForEdgeType/edge_types before it.
+// THE WIRE EDGE CLASSES FIX (Thoth mail 11291): this table is a FALLBACK now, used only
+// for a type the header's own `link_type_class` (fetchStreamSnapshot's own edgeClassByType)
+// doesn't carry a value for -- not the primary source any more. A stale earlier version of
+// this fallback logic read a field (`edge_classes`) the wire never actually sent, so it ran
+// unconditionally; kept here in case a future snapshot genuinely omits the header key.
 const STRUCTURAL_EDGE_TYPES = new Set([
   "in_repo", "works_in", "governs", "holds", "acts_for", "member_of", "employs",
   "worktree_of", "succeeds_seat", "owns", "owned_by", "subsidiary_of", "ultimate_parent",
@@ -161,14 +164,32 @@ async function fetchStreamSnapshot() {
       label: snap.labels ? snap.labels[i] : undefined,
     });
   }
+  // THE WIRE EDGE CLASSES FIX (Thoth mail 11291): the client's own STRUCTURAL_EDGE_TYPES
+  // table was never anything but a fallback, but it ran 100% of the time -- the code read
+  // `snap.edge_classes`, a field the wire never actually sends. The real field is
+  // `link_type_class`, index-aligned to `edge_types` the same way (values semantic/
+  // structural/container), which is exactly why the browser marked authored_by/spawned_by
+  // "semantic" and drew them at rest (6,413 authored_by edges over 20k units read as the
+  // yellow beam) while the header's own link_type_class says authored_by is structural.
+  // "container" (membership/containment, distinct from ordinary structural) hides at rest
+  // exactly like "structural" -- every existing check in this file only ever distinguishes
+  // "structural" from everything else, so normalize container -> structural here rather
+  // than special-case it at every call site. Built once from the type vocabulary itself
+  // (edge_types), not per-edge, so a type with zero edges in THIS snapshot still has a
+  // real effective class to report on the debug API.
+  const edgeClassByType = {};
+  if (snap.edge_types) {
+    for (let i = 0; i < snap.edge_types.length; i++) {
+      const t = snap.edge_types[i];
+      let cls = snap.link_type_class && snap.link_type_class[i];
+      if (cls === "container") cls = "structural";
+      edgeClassByType[t] = cls || classOfEdgeType(t); // no header value -- the client fallback
+    }
+  }
   const edges = [];
   for (let i = 0; i < snap.edge_count; i++) {
     const type = (snap.edge_types && snap.edge_types[snap.edge_type_code[i]]) ?? snap.edge_type_code[i];
-    // prefers Khnum's own real per-type classification (DM 10603) once the header carries
-    // one; falls back to the client-side default (classOfEdgeType) until then.
-    const edgeClass = snap.edge_classes && snap.edge_classes[snap.edge_type_code[i]]
-      ? snap.edge_classes[snap.edge_type_code[i]]
-      : classOfEdgeType(type);
+    const edgeClass = edgeClassByType[type] || classOfEdgeType(type);
     edges.push({
       source: snap.object_ids[snap.edge_src[i]],
       target: snap.object_ids[snap.edge_dst[i]],
@@ -180,7 +201,7 @@ async function fetchStreamSnapshot() {
   // 2i/2j/h) still ride the same wire header, but nothing client-side reads them any more;
   // node.type/node.project are already resolved to name strings above, off the same
   // types/projects tables those aggregates were keyed against.
-  return { nodes, edges };
+  return { nodes, edges, edgeClassByType };
 }
 
 // resolves DOM refs from a passed-in container map, falling back to the same fixed ids
@@ -875,7 +896,7 @@ export async function initSpace(container) {
   // positionLabels/pickLabels below for the one label rule that replaces it (viewport
   // top-N by degree, de-overlapped, at every zoom, no separate project-label pass).
   setStatus("loading the whole graph…");
-  let { nodes, edges } = await fetchStreamSnapshot();
+  let { nodes, edges, edgeClassByType } = await fetchStreamSnapshot();
   buildScene(nodes, edges);
   fitToNodes(nodes);
   setStatus(`${nodes.length} objects, ${edges.length} edges`);
@@ -1076,7 +1097,7 @@ export async function initSpace(container) {
     for (const e of edges) {
       if (seed.has(e.source) && seed.has(e.target)) springs.push([e.source, e.target]);
     }
-    const relaxed = relaxPositions(seed, springs, fixedIds);
+    const relaxed = relaxedOrSeed(seed, relaxPositions(seed, springs, fixedIds));
     for (const [id, p] of relaxed) {
       if (id === focusId) continue;
       const nd = idx.get(id);
@@ -1249,8 +1270,15 @@ export async function initSpace(container) {
             const d = ringR + (k + 1) * chainStep;
             extraSeed.set(nd.id, { x: cx + dirX * d, y: cy + dirY * d, pinned: true });
           } else {
+            // THE PHYSICS DIVERGENCE FIX (Thoth mail 11308): a page angle step of 0.08 rad
+            // wraps past a full 2*PI revolution once `take` (DRILL_PAGE_SIZE *
+            // egoGroupPageCount, unbounded by repeated "more" clicks) exceeds ~79 -- at a
+            // CONSTANT radius that puts two genuinely different members at the exact same
+            // seed (x,y). A small per-index radius growth (a spiral, not a circle) makes
+            // that structurally impossible regardless of how many pages are open.
             const a2 = angle + (k - (take - 1) / 2) * 0.08;
-            extraSeed.set(nd.id, { x: cx + Math.cos(a2) * ringR * 1.3, y: cy + Math.sin(a2) * ringR * 1.3 });
+            const r2 = ringR * 1.3 + k * 2;
+            extraSeed.set(nd.id, { x: cx + Math.cos(a2) * r2, y: cy + Math.sin(a2) * r2 });
           }
         }
         if (ranked.length > take) {
@@ -1268,7 +1296,8 @@ export async function initSpace(container) {
         } else {
           members.forEach((nd, i) => {
             const a2 = angle + (i - (members.length - 1) / 2) * 0.1;
-            extraSeed.set(nd.id, { x: cx + Math.cos(a2) * ringR, y: cy + Math.sin(a2) * ringR });
+            const r2 = ringR + i * 2; // same spiral defence as the expanded-page branch
+            extraSeed.set(nd.id, { x: cx + Math.cos(a2) * r2, y: cy + Math.sin(a2) * r2 });
           });
         }
         continue;
@@ -1293,6 +1322,13 @@ export async function initSpace(container) {
     if (!hub) return;
     const extraSeed = buildEgoGroups(id, hub);
     pathReachable = new Set([...focusBasePathReachable, ...extraSeed.keys()]);
+    // THE STALE TABLE FIX (Thoth mail 11308): onFocus (console.js's own onSpaceFocus,
+    // wired through to renderEntityExplorerStage/hydrateFocusReachable) used to fire only
+    // from focusObject's own INITIAL call -- a group/"more" click re-renders through this
+    // shared path directly, never notifying the table that pathReachable just grew, so it
+    // stayed at the ORIGINAL row count after an expansion. Every call here re-notifies,
+    // same id or not.
+    if (onFocus) onFocus(id);
     applyEgoLayout(id, hopsUp, hopsDown, extraSeed);
     syncMovedInstancePositions(egoSaved ? new Set(egoSaved.keys()) : null);
     // zoom-to-fit: frame the camera around exactly the reachable set's own (now relaid-out)
@@ -1337,6 +1373,25 @@ export async function initSpace(container) {
   const EGO_FORCE_ITERATIONS = 180;
   const EGO_REPULSION = 3200;
   const EGO_SPRING = 0.02;
+  // THE PHYSICS DIVERGENCE FIX (Thoth mail 11308, w306 review BLOCKER): live-verified --
+  // focusing a real 223-degree Thread (177 reachable, 154 Message) or 125-degree Decision
+  // (213 reachable, 211 Message) left camera.position at 3.6e83 / -1.0e85, canvas black.
+  // Root cause: buildEgoGroups' own small-bucket seeding fans members by angle alone at a
+  // CONSTANT radius (`a2 = angle + i * step`) -- once a bucket's own member count pushes
+  // the total angular spread past 2*PI (154 members * a 0.1 rad step ~= 15.4 rad, 2.4 full
+  // turns), cos/sin periodicity puts genuinely DIFFERENT members at the EXACT SAME (x,y).
+  // The old `d2 = max(d2, 1)` clamp bounds any ONE pair's force, but dozens of exactly-
+  // coincident pairs at one point still sum to an enormous single-iteration displacement,
+  // and 180 iterations of that compounds into non-finite territory. Three independent
+  // guards, not just one, since seeding is only ONE of several places a coincidence or a
+  // runaway sum could originate: a real minimum-separation floor (not 1 world unit -- big
+  // enough that even a full pile-up sums to a bounded force), a hard per-iteration
+  // displacement cap (so a raw force spike can never move a point further than a fraction
+  // of the graph's own real scale in one step regardless of how many neighbours pile onto
+  // it), and a finite-position assertion at the caller (renderFocusEgoGroups/
+  // renderContainerDrill) with a fallback to the pre-relax seed.
+  const EGO_MIN_SEP2 = 400; // d2 floor -- max single-pair force EGO_REPULSION/400 = 8
+  const EGO_MAX_DISPLACEMENT = 400; // per node, per iteration, in world units
   function relaxPositions(seed, springs, fixedId) {
     const ids = [...seed.keys()];
     if (ids.length < 2) return seed;
@@ -1349,7 +1404,7 @@ export async function initSpace(container) {
           const b = pos.get(ids[j]);
           let dx = a.x - b.x, dy = a.y - b.y;
           let d2 = dx * dx + dy * dy;
-          if (d2 < 1) d2 = 1;
+          if (d2 < EGO_MIN_SEP2) d2 = EGO_MIN_SEP2;
           const d = Math.sqrt(d2);
           const f = EGO_REPULSION / d2;
           const fx = (dx / d) * f, fy = (dy / d) * f;
@@ -1369,10 +1424,25 @@ export async function initSpace(container) {
       for (const id of ids) {
         if (id === fixedId || (fixedId instanceof Set && fixedId.has(id))) continue;
         const p = pos.get(id), f = force.get(id);
+        const mag = Math.hypot(f.x, f.y);
+        if (mag > EGO_MAX_DISPLACEMENT) {
+          const scale = EGO_MAX_DISPLACEMENT / mag;
+          f.x *= scale; f.y *= scale;
+        }
         p.x += f.x; p.y += f.y;
       }
     }
     return pos;
+  }
+  // last-resort safety net: a non-finite position anywhere in the relaxed set means the
+  // physics genuinely diverged (a real bug, not something to paper over silently) -- the
+  // caller falls back to the pre-relax seed rather than feeding NaN/Infinity into the
+  // camera fit, which is what actually produced the black-canvas symptom.
+  function relaxedOrSeed(seed, relaxed) {
+    for (const p of relaxed.values()) {
+      if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) return seed;
+    }
+    return relaxed;
   }
 
   // pushes the (few) moved nodes' new positions into the GPU buffers directly — never a
@@ -1398,9 +1468,10 @@ export async function initSpace(container) {
   // ---- THE DRILL (operator ruling d7d55257, Thoth mail 11048) ----------------------------
   // A CONTAINER is any object whose own structural (containment/membership) degree exceeds
   // MAX_EGO_NODES -- a project, an agent with a huge working set, any hub the ordinary ego
-  // walk could never show in full. Until Khnum's own `container` flag lands in
-  // link_type_class, "structural" stands in for it (his own note, same mail) -- the exact
-  // set every other container-shaped check in this file already uses. Focusing a container
+  // walk could never show in full. Khnum's own `container` value in link_type_class landed
+  // (Thoth mail 11291) and is normalized into "structural" at decode time (fetchStreamSnapshot's
+  // own edgeClassByType) -- the exact set every other container-shaped check in this file
+  // already uses. Focusing a container
   // is a DRILL, not the ordinary ego tree: the hub plus one count node per member type,
   // sorted by count, real members hidden until a reader clicks a type open. Acceptance:
   // "focusing repo:osiris opens under 30 nodes" -- confirmed live, see the tip's own commit.
@@ -1537,7 +1608,7 @@ export async function initSpace(container) {
       }
     });
 
-    const relaxed = relaxPositions(seed, springs, id);
+    const relaxed = relaxedOrSeed(seed, relaxPositions(seed, springs, id));
     for (const [key, p] of relaxed) {
       if (key === id) continue;
       const nd = idById.get(key);
@@ -2346,9 +2417,18 @@ export async function initSpace(container) {
       const x = (_screenV.x * 0.5 + 0.5) * wrap.clientWidth;
       const y = (-_screenV.y * 0.5 + 0.5) * wrap.clientHeight;
       const lit = nd.id === pathFocusId || pathReachable.has(nd.id) || nd.id === selectedId;
+      // THE CHAIN LABEL DECLUTTER (Thoth mail 11308): "lit labels always win their spot"
+      // is right for an ordinary small reachable set, but a real succession chain (up to
+      // 50+ pinned members, ALL lit since they're all in pathReachable) flooded the view
+      // into an unbroken wall of identical labels -- lit never used to yield to anything.
+      // A chain member keeps that guarantee only at generation 1 (nearest the focus) or a
+      // multiple of 5; every other generation declutters like an ordinary label instead.
+      const generation = lit ? computeGeneration(nd) : null;
+      const chainDeclutters = generation != null && generation !== 1 && generation % 5 !== 0;
       // lit/focused labels always win their spot (never declutter the thing you asked to
-      // see); ordinary labels yield to anything already placed.
-      if (!lit && overlapsPlaced(x, y)) { div.hidden = true; continue; }
+      // see) UNLESS this chain rule says otherwise; ordinary labels yield to anything
+      // already placed.
+      if ((!lit || chainDeclutters) && overlapsPlaced(x, y)) { div.hidden = true; continue; }
       div.hidden = false;
       div.style.left = `${x}px`;
       div.style.top = `${y}px`;
@@ -2393,6 +2473,12 @@ export async function initSpace(container) {
     setHiddenProjects,
     get idToNode() { return idToNode; },
     get edges() { return edges; },
+    // THE WIRE EDGE CLASSES FIX (Thoth mail 11291): the effective per-type classification
+    // -- the header's own link_type_class when the wire carries one for that type
+    // (container already normalized to structural), the client's classOfEdgeType fallback
+    // otherwise. Same live-verification convention as the rest of this debug surface.
+    effectiveEdgeClass(type) { return edgeClassByType[type] || classOfEdgeType(type); },
+    get edgeClassByType() { return { ...edgeClassByType }; },
     get pathReachable() { return pathReachable; },
     get pathFocusId() { return pathFocusId; },
     get selectedId() { return selectedId; },

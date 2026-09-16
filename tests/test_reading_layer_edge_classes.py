@@ -23,7 +23,7 @@ _SPACE_HTML = (_STATIC / "space.html").read_text()
 
 
 # --- classification: a default, disclosed rather than parked on (mail 10596's own
-# instruction), swapped for Khnum's real per-request edge_classes the moment it lands -------
+# instruction), overridden by Khnum's real per-type header field ---------------------------
 
 def test_a_default_structural_type_list_exists_and_is_disclosed() -> None:
     assert "const STRUCTURAL_EDGE_TYPES = new Set([" in _SPACE_JS
@@ -32,11 +32,41 @@ def test_a_default_structural_type_list_exists_and_is_disclosed() -> None:
     assert "function classOfEdgeType(type)" in _SPACE_JS
 
 
-def test_classification_prefers_khnums_real_header_field_over_the_fallback() -> None:
+def test_classification_reads_the_wire_field_link_type_class_not_edge_classes() -> None:
+    # THE WIRE EDGE CLASSES FIX (Thoth mail 11291): the browser used to read
+    # `snap.edge_classes`, a field the wire never actually sends -- the real header field
+    # is `link_type_class`, index-aligned to edge_types the same way. The old field is gone
+    # outright as a live READ (an explanatory comment naming it, for the historical record,
+    # is fine and expected -- checked as a real indexing expression, not a bare substring,
+    # so the comment prose doesn't false-negative this).
     body = _SPACE_JS.split("async function fetchStreamSnapshot()", 1)[1].split(
-        "\n  return { nodes, edges };", 1)[0]
-    assert "snap.edge_classes" in body
-    assert "classOfEdgeType(type)" in body
+        "\n  return { nodes, edges, edgeClassByType };", 1)[0]
+    assert "snap.edge_classes[" not in body
+    assert "snap.link_type_class[i]" in body
+    assert "classOfEdgeType(type)" in body  # still the fallback for a type the header lacks
+
+
+def test_header_container_class_normalizes_to_structural() -> None:
+    # "container" (membership/containment, distinct from ordinary structural) hides at
+    # rest exactly like "structural" -- every existing check in this file only ever
+    # distinguishes "structural" from everything else.
+    body = _SPACE_JS.split("async function fetchStreamSnapshot()", 1)[1][:2600]
+    assert 'if (cls === "container") cls = "structural";' in body
+
+
+def test_a_header_class_overrides_the_client_fallback_table() -> None:
+    # live-verified regression (mail 11291): the browser marked authored_by "semantic"
+    # (STRUCTURAL_EDGE_TYPES doesn't list it) while the header's own link_type_class says
+    # authored_by is structural -- edgeClassByType must prefer the header's own value.
+    body = _SPACE_JS.split("async function fetchStreamSnapshot()", 1)[1][:2600]
+    assert "let cls = snap.link_type_class && snap.link_type_class[i];" in body
+    assert "edgeClassByType[t] = cls || classOfEdgeType(t);" in body
+
+
+def test_effective_edge_class_debug_hook_exists() -> None:
+    body = _SPACE_JS.split("const api = {", 1)[1]
+    assert "effectiveEdgeClass(type)" in body
+    assert "get edgeClassByType()" in body
 
 
 # --- structural edges are NOT drawn at rest; the legend is the only way to opt back in ----
