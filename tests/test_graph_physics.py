@@ -747,7 +747,10 @@ async def test_run_physics_migrate_verify_only_writes_nothing(actions: Actions) 
     assert receipts[-1]["done"] is True
     assert receipts[-1]["verify_only"] is True
     assert receipts[-1]["placed"] >= 2
-    assert "peak_rss_kb" not in receipts[-1]
+    # THE RECEIPT-STATS TIP (decision cc2f2ea7): peak_rss_kb rides every receipt
+    # shape now, not just a real write's own -- `--verify-only` used to report
+    # nothing about memory at all.
+    assert receipts[-1]["peak_rss_kb"] > 0
     # THE ACCEPTANCE METRICS (Thoth mail 11208) ride the receipt too.
     assert "layout_bbox_min" in receipts[-1]
     assert "layout_bbox_max" in receipts[-1]
