@@ -948,6 +948,16 @@ export async function initSpace(container) {
   // more than this many nodes for one direction, so a hub focus stays a legible tree.
   const MAX_EGO_NODES = 300;
   let egoSaved = null; // Map<id, {x,y}> of positions the active relayout overwrote
+  // THE ONE-HOP NEIGHBOURHOOD FIX (operator ruling, grounds 5b37d219, Thoth mail 11272):
+  // measured defect -- focus walked PATH_EDGE_TYPES only, so focusing a real agent
+  // (Sekhmet, degree 402) reached 43 nodes over succeeded_from/succeeds_seat and nothing
+  // else; the operator saw a wall of same-named labels and never what the agent actually
+  // did. focusBasePathReachable is the ORIGINAL provenance-path walk's own reachable set
+  // (upstream/downstream over PATH_EDGE_TYPES, unchanged); the one-hop-all-types
+  // neighbourhood is additive on top of it, grouped per (type, direction) into a paged
+  // count node when a bucket exceeds DRILL_PAGE_SIZE, added as real objects otherwise.
+  let focusBasePathReachable = new Set();
+  let focusHopsUp = new Map(), focusHopsDown = new Map();
   function bfsHops(adj, startId, depth) {
     const hops = new Map([[startId, 0]]);
     let frontier = [startId];
@@ -971,7 +981,7 @@ export async function initSpace(container) {
     }
     egoSaved = null;
   }
-  function applyEgoLayout(focusId, hopsUp, hopsDown) {
+  function applyEgoLayout(focusId, hopsUp, hopsDown, extraSeed) {
     restoreEgoLayout(); // a fresh focus always starts from the real stored positions
     const idx = idById;
     const focusNode = idx.get(focusId);
@@ -985,6 +995,7 @@ export async function initSpace(container) {
     // reference wpp that never shrinks just because the camera was already zoomed in.
     const wpp = maxViewSize / wrap.clientHeight;
     const colW = EGO_COL_SPACING_PX * wpp, rowH = EGO_ROW_SPACING_PX * wpp;
+    const chainW = CHAIN_SPACING_PX * wpp;
     egoSaved = new Map();
     const byRank = new Map(); // signed hop (-left/+right) -> [ids]
     for (const [id, hop] of hopsUp) {
@@ -995,9 +1006,37 @@ export async function initSpace(container) {
       if (id === focusId || hop === 0) continue;
       (byRank.get(hop) || (byRank.set(hop, []), byRank.get(hop))).push(id);
     }
+    // SUCCESSION CHAIN COLUMN COMPRESSION (mail 11272 items 2/4): live-verified root cause
+    // of "the camera does not refit to something legible" for a long-lineage agent -- a
+    // pure single-file succession run (rank K has exactly one member, connected to rank
+    // K-1's own single member by a succession edge) used to pay the FULL EGO_COL_SPACING_PX
+    // every hop, same as any unrelated provenance hop. A real 43-generation Sekhmet chain
+    // measured a 544,433-world-unit span from that alone. Adjacent succession-only ranks
+    // now use the same tight CHAIN_SPACING_PX the one-hop groups use; a branching or
+    // mixed-type rank still gets the normal column width.
+    const successionAdj = new Map(); // id -> Set of ids reachable by one succession edge
+    for (const e of edges) {
+      if (!SUCCESSION_EDGE_TYPES.has(e.type)) continue;
+      (successionAdj.get(e.source) || (successionAdj.set(e.source, new Set()), successionAdj.get(e.source))).add(e.target);
+      (successionAdj.get(e.target) || (successionAdj.set(e.target, new Set()), successionAdj.get(e.target))).add(e.source);
+    }
+    const colX = new Map([[0, cx]]);
+    const chainRankIds = new Set(); // rank members whose column used the tight chain width
+    for (const [side, cmp] of [[-1, (a, b) => b - a], [1, (a, b) => a - b]]) {
+      const ranks = [...byRank.keys()].filter((r) => Math.sign(r) === side).sort(cmp);
+      let x = cx, prevSingle = focusId;
+      for (const r of ranks) {
+        const ids = byRank.get(r);
+        const isChainStep = ids.length === 1 && prevSingle && successionAdj.get(ids[0])?.has(prevSingle);
+        x += side * (isChainStep ? chainW : colW);
+        colX.set(r, x);
+        if (isChainStep) chainRankIds.add(ids[0]);
+        prevSingle = ids.length === 1 ? ids[0] : null;
+      }
+    }
     const seed = new Map([[focusId, { x: cx, y: cy }]]);
     for (const [signedHop, ids] of byRank) {
-      const x = cx + signedHop * colW;
+      const x = colX.get(signedHop);
       ids.sort(); // deterministic, not otherwise meaningful
       ids.forEach((id, i) => {
         const nd = idx.get(id);
@@ -1005,6 +1044,28 @@ export async function initSpace(container) {
         egoSaved.set(id, { x: nd.x, y: nd.y });
         seed.set(id, { x, y: cy + (i - (ids.length - 1) / 2) * rowH });
       });
+    }
+    // ONE-HOP NEIGHBOURHOOD (mail 11272 item 1): real neighbour objects a (type, direction)
+    // bucket was small enough to place directly, seeded radially around the hub by
+    // buildEgoGroups -- merged into the SAME seed/relax pass so real edges between them and
+    // the path-ranked members still pull toward each other, not just toward the hub. A node
+    // already placed by the path walk keeps its ranked-column seed; the one-hop walk never
+    // fights it.
+    // pinned ids (SUCCESSION CHAIN LAYOUT, mail 11272 item 4): a chain member's own
+    // position is a deliberate, ordered-by-generation placement, not a physics seed --
+    // exempted from repulsion/springs entirely, or the SAME O(n^2) spread that unfolds a
+    // wide rank into a fan would just as happily unfold a 50-member chain back into the
+    // "40-wide row of labels" this layout exists to prevent.
+    const fixedIds = new Set([focusId, ...chainRankIds]);
+    if (extraSeed) {
+      for (const [id, p] of extraSeed) {
+        if (seed.has(id)) continue;
+        const nd = idx.get(id);
+        if (!nd) continue;
+        egoSaved.set(id, { x: nd.x, y: nd.y });
+        seed.set(id, p);
+        if (p.pinned) fixedIds.add(id);
+      }
     }
     // THE DRILL, item 6: relax the rank layout's own output -- a wide rank (many siblings
     // at the same hop) used to stack in one straight column, reading as a solid bar/disc
@@ -1015,13 +1076,255 @@ export async function initSpace(container) {
     for (const e of edges) {
       if (seed.has(e.source) && seed.has(e.target)) springs.push([e.source, e.target]);
     }
-    const relaxed = relaxPositions(seed, springs, focusId);
+    const relaxed = relaxPositions(seed, springs, fixedIds);
     for (const [id, p] of relaxed) {
       if (id === focusId) continue;
       const nd = idx.get(id);
       if (nd) { nd.x = p.x; nd.y = p.y; }
     }
   }
+
+  // THE ONE-HOP NEIGHBOURHOOD (mail 11272 item 1): "focus = the clicked object plus its
+  // ONE-HOP neighbourhood over ALL link types, both directions ... container-class
+  // neighbours appear as one anchor each." Groups every real one-hop neighbour by
+  // (edge type, direction relative to id) -- a container-scale neighbour (isContainerFocus
+  // of its own) gets pulled out separately, one anchor each, never grouped into a bucket.
+  function oneHopByTypeDirection(id) {
+    const byKey = new Map(); // "type|direction" -> Map<id, nd>
+    const containerNeighbors = new Map(); // id -> nd
+    for (const e of edges) {
+      let otherId, direction;
+      if (e.source === id && e.target !== id) { otherId = e.target; direction = "out"; }
+      else if (e.target === id && e.source !== id) { otherId = e.source; direction = "in"; }
+      else continue;
+      const nd = idById.get(otherId);
+      if (!nd) continue;
+      if (isContainerFocus(otherId)) { containerNeighbors.set(otherId, nd); continue; }
+      const key = `${e.type}|${direction}`;
+      let m = byKey.get(key);
+      if (!m) { m = new Map(); byKey.set(key, m); }
+      m.set(otherId, nd);
+    }
+    const groups = new Map();
+    for (const [key, m] of byKey) groups.set(key, [...m.values()]);
+    return { groups, containerNeighbors: [...containerNeighbors.values()] };
+  }
+
+  // SUCCESSION CHAIN LAYOUT (mail 11272 item 4): "a succession chain renders as a chain
+  // (ordered by generation, spaced by pixels), never overlapping." Live-verified without
+  // this: focusing a real 402-degree agent's "spawned_by (in)" bucket spread 381
+  // same-named lineage members via generic repulsion into one wide horizontal smear --
+  // exactly the "40-wide row of labels" the operator's own report described. A succession
+  // edge type gets a real linear order (BFS outward from the focus over ONLY that edge
+  // type, among this bucket's own members) instead of a radial fan; distance from focus
+  // doubles as generation.
+  const SUCCESSION_EDGE_TYPES = new Set(["succeeded_from", "succeeds_seat"]);
+  function orderSuccessionChain(focusId, members, edgeType) {
+    const memberIds = new Set(members.map((m) => m.id));
+    const universe = new Set([focusId, ...memberIds]);
+    const adj = new Map();
+    for (const e of edges) {
+      if (e.type !== edgeType) continue;
+      if (!universe.has(e.source) || !universe.has(e.target)) continue;
+      (adj.get(e.source) || (adj.set(e.source, []), adj.get(e.source))).push(e.target);
+      (adj.get(e.target) || (adj.set(e.target, []), adj.get(e.target))).push(e.source);
+    }
+    const dist = new Map([[focusId, 0]]);
+    const queue = [focusId];
+    for (let qi = 0; qi < queue.length; qi++) {
+      const cur = queue[qi];
+      for (const n of adj.get(cur) || []) {
+        if (dist.has(n)) continue;
+        dist.set(n, dist.get(cur) + 1);
+        queue.push(n);
+      }
+    }
+    // members the chain walk never reached (a disconnected outlier within the same edge
+    // type/direction bucket) still need a slot -- appended past the real chain, sorted by
+    // degree so at least the ordering stays deterministic.
+    const ordered = members.filter((m) => dist.has(m.id))
+      .sort((a, b) => dist.get(a.id) - dist.get(b.id));
+    const unreached = members.filter((m) => !dist.has(m.id))
+      .sort((a, b) => (b.degree || 0) - (a.degree || 0) || (a.id < b.id ? -1 : 1));
+    return [...ordered, ...unreached].map((nd) => ({ nd, generation: dist.get(nd.id) ?? null }));
+  }
+
+  let egoGroupFocusId = null; // which focus these groups belong to
+  let egoGroupExpandedKey = null; // "type|direction" currently paged open, or null
+  let egoGroupPageCount = 1;
+  let egoGroupEntries = []; // [{key, kind:'group'|'more', type, direction, count, x, y, div}]
+  let egoContainerAnchorEntries = []; // [{id, label, x, y, div}]
+  function disposeEgoGroupDivs() {
+    for (const e of egoGroupEntries) e.div.remove();
+    egoGroupEntries = [];
+  }
+  function disposeEgoContainerAnchors() {
+    for (const e of egoContainerAnchorEntries) e.div.remove();
+    egoContainerAnchorEntries = [];
+  }
+  function clearEgoGroupState() {
+    disposeEgoGroupDivs();
+    disposeEgoContainerAnchors();
+    egoGroupFocusId = null;
+    egoGroupExpandedKey = null;
+    egoGroupPageCount = 1;
+  }
+  function buildEgoGroupDivs() {
+    for (const entry of egoGroupEntries) {
+      const div = document.createElement("div");
+      div.className = "lod-glyph-label ego-drill-label";
+      div.style.cursor = "pointer";
+      div.textContent = entry.kind === "more"
+        ? `+${entry.count} more ${entry.type} (${entry.direction})`
+        : `${entry.type} (${entry.direction}) ${entry.count}`;
+      div.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        if (entry.kind === "more") { egoGroupPageCount++; } else { egoGroupExpandedKey = entry.key; egoGroupPageCount = 1; }
+        renderFocusEgoGroups(pathFocusId, focusHopsUp, focusHopsDown);
+      });
+      labelsEl.appendChild(div);
+      entry.div = div;
+    }
+  }
+  function buildEgoContainerAnchorDivs() {
+    for (const entry of egoContainerAnchorEntries) {
+      const div = document.createElement("div");
+      div.className = "lod-glyph-label ego-drill-label";
+      div.style.cursor = "pointer";
+      div.textContent = entry.label || entry.id.slice(0, 8);
+      div.addEventListener("click", (ev) => { ev.stopPropagation(); focusObject(entry.id); });
+      labelsEl.appendChild(div);
+      entry.div = div;
+    }
+  }
+  function positionEgoGroups() {
+    for (const entry of egoGroupEntries) {
+      if (!entry.div) continue;
+      _screenV.set(entry.x, entry.y, 0).project(camera);
+      entry.div.style.left = `${(_screenV.x * 0.5 + 0.5) * wrap.clientWidth}px`;
+      entry.div.style.top = `${(-_screenV.y * 0.5 + 0.5) * wrap.clientHeight}px`;
+    }
+    for (const entry of egoContainerAnchorEntries) {
+      if (!entry.div) continue;
+      _screenV.set(entry.x, entry.y, 0).project(camera);
+      entry.div.style.left = `${(_screenV.x * 0.5 + 0.5) * wrap.clientWidth}px`;
+      entry.div.style.top = `${(-_screenV.y * 0.5 + 0.5) * wrap.clientHeight}px`;
+    }
+  }
+  // computes this focus's own one-hop groups/anchors and returns the real member ids to
+  // seed into applyEgoLayout's own relax pass -- small buckets (<= DRILL_PAGE_SIZE, and
+  // budget-permitting) place directly; a bucket over the page size (or one that would blow
+  // the MAX_EGO_NODES budget) becomes a paged count node instead, same mechanic THE DRILL's
+  // own container buckets use.
+  const CHAIN_SPACING_PX = 22; // tighter than EGO_ROW_SPACING_PX (34) -- lineage siblings, not the ranked tree
+  function buildEgoGroups(id, hub) {
+    disposeEgoGroupDivs();
+    disposeEgoContainerAnchors();
+    const { groups, containerNeighbors } = oneHopByTypeDirection(id);
+    const cx = hub.x || 0, cy = hub.y || 0;
+    const wpp = maxViewSize / wrap.clientHeight;
+    const ringR = EGO_COL_SPACING_PX * wpp * 1.6;
+    const chainStep = CHAIN_SPACING_PX * wpp;
+    const extraSeed = new Map(); // id -> {x,y,pinned?}
+    const keys = [...groups.keys()].sort();
+    const slotCount = keys.length + containerNeighbors.length;
+    const angleStep = slotCount ? (2 * Math.PI / slotCount) : 0;
+    let slot = 0;
+    for (const key of keys) {
+      const members = groups.get(key);
+      const [type, direction] = key.split("|");
+      const angle = slot * angleStep; slot++;
+      const tx = cx + Math.cos(angle) * ringR, ty = cy + Math.sin(angle) * ringR;
+      const isChain = SUCCESSION_EDGE_TYPES.has(type);
+      const dirX = Math.cos(angle), dirY = Math.sin(angle);
+      const budgetLeft = MAX_EGO_NODES - focusBasePathReachable.size - extraSeed.size;
+      if (key === egoGroupExpandedKey) {
+        const ranked = isChain
+          ? orderSuccessionChain(id, members, type).map((c) => c.nd)
+          : members.slice().sort((a, b) => (b.degree || 0) - (a.degree || 0) || (a.id < b.id ? -1 : 1));
+        const take = Math.min(ranked.length, DRILL_PAGE_SIZE * egoGroupPageCount, Math.max(0, budgetLeft));
+        for (let k = 0; k < take; k++) {
+          const nd = ranked[k];
+          if (isChain) {
+            const d = ringR + (k + 1) * chainStep;
+            extraSeed.set(nd.id, { x: cx + dirX * d, y: cy + dirY * d, pinned: true });
+          } else {
+            const a2 = angle + (k - (take - 1) / 2) * 0.08;
+            extraSeed.set(nd.id, { x: cx + Math.cos(a2) * ringR * 1.3, y: cy + Math.sin(a2) * ringR * 1.3 });
+          }
+        }
+        if (ranked.length > take) {
+          egoGroupEntries.push({ key: `more:${key}`, kind: "more", type, direction, count: ranked.length - take, x: tx, y: ty, div: null });
+        }
+        continue;
+      }
+      if (members.length <= DRILL_PAGE_SIZE && members.length <= budgetLeft) {
+        if (isChain) {
+          const chain = orderSuccessionChain(id, members, type);
+          chain.forEach(({ nd }, i) => {
+            const d = ringR + (i + 1) * chainStep;
+            extraSeed.set(nd.id, { x: cx + dirX * d, y: cy + dirY * d, pinned: true });
+          });
+        } else {
+          members.forEach((nd, i) => {
+            const a2 = angle + (i - (members.length - 1) / 2) * 0.1;
+            extraSeed.set(nd.id, { x: cx + Math.cos(a2) * ringR, y: cy + Math.sin(a2) * ringR });
+          });
+        }
+        continue;
+      }
+      egoGroupEntries.push({ key, kind: "group", type, direction, count: members.length, x: tx, y: ty, div: null });
+    }
+    containerNeighbors.forEach((nd, i) => {
+      const angle = (keys.length + i) * angleStep;
+      const tx = cx + Math.cos(angle) * ringR, ty = cy + Math.sin(angle) * ringR;
+      egoContainerAnchorEntries.push({ id: nd.id, label: nd.label, x: tx, y: ty, div: null });
+    });
+    buildEgoGroupDivs();
+    buildEgoContainerAnchorDivs();
+    return extraSeed;
+  }
+  // the shared render path for BOTH the initial focus and any group/"more" click after it
+  // -- never resets egoGroupExpandedKey/egoGroupPageCount itself (the caller, focusObject
+  // or a click handler, decides that), the exact bug THE DRILL's own clearDrillState hit
+  // (mail 11241) if this had reset unconditionally instead.
+  function renderFocusEgoGroups(id, hopsUp, hopsDown) {
+    const hub = idById.get(id);
+    if (!hub) return;
+    const extraSeed = buildEgoGroups(id, hub);
+    pathReachable = new Set([...focusBasePathReachable, ...extraSeed.keys()]);
+    applyEgoLayout(id, hopsUp, hopsDown, extraSeed);
+    syncMovedInstancePositions(egoSaved ? new Set(egoSaved.keys()) : null);
+    // zoom-to-fit: frame the camera around exactly the reachable set's own (now relaid-out)
+    // bounding box -- every focus (and every group expand within it) refits, per mail
+    // 11272 item 2 ("the operator reports it does not").
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const rid of pathReachable) {
+      const nd = idById.get(rid);
+      if (!nd || nd.x == null || nd.y == null) continue;
+      minX = Math.min(minX, nd.x); maxX = Math.max(maxX, nd.x);
+      minY = Math.min(minY, nd.y); maxY = Math.max(maxY, nd.y);
+    }
+    if (Number.isFinite(minX)) {
+      camera.position.x = (minX + maxX) / 2;
+      camera.position.y = (minY + maxY) / 2;
+      const span = Math.max(maxX - minX, maxY - minY, 0);
+      const EGO_FIT_MIN_VIEWSIZE = 400;
+      viewSize = Math.max(EGO_FIT_MIN_VIEWSIZE, Math.min(maxViewSize, span * 1.6 + 40));
+      updateFrustum();
+      rescaleForZoom();
+    }
+    applyDim();
+    buildEdgeLines(idToNode, edges); // review flaw #1: base layer must hide too, see clearFocus
+    updatePathEdges();
+    buildProjectAnchors(id);
+    positionEgoGroups();
+    setStatus(`focused: ${pathReachable.size} reachable` +
+      (includeDownstream ? " (upstream+downstream)" : " (upstream)"));
+    scheduleLabelPick();
+    markDirty();
+  }
+
   // THE DRILL (ruling d7d55257, Thoth mail 11048, item 6): "physics on the visible set
   // only: a small force step (repulsion + springs, a few hundred iterations, seeded) over
   // the expanded nodes, nothing else moves." `seed` is a Map<id,{x,y}> of STARTING
@@ -1064,7 +1367,7 @@ export async function initSpace(container) {
         if (fb) { fb.x -= dx * EGO_SPRING; fb.y -= dy * EGO_SPRING; }
       }
       for (const id of ids) {
-        if (id === fixedId) continue;
+        if (id === fixedId || (fixedId instanceof Set && fixedId.has(id))) continue;
         const p = pos.get(id), f = force.get(id);
         p.x += f.x; p.y += f.y;
       }
@@ -1488,6 +1791,16 @@ export async function initSpace(container) {
   let pathHighlightEdges = null;
   const PATH_EDGE_BRIGHT = new THREE.Color(0x58a6ff);
   const PATH_EDGE_DIM = new THREE.Color(0x58a6ff).multiplyScalar(0.35);
+  // CROSS-CLUSTER FOCUS EDGE BUNDLING (operator ruling, grounds 5b37d219, Thoth mail 11272
+  // item 5): "cross-cluster edges longer than a threshold in screen pixels draw as bundled
+  // quadratic curves with alpha falling with length." Scoped to the FOCUS overlay only
+  // (this function) -- THE LAST RENDERER's own "no bundling, straight lines" rule (mail
+  // 11066) stays in force for the base dim layer (buildEdgeLines); this reopens rendering
+  // for focus/preview specifically, per the new ruling, not a blanket reversal.
+  const BUNDLE_SCREEN_PX_THRESHOLD = 220;
+  const BUNDLE_CURVE_SEGMENTS = 14;
+  const BUNDLE_BOW_PX = 60; // how far the curve's own midpoint bows off the straight line
+  const BUNDLE_ALPHA_FLOOR = 0.15; // never fades a real edge to invisible, same spirit as uMinAlpha
   function updatePathEdges() {
     if (pathHighlightEdges) {
       scene.remove(pathHighlightEdges);
@@ -1497,15 +1810,45 @@ export async function initSpace(container) {
     }
     markDirty();
     if (!pathFocusId) return;
+    const wpp = worldPerPx();
     const pos = [], col = [];
     for (const e of edges) {
       const onPath = PATH_EDGE_TYPES.has(e.type) && pathReachable.has(e.source) && pathReachable.has(e.target);
       if (!onPath) continue;
       const a = idById.get(e.source), b = idById.get(e.target);
       if (!a || !b) continue;
-      pos.push(a.x || 0, a.y || 0, -0.05, b.x || 0, b.y || 0, -0.05);
-      col.push(PATH_EDGE_BRIGHT.r, PATH_EDGE_BRIGHT.g, PATH_EDGE_BRIGHT.b,
-        PATH_EDGE_DIM.r, PATH_EDGE_DIM.g, PATH_EDGE_DIM.b);
+      const ax = a.x || 0, ay = a.y || 0, bx = b.x || 0, by = b.y || 0;
+      const worldLen = Math.hypot(bx - ax, by - ay);
+      const screenLen = worldLen / wpp;
+      const crossCluster = a.project && b.project && a.project !== b.project;
+      if (!crossCluster || screenLen <= BUNDLE_SCREEN_PX_THRESHOLD) {
+        pos.push(ax, ay, -0.05, bx, by, -0.05);
+        col.push(PATH_EDGE_BRIGHT.r, PATH_EDGE_BRIGHT.g, PATH_EDGE_BRIGHT.b,
+          PATH_EDGE_DIM.r, PATH_EDGE_DIM.g, PATH_EDGE_DIM.b);
+        continue;
+      }
+      // alpha falls with length past the threshold -- baked into the vertex COLOR here
+      // (this material has no separate alpha attribute), scaling the bright/dim endpoints
+      // toward black so additive blending reads as dimmer without ever hitting true zero.
+      const over = (screenLen - BUNDLE_SCREEN_PX_THRESHOLD) / BUNDLE_SCREEN_PX_THRESHOLD;
+      const alpha = Math.max(BUNDLE_ALPHA_FLOOR, 1 / (1 + over)); // Reinhard-shaped falloff, bounded
+      const midX = (ax + bx) / 2, midY = (ay + by) / 2;
+      const nx = -(by - ay) / worldLen, ny = (bx - ax) / worldLen; // unit perpendicular
+      const bow = BUNDLE_BOW_PX * wpp;
+      const ctrlX = midX + nx * bow, ctrlY = midY + ny * bow;
+      let px = ax, py = ay;
+      for (let s = 1; s <= BUNDLE_CURVE_SEGMENTS; s++) {
+        const t = s / BUNDLE_CURVE_SEGMENTS;
+        const omt = 1 - t;
+        const x = omt * omt * ax + 2 * omt * t * ctrlX + t * t * bx;
+        const y = omt * omt * ay + 2 * omt * t * ctrlY + t * t * by;
+        pos.push(px, py, -0.05, x, y, -0.05);
+        const t0 = (s - 1) / BUNDLE_CURVE_SEGMENTS;
+        const c0 = PATH_EDGE_DIM.clone().lerp(PATH_EDGE_BRIGHT, 1 - t0).multiplyScalar(alpha);
+        const c1 = PATH_EDGE_DIM.clone().lerp(PATH_EDGE_BRIGHT, 1 - t).multiplyScalar(alpha);
+        col.push(c0.r, c0.g, c0.b, c1.r, c1.g, c1.b);
+        px = x; py = y;
+      }
     }
     if (!pos.length) return;
     const geo = new THREE.BufferGeometry();
@@ -1669,9 +2012,56 @@ export async function initSpace(container) {
   hoverEl.className = "hover-card";
   hoverEl.hidden = true;
   wrap.appendChild(hoverEl);
+  // THE UNMISTAKABLE FOCUS (mail 11272 item 2): "a ring or halo" around the clicked
+  // object itself -- a plain HTML overlay (same pattern as hoverEl above), sized off the
+  // focused node's own aRadiusPx-equivalent screen size, never the WebGL scene.
+  const focusRingEl = document.createElement("div");
+  focusRingEl.className = "focus-ring";
+  focusRingEl.hidden = true;
+  wrap.appendChild(focusRingEl);
+  function positionFocusRing() {
+    const nd = pathFocusId ? idById.get(pathFocusId) : null;
+    if (!nd) { focusRingEl.hidden = true; return; }
+    _screenV.set(nd.x || 0, nd.y || 0, 0).project(camera);
+    const x = (_screenV.x * 0.5 + 0.5) * wrap.clientWidth;
+    const y = (-_screenV.y * 0.5 + 0.5) * wrap.clientHeight;
+    const r = Math.max(10, (nd.radiusPx || 6) + 6);
+    focusRingEl.style.left = `${x}px`;
+    focusRingEl.style.top = `${y}px`;
+    focusRingEl.style.width = `${r * 2}px`;
+    focusRingEl.style.height = `${r * 2}px`;
+    focusRingEl.hidden = false;
+  }
+  // THE UNMISTAKABLE FOCUS (mail 11272 item 3): "the hover card shows the same identity
+  // string as the label plus type, project and generation; label and card never
+  // disagree." labelTextFor(nd) is already the SAME call pickLabels' own div.textContent
+  // uses -- label and card were already structurally incapable of disagreeing, since both
+  // read the identical function on the identical node. Generation is the new piece: how
+  // many succeeded_from hops back this object sits from the newest in its own succession
+  // chain, or null (omitted) for anything that isn't part of one.
+  let succeededFromNext = null; // built lazily, once: id -> id it succeeded (older)
+  let succeededFromMembers = null; // ids appearing anywhere in a succeeded_from edge
+  function computeGeneration(nd) {
+    if (!succeededFromNext) {
+      succeededFromNext = new Map();
+      succeededFromMembers = new Set();
+      for (const e of edges) {
+        if (e.type !== "succeeded_from") continue;
+        succeededFromNext.set(e.source, e.target);
+        succeededFromMembers.add(e.source);
+        succeededFromMembers.add(e.target);
+      }
+    }
+    if (!succeededFromMembers.has(nd.id)) return null;
+    let count = 0, cur = nd.id, guard = 0;
+    while (succeededFromNext.has(cur) && guard++ < 200) { cur = succeededFromNext.get(cur); count++; }
+    return count + 1;
+  }
   function updateHoverCard(nd) {
+    const generation = computeGeneration(nd);
     hoverEl.innerHTML = `<div class="hover-label">${labelTextFor(nd)}</div>` +
-      `<div class="hover-meta">${nd.type}${nd.project ? " · " + nd.project : ""}</div>`;
+      `<div class="hover-meta">${nd.type}${nd.project ? " · " + nd.project : ""}` +
+      `${generation != null ? " · gen " + generation : ""}</div>`;
   }
   function positionHoverCard(clientX, clientY) {
     const rect = wrap.getBoundingClientRect();
@@ -1702,6 +2092,8 @@ export async function initSpace(container) {
     restoreEgoLayout();
     if (restored) syncMovedInstancePositions(restored);
     clearDrillState();
+    clearEgoGroupState();
+    focusBasePathReachable = new Set();
     disposeProjectAnchors();
     applyDim();
     // review flaw #1: the BASE edge layer is its own static geometry (built once from
@@ -1796,47 +2188,21 @@ export async function initSpace(container) {
     if (!options.skipStackPush) pushFocusStack(id);
     if (onFocus) onFocus(id); // shares the selection with an embedding table (console.js)
 
+    // ONE-HOP NEIGHBOURHOOD (mail 11272 item 1): the provenance-path walk above stays the
+    // BASE reachable set (unchanged semantics); the one-hop-all-types neighbourhood is
+    // additive on top of it. A fresh focus onto a DIFFERENT object resets the group/page
+    // expand state; re-focusing the SAME one (or a group/"more" click within it) keeps it.
+    focusBasePathReachable = new Set(pathReachable);
+    focusHopsUp = hopsUp; focusHopsDown = hopsDown;
+    if (egoGroupFocusId !== id) { egoGroupExpandedKey = null; egoGroupPageCount = 1; }
+    egoGroupFocusId = id;
+
     // EGO RELAYOUT (mail 10726): focus at centre, ancestors ranked leftward by hop (roots
     // farthest left), downstream (if on) ranked rightward — "distance rational instead of
-    // the world-unit spread." Moves only the reachable set's own GPU instances (O(moved)).
-    applyEgoLayout(id, hopsUp, hopsDown);
-    syncMovedInstancePositions(egoSaved ? new Set(egoSaved.keys()) : null);
-
-    // zoom-to-fit: frame the camera around exactly the reachable set's own (now relaid-out)
-    // bounding box, not a fixed small viewSize centered on the click.
-    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-    for (const rid of pathReachable) {
-      const nd = idById.get(rid);
-      if (!nd || nd.x == null || nd.y == null) continue;
-      minX = Math.min(minX, nd.x); maxX = Math.max(maxX, nd.x);
-      minY = Math.min(minY, nd.y); maxY = Math.max(maxY, nd.y);
-    }
-    if (Number.isFinite(minX)) {
-      camera.position.x = (minX + maxX) / 2;
-      camera.position.y = (minY + maxY) / 2;
-      const span = Math.max(maxX - minX, maxY - minY, 0);
-      // padding + a sane floor/ceiling — the ceiling rides maxViewSize (the real fitted
-      // graph's own extent, set in fitToNodes) rather than a hardcoded 1300: the same class
-      // of stale-constant bug Thoth caught in the wheel clamp (mail 10581) would otherwise
-      // clip a legitimately wide-spread path back down to a fixed small view. The floor
-      // (review flaw #6, TIP 1c) is raised from the old 30 -- fine for a whole-graph fit,
-      // where span is always huge, but a tiny reachable set (a lone child or two) could
-      // collapse the ego layout's own span near that floor, leaving the 48px screen CAP as
-      // the dominant visual element in an otherwise near-empty frame.
-      const EGO_FIT_MIN_VIEWSIZE = 400;
-      viewSize = Math.max(EGO_FIT_MIN_VIEWSIZE, Math.min(maxViewSize, span * 1.6 + 40));
-      updateFrustum();
-      rescaleForZoom();
-    }
-
-    applyDim();
-    buildEdgeLines(idToNode, edges); // review flaw #1: base layer must hide too, see clearFocus
-    updatePathEdges();
-    buildProjectAnchors(id);
-    setStatus(`focused: ${pathReachable.size} reachable` +
-      (includeDownstream ? " (upstream+downstream)" : " (upstream)"));
-    scheduleLabelPick();
-    markDirty();
+    // the world-unit spread." The one-hop groups/anchors, camera refit, edge rebuild and
+    // status line all live in renderFocusEgoGroups now, shared with every group/"more"
+    // click after this one so they behave identically.
+    renderFocusEgoGroups(id, hopsUp, hopsDown);
     // TIP 1's own 100ms budget (mail 10726 item 2): everything above is client-side and
     // synchronous; only the inspector's own network fetch happens after, unawaited by the
     // visual. Logged, not asserted, since a live DevTools/CPU throttle can't be simulated
@@ -1986,9 +2352,13 @@ export async function initSpace(container) {
       div.hidden = false;
       div.style.left = `${x}px`;
       div.style.top = `${y}px`;
-      div.className = "lbl" + (lit ? " lit" : "");
+      // THE UNMISTAKABLE FOCUS (mail 11272 item 2): the clicked object's own label is
+      // strictly bigger than a merely-lit one, never just bold-and-bright -- pinned is
+      // already true for it via `lit` above, this is the "larger" half of the same ask.
+      div.className = "lbl" + (lit ? " lit" : "") + (nd.id === pathFocusId ? " focus-label" : "");
       _placed.push([x - LABEL_W / 2, y - LABEL_H, x + LABEL_W / 2, y]);
     }
+    positionFocusRing();
     if (window.__spaceWheelTiming) {
       const t0 = performance.now();
       positionDrillDivs();
@@ -1997,12 +2367,16 @@ export async function initSpace(container) {
       const t2 = performance.now();
       positionProjectStubs();
       const t3 = performance.now();
+      positionEgoGroups();
+      const t4 = performance.now();
       console.debug("[wheel] positionLabels tail: drillDivs", (t1 - t0).toFixed(2),
-        "ms; projectAnchors", (t2 - t1).toFixed(2), "ms; projectStubs", (t3 - t2).toFixed(2), "ms");
+        "ms; projectAnchors", (t2 - t1).toFixed(2), "ms; projectStubs", (t3 - t2).toFixed(2),
+        "ms; egoGroups", (t4 - t3).toFixed(2), "ms");
     } else {
       positionDrillDivs();
       positionProjectAnchors();
       positionProjectStubs();
+      positionEgoGroups();
     }
   }
 
@@ -2042,6 +2416,14 @@ export async function initSpace(container) {
     get projectAnchorCount() { return projectAnchorEntries.length; },
     get projectStubEntries() { return projectStubEntries.map((e) => ({ visibleProject: e.visibleProject, hiddenProject: e.hiddenProject, count: e.count })); },
     revealProjectStub,
+    // THE ONE-HOP NEIGHBOURHOOD (mail 11272 item 1): live-verification/test hooks, same
+    // convention as the container drill's own hooks above.
+    oneHopByTypeDirection,
+    get egoGroupEntries() { return egoGroupEntries.map((e) => ({ key: e.key, kind: e.kind, type: e.type, direction: e.direction, count: e.count })); },
+    get egoContainerAnchorEntries() { return egoContainerAnchorEntries.map((e) => ({ id: e.id, label: e.label })); },
+    get egoGroupExpandedKey() { return egoGroupExpandedKey; },
+    expandEgoGroup(key) { egoGroupExpandedKey = key; egoGroupPageCount = 1; renderFocusEgoGroups(pathFocusId, focusHopsUp, focusHopsDown); },
+    get focusBasePathReachable() { return focusBasePathReachable; },
   };
   window.__space = api; // kept for existing debugging/test scripts, same shape as before
   return api;

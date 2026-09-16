@@ -155,7 +155,7 @@ def test_the_structural_edges_of_focus_carve_out_is_retired() -> None:
 
 
 def test_camera_fits_to_the_reachable_set_not_a_fixed_view() -> None:
-    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:4700]
+    body = _SPACE_JS.split("function renderFocusEgoGroups(id, hopsUp, hopsDown)", 1)[1][:1600]
     assert "for (const rid of pathReachable)" in body
     assert "Math.min(maxViewSize, span * 1.6 + 40)" in body
 

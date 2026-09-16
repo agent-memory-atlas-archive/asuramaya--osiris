@@ -41,7 +41,7 @@ async def test_ui_static_assets_force_revalidation() -> None:
 # --- flaw #1: focus rebuilds the BASE edge layer too, not just node visibility ------------
 
 def test_focus_rebuilds_the_base_edge_layer_not_just_node_visibility() -> None:
-    focus_body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:4700]
+    focus_body = _SPACE_JS.split("function renderFocusEgoGroups(id, hopsUp, hopsDown)", 1)[1][:1600]
     assert "buildEdgeLines(idToNode, edges); // review flaw #1" in focus_body
     clear_body = _SPACE_JS.split("function clearFocus()", 1)[1][:900]
     assert "buildEdgeLines(idToNode, edges);" in clear_body
