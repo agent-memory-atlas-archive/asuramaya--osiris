@@ -134,7 +134,7 @@ def test_hover_card_and_label_read_off_the_identical_identity_string() -> None:
     body = _SPACE_JS.split("function updateHoverCard(nd)", 1)[1][:500]
     assert "${labelTextFor(nd)}" in body
     assert "const generation = computeGeneration(nd);" in body
-    assert '" · gen " + generation' in body
+    assert '" · chain depth " + generation' in body
 
 
 def test_generation_is_hops_back_a_succeeded_from_chain_null_if_not_in_one() -> None:
@@ -273,3 +273,47 @@ def test_group_expansion_notifies_the_table_not_just_the_initial_focus() -> None
     # real expansion, not stuck at the pre-expansion count.
     body = _SPACE_JS.split("function renderFocusEgoGroups(id, hopsUp, hopsDown)", 1)[1][:900]
     assert "if (onFocus) onFocus(id);" in body
+
+
+# --- w312 review (mail 11359): agent focus wrongly drilled, label pool ignored focus,
+# hover-card generation disagreed with the label's own, no-op group expansions ------------
+
+def test_only_membership_container_types_take_the_drill() -> None:
+    # a busy Agent seat's own structural degree can exceed MAX_EGO_NODES the same way a
+    # real project's membership degree does now that spawned_by is structural (mail 11291)
+    # -- the drill must never eat a non-membership focus regardless of degree.
+    body = _SPACE_JS.split("function isContainerFocus(id)", 1)[1][:400]
+    assert 'const CONTAINER_FOCUS_TYPES = new Set(["SoftwareProject", "Seat"]);' \
+        in _SPACE_JS.split("function isContainerFocus(id)", 1)[0][-500:]
+    assert "if (!nd || !CONTAINER_FOCUS_TYPES.has(nd.type)) return false;" in body
+
+
+def test_label_pool_fills_lit_nodes_before_ranking_by_degree() -> None:
+    # top-N-by-degree alone ignores the focus: a real ego focus is mostly low-natural-degree
+    # nodes (Message, chain members), so the old sort filled the pool with unrelated
+    # high-degree nodes elsewhere in the viewport instead of what was actually focused.
+    body = _SPACE_JS.split("function pickLabels()", 1)[1][:1400]
+    assert "const isLit = (nd) => nd.id === pathFocusId || pathReachable.has(nd.id) || " \
+        "nd.id === selectedId;" in body
+    assert "(isLit(b) ? 1 : 0) - (isLit(a) ? 1 : 0) || (b.degree || 0) - (a.degree || 0)" \
+        in body
+
+
+def test_hover_card_generation_is_named_honestly_not_claimed_as_the_labels_own() -> None:
+    # computeGeneration is a succeeded_from hop count, not the seat's own generation
+    # numeral the label string carries (Khnum's roman numeral) -- the two can genuinely
+    # disagree, so the card names what it actually measures instead of "gen".
+    body = _SPACE_JS.split("function updateHoverCard(nd)", 1)[1][:500]
+    assert '" · chain depth " + generation' in body
+    assert '" · gen "' not in _SPACE_JS
+
+
+def test_group_offers_are_filtered_to_members_not_already_reachable() -> None:
+    # oneHopByTypeDirection walks ALL edges touching id, including ones the original
+    # PATH_EDGE_TYPES walk already reached -- a group entirely made of already-reachable
+    # members is a dead click (expanding it never grows pathReachable) and must never be
+    # offered at all.
+    body = _SPACE_JS.split("function buildEgoGroups(id, hub)", 1)[1][:1600]
+    assert "const members = groups.get(key).filter((nd) => " \
+        "!focusBasePathReachable.has(nd.id));" in body
+    assert "if (members.length === 0) continue;" in body

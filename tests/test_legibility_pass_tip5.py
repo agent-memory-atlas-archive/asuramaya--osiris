@@ -159,7 +159,7 @@ def test_edges_are_no_longer_bundled_or_density_scaled() -> None:
 # --- rule 3: top-N-by-degree labels inside the current viewport, every zoom, no tiers ------
 
 def test_labels_are_top_n_by_degree_within_the_viewport_no_tier_gating() -> None:
-    body = _SPACE_JS.split("function pickLabels()", 1)[1][:900]
+    body = _SPACE_JS.split("function pickLabels()", 1)[1][:1400]
     assert "nodeVisible(nd) && nd.x >= minX && nd.x <= maxX && nd.y >= minY && nd.y <= maxY" in body
     assert "(b.degree || 0) - (a.degree || 0)" in body
     assert "N_LABELS" in body
