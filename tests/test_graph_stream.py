@@ -344,6 +344,53 @@ async def test_fetch_snapshot_nameless_seat_holder_generation_is_uppercase_roman
     assert out["labels"][idx] == "Thoth VII"
 
 
+async def test_fetch_snapshot_seat_generation_past_39_uses_the_display_roman(
+    actions: Actions,
+) -> None:
+    """THE WRONG ROMAN FUNCTION (Thoth mail 11345, the w310 regression): the seat
+    branch called `agents._to_roman`, the CANONICAL-ID-SUFFIX formatter -- capped
+    at 39, falling back to a raw "g<n>" escape hatch above that (built for a
+    mintable id, hex-collision-free, never meant to reach a human-facing label).
+    Live specimens: "thoth G107", "Khnum G72", "Seshat G65" -- every current seat
+    holder past generation 39. `agents._roman_display` (unbounded, already
+    uppercase, the SAME function `seat_label` itself uses for "Thoth CVI") is the
+    right one -- 107 renders as "CVII", never "G107"."""
+    now = datetime.now(UTC)
+    seat = await actions.create_or_find_object("Seat", "seat:gs-past-39", "test")
+    await actions.assert_property(seat, "handle", "Thoth", "test", now, 0.9)
+    agent = await actions.create_or_find_object("Agent", "agent:gs-past-39-holder", "test")
+    await actions.assert_property(agent, "seat_generation", "107", "test", now, 0.9)
+    await actions.create_link(agent, seat, "holds", "test", now, 1.0)
+
+    await layout_batch(actions, limit=1000)
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    idx = out["object_ids"].index(str(agent))
+    label = out["labels"][idx]
+    assert label == "Thoth CVII"
+    assert not re.search(r"G\d+", label)
+
+
+async def test_fetch_snapshot_seat_holder_label_folds_in_the_model_suffix(
+    actions: Actions,
+) -> None:
+    """THE MODEL SUFFIX ON EVERY LABEL (Thoth mail 11345): the seat branch used to
+    never read `source_model` at all -- "Thoth VII", never "Thoth VII ·
+    sonnet-5" -- even when the assertion existed. Folded on now, uniformly with
+    the patronym and canonical-stem branches."""
+    now = datetime.now(UTC)
+    seat = await actions.create_or_find_object("Seat", "seat:gs-seat-model", "test")
+    await actions.assert_property(seat, "handle", "Seshat", "test", now, 0.9)
+    agent = await actions.create_or_find_object("Agent", "agent:gs-seat-model-holder", "test")
+    await actions.assert_property(agent, "seat_generation", "65", "test", now, 0.9)
+    await actions.assert_property(agent, "source_model", "claude-haiku-4-5", "test", now, 0.9)
+    await actions.create_link(agent, seat, "holds", "test", now, 1.0)
+
+    await layout_batch(actions, limit=1000)
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    idx = out["object_ids"].index(str(agent))
+    assert out["labels"][idx] == "Seshat LXV · haiku-4-5"
+
+
 async def test_fetch_snapshot_seat_succession_canonical_reads_the_real_generation(
     actions: Actions,
 ) -> None:
@@ -430,7 +477,9 @@ async def test_fetch_snapshot_nameless_agent_without_a_patronym_falls_back_to_ca
     await layout_batch(actions, limit=1000)
     out = decode_snapshot(await fetch_snapshot(actions.pool))
     idx = out["object_ids"].index(str(agent))
-    assert out["labels"][idx] == "gs-nameless-nopat"
+    # THE MODEL SUFFIX ON EVERY LABEL (Thoth mail 11345): folded onto the
+    # canonical-stem fallback too, not just the patronym/seat branches.
+    assert out["labels"][idx] == "gs-nameless-nopat · sonnet-5"
     assert "?" not in out["labels"][idx]
 
 
@@ -479,8 +528,9 @@ async def test_fetch_snapshot_agent_name_assertion_is_never_read_for_the_stem(
     assert "Reconcile" not in label
     # no patronym and no handle either -- falls to the canonical stem, same as
     # any other totally nameless agent (test_fetch_snapshot_nameless_agent_
-    # without_a_patronym_falls_back_to_canonical's own precedent).
-    assert label == "gs-name-never-read"
+    # without_a_patronym_falls_back_to_canonical's own precedent), with the
+    # model suffix and sub marker still folded on (Thoth mail 11345).
+    assert label == "gs-name-never-read · opus-4-8 ⌊ sub"
 
 
 async def test_fetch_snapshot_agent_handle_stripped_to_its_leading_alphabetic_run(
