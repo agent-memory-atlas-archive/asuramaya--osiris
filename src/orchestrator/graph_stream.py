@@ -116,9 +116,16 @@ same tip since all three ship together here):
      17,689 carried a numeral -- the rest were an AUTO-GENERATED `name`
      assertion ("claude in osiris", "general-purpose spawn") wrongly seeding
      the patronym slot as if it were a real name, or a generation-1 label
-     dropping its own roman numeral outright. Both closed: `_is_auto_shaped_name`
-     excludes the machinery shapes from the patronym slot, and every label now
-     shows a numeral unconditionally, "I" included.
+     dropping its own roman numeral outright. THE w309 REGRESSION (Thoth mail
+     11334): the fix for that remainder (a per-shape `name`-string detector)
+     both missed a third auto-shape ("<model> · <description>", lineage.py:247)
+     and, for a spawned child whose `patronym` is already the compound "<stem>
+     <parent ROMAN>.<ordinal>" `patronym_for` mints, appended a SECOND fresh
+     roman numeral on top ("Thoth I.1 I"). STOP PATTERN-MATCHING NAME STRINGS:
+     `name`/`summary`/`title` are never read for an Agent's stem at all now,
+     closed-endedly, and a compound patronym's own embedded roman+ordinal is
+     read as the complete generation field rather than recomputed and
+     appended again -- see `_agent_identity_labels`'s own docstring.
 """
 from __future__ import annotations
 
@@ -140,20 +147,33 @@ STATUS_RETIRED = 1 << 0
 STATUS_CONTESTED = 1 << 1
 _LABEL_MAX_CHARS = 40
 
-# THE 1,851 REMAINDER (Thoth mail 11326, w308 live header check): the two auto-generated
-# `name` assertion shapes that must never seed the patronym slot -- neither carries a
-# real human-chosen name, so using either as a label's stem is the exact "labels show
-# machinery" shape the whole legibility pass exists to kill. `_MODEL_IN_PROJECT_RE`
-# matches `f"{identity.model or 'claude'} in {identity.project or '?'}"` (agents.py:4060,
-# e.g. "claude in osiris", "claude-haiku-4-5-20251001 in neo" -- model and project tokens
-# are both single-word slugs, so no real prose name collides with this shape). The
-# `" spawn"` suffix matches `f"{agent_type} spawn"` (lineage.py:358, e.g.
-# "general-purpose spawn") -- a subagent-type stamp, not a name.
-_MODEL_IN_PROJECT_RE = re.compile(r"^\S+ in \S+$")
+# STOP PATTERN-MATCHING NAME STRINGS (Thoth mail 11334, the w309 regression): the
+# `name`/`summary`/`title` assertions are never read for an Agent's stem at all --
+# not even through a detector for a known machine-generated shape (the w309 fix's
+# own `_is_auto_shaped_name`, which this replaces). `name` on an Agent is always
+# either a human-legible echo of a structural field (redundant) or one of several
+# auto-generated shapes this module has no closed list of (agents.py:4060's
+# "<model> in <project>", lineage.py:358's "<agent_type> spawn",
+# lineage.py:247's "<model> · <description>", and whatever the next one turns out
+# to be) -- excluding shapes one regex at a time chases an open set forever. The
+# stem comes ONLY from structured fields: `patronym`, else `handle` (stripped to
+# its leading alphabetic run -- a legacy/malformed handle like "thoth G58" carries
+# noise no real name does), else the canonical short id.
+_LEADING_ALPHA_RE = re.compile(r"[A-Za-z]+")
 
+# A `patronym` assertion is minted by `patronym_for` (lineage.py) in exactly one
+# compound shape for a spawned child: "<parent's own display name> <parent's
+# ROMAN numeral>.<birth ordinal>" (e.g. "Thoth I.1", "Soundwave XIII.4" -- the
+# roman belongs to the PARENT, the child rides it dotted, operator ruling
+# 2026-07-16). THE DOUBLE NUMERAL BUG (Thoth mail 11334): treating that whole
+# compound as a bare stem and then appending this child's OWN freshly-computed
+# generation roman on top produced "Thoth I.1 I" -- two numerals, one already
+# embedded in the compound, one appended fresh. This regex recognizes the SAME
+# sanctioned shape `_PATRONYM_ORDINAL` (lineage.py) already parses for the same
+# assertion, splitting a compound patronym into its real stem and its
+# already-complete generation+ordinal, so nothing is appended twice.
+_PATRONYM_COMPOUND_RE = re.compile(r"^(.+) ([IVXLCDM]+)\.(\d+)$")
 
-def _is_auto_shaped_name(name: str) -> bool:
-    return bool(_MODEL_IN_PROJECT_RE.match(name)) or name.endswith(" spawn")
 
 def _short_label(
     type_name: str, canonical: str, handle: str | None, name: str | None,
@@ -337,29 +357,26 @@ async def _agent_identity_labels(
     7,618 osiris agents were rendering "Agent · ? in osiris" because the OLD
     fallback's own `model` lookup came back empty for this subset and
     `patronym`, which DOES carry a real name for almost all of them, was never
-    read): "<Patronym> <ROMAN> · <model short>" built from the `patronym`
-    assertion (falling back to the object's OWN raw `handle`/`name` assertion
-    when patronym is genuinely absent -- the same string that used to bypass
-    this whole scheme now only ever SEEDS it), the canonical's own generation
-    suffix (`_generation`/`_to_roman`, the SAME parse the seat-branch above
-    already trusts), and `source_model` short-formed (`_model_short`) -- a
-    sidechain fork (`is_sidechain`) gets a trailing " ⌊ sub" marker on top of
-    that same label, disclosure not suppression (mailbox.py's own is_sidechain
-    disclosure rule, obligation 706c27dc). NEVER "?" and NEVER a bare name
-    with no numeral: an agent with no patronym AND no raw handle/usable name
-    falls back to its own canonical short id -- still a real, resolvable name.
+    read): "<stem> <ROMAN>[.ordinal] · <model short>" -- `source_model`
+    short-formed (`_model_short`), a sidechain fork (`is_sidechain`) gets a
+    trailing " ⌊ sub" marker on top, disclosure not suppression (mailbox.py's
+    own is_sidechain disclosure rule, obligation 706c27dc). NEVER "?" and
+    NEVER a bare stem with no numeral.
 
-    THE 1,851 REMAINDER (Thoth mail 11326, w308 live header check -- 17,689 of
-    19,540 Agent labels carried a numeral post-w308, the rest two shapes):
-    (1) a `name` assertion of an AUTO-GENERATED shape (`_is_auto_shaped_name`:
-    "<model> in <project>" from agents.py:4060, or "<agent_type> spawn" from
-    lineage.py:358) is machinery, not a name -- it no longer seeds the
-    patronym slot, falling through to the canonical stem exactly like a
-    patronym-less, handle-less agent always has. (2) generation 1 used to
-    omit the roman suffix outright (a bare "anubis"/"Ferryman · opus-4-8",
-    indistinguishable from the old handle-bypass this whole arc exists to
-    kill) -- every Agent label now carries a numeral, "I" included, in both
-    the seat branch and the patronym branch."""
+    STRUCTURAL FIELDS ONLY, NEVER NAME/SUMMARY/TITLE (Thoth mail 11334, the
+    w309 regression): the stem is `patronym`, else `handle`'s own leading
+    alphabetic run, else the canonical short id -- `name` is never read for an
+    Agent at all, closed-endedly (see `_LEADING_ALPHA_RE`'s own module
+    comment for why a per-shape detector was the wrong fix). THE DOUBLE
+    NUMERAL FIX (same mail): `patronym_for` (lineage.py) mints a spawned
+    child's patronym as the COMPOUND "<parent stem> <parent ROMAN>.<birth
+    ordinal>" (e.g. "Thoth I.1") -- treating that as a bare stem and
+    appending this child's own freshly-computed roman on top produced "Thoth
+    I.1 I". `_PATRONYM_COMPOUND_RE` recognises the shape and uses its
+    embedded roman+ordinal as the complete generation field, stem split out
+    separately, nothing appended twice. EVERY AGENT LABEL CARRIES A NUMERAL
+    (Thoth mail 11326): generation 1 shows "I", never omitted, in both the
+    seat branch and this one."""
     agents = [r for r in rows if r["type"] == "Agent"]
     if not agents:
         return {}
@@ -415,27 +432,34 @@ async def _agent_identity_labels(
             out[oid] = f"{seat['handle']} {_to_roman(gen).upper()}"
             continue
         detail = detail_by_id.get(oid)
-        # THE NAME ASSERTION ONLY SEEDS THE PATRONYM (Thoth mail 11317): a raw
-        # `handle`/`name` assertion (the lineage's own bare stamp, e.g.
-        # "Thoth") used to bypass the whole identity format outright; now it
-        # only ever supplies the patronym slot when a real `patronym`
-        # assertion is absent, so it still gets a real generation numeral.
-        #
-        # THE AUTO-SHAPED NAME MUST NOT SEED IT EITHER (Thoth mail 11326, the
-        # 1,851 remainder): a `name` assertion of the machinery shapes
-        # `_is_auto_shaped_name` recognises ("claude in osiris", "general-
-        # purpose spawn") is not a real name any more than the id it replaced
-        # -- falls through to the canonical stem below, same as no name at all.
-        raw_name = r["name"]
-        usable_name = raw_name if raw_name and not _is_auto_shaped_name(raw_name) else None
-        patronym = (detail["patronym"] if detail else None) or r["handle"] or usable_name
-        if not patronym:
+        # STOP PATTERN-MATCHING NAME STRINGS (Thoth mail 11334): the `name`
+        # assertion is never read here at all any more -- see the module-level
+        # comment above `_LEADING_ALPHA_RE`. Stem is patronym, else handle's
+        # own leading alphabetic run (never the raw handle verbatim: a legacy
+        # value like "thoth G58" is noise past the first word), else nothing
+        # (falls to the canonical stem below).
+        raw_patronym = detail["patronym"] if detail else None
+        compound = _PATRONYM_COMPOUND_RE.match(raw_patronym) if raw_patronym else None
+        # THE DOUBLE NUMERAL FIX (Thoth mail 11334): when the patronym is
+        # already the compound "<stem> <ROMAN>.<ordinal>" shape `patronym_for`
+        # mints for a spawned child, that IS the complete generation+sub-index
+        # -- never recomputed fresh and appended a second time on top.
+        if compound:
+            stem: str | None = compound.group(1)
+            gen_display = f"{compound.group(2)}.{compound.group(3)}"
+        else:
+            handle_match = _LEADING_ALPHA_RE.match(r["handle"]) if r["handle"] else None
+            stem = raw_patronym or (handle_match.group(0) if handle_match else None)
+            gen_display = None
+        if not stem:
             out[oid] = canonical.removeprefix("agent:")
             continue
-        gen = _generation(canonical)[1]
-        # EVERY AGENT LABEL CARRIES A NUMERAL (Thoth mail 11326): same rule as
-        # the seat branch above -- "I" for generation 1, never a bare patronym.
-        label = f"{patronym} {_to_roman(gen).upper()}"
+        if gen_display is None:
+            # EVERY AGENT LABEL CARRIES A NUMERAL (Thoth mail 11326): same rule
+            # as the seat branch above -- "I" for generation 1, never a bare stem.
+            gen = _generation(canonical)[1]
+            gen_display = _to_roman(gen).upper()
+        label = f"{stem} {gen_display}"
         model = detail["model"] if detail else None
         if model:
             label = f"{label} · {_model_short(model)}"
