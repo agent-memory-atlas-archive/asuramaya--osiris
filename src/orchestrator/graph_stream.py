@@ -98,11 +98,17 @@ same tip since all three ship together here):
      that can genuinely lack a name (an anonymous swarm session that never
      `claim_name`'d). Fixed per the ruling's own rule: lineage handle + generation
      when the Agent's OWN lineage currently holds a Seat (`seats.held_seat`, the same
-     door orient()/mount() use), else "Agent · <model> in <project>" (source_model
-     assertion; first live works_in target's own canonical, repo: prefix stripped) --
-     never the id either way. Resolved for the SMALL handle-less-Agent subset only
-     (Thoth's own live count: 49,712 of 49,766 labels already read as titles), not a
-     query added to every row.
+     door orient()/mount() use), else -- THE AGENT IDENTITY FIX (operator ruling,
+     grounds 9163b1c7): "<Patronym> <ROMAN> · <model short>" from the `patronym`
+     assertion, the canonical's own generation suffix, and a short-formed
+     `source_model`, a trailing " ⌊ sub" marker for a sidechain fork
+     (`is_sidechain`) -- superseding an earlier "Agent · <model> in <project>" whose
+     own `model` lookup came back empty for 7,618 live osiris agents, rendering
+     "Agent · ? in osiris". Never the raw id either way -- a patronym-less agent
+     (disclosed as possible, not observed) falls back to its own canonical short
+     id rather than a bare "?". Resolved for the SMALL handle-less-Agent subset
+     only (Thoth's own live count: 49,712 of 49,766 labels already read as
+     titles), not a query added to every row.
 """
 from __future__ import annotations
 
@@ -271,14 +277,36 @@ def decode_snapshot(data: bytes) -> dict[str, Any]:
     return out
 
 
+def _model_short(model: str) -> str:
+    """claude-sonnet-5 -> sonnet-5 -- the vendor prefix carries no information a
+    reader of THIS house's own labels needs; every model source_model ever
+    asserts here is a Claude one, so a fixed prefix strip is exact, not a guess."""
+    return model.removeprefix("claude-")
+
+
 async def _nameless_agent_fallbacks(
     pool: asyncpg.Pool, rows: list[asyncpg.Record],
 ) -> dict[uuid.UUID, str]:
-    """THE NAMELESS-AGENT LABEL FIX (ruling e1cb9e3b(c)): resolved ONLY for the small
-    handle-less-Agent subset of `rows` -- a per-id Seat lookup plus a couple of
-    assertion reads this module has no reason to pay for every ordinary, already-
-    named object. Lineage handle + generation when the Agent's OWN lineage currently
-    holds a Seat, else "Agent · <model> in <project>" -- never the id."""
+    """THE NAMELESS-AGENT LABEL FIX (ruling e1cb9e3b(c), corrected per operator
+    ruling grounds 9163b1c7): resolved ONLY for the small handle-less-Agent subset
+    of `rows` -- a per-id Seat lookup plus a couple of assertion reads this module
+    has no reason to pay for every ordinary, already-named object.
+
+    Lineage handle + generation when the Agent's OWN lineage currently holds a
+    Seat (unchanged) -- that's the recognisable, load-bearing name a reader
+    actually wants for a live seat-holder. Otherwise (THE AGENT IDENTITY FIX,
+    live count: 7,618 osiris agents were rendering "Agent · ? in osiris" because
+    the OLD fallback's own `model` lookup came back empty for this subset and
+    `patronym`, which DOES carry a real name for almost all of them, was never
+    read): "<Patronym> <ROMAN> · <model short>" built from the `patronym`
+    assertion, the canonical's own generation suffix (`_generation`/`_to_roman`,
+    the SAME parse the seat-branch above already trusts), and `source_model`
+    short-formed (`_model_short`) -- a sidechain fork (`is_sidechain`) gets a
+    trailing " ⌊ sub" marker on top of that same label, disclosure not
+    suppression (mailbox.py's own is_sidechain disclosure rule, obligation
+    706c27dc). NEVER "?": a patronym-less agent (no live count above zero at
+    last check, but disclosed rather than assumed impossible) falls back to its
+    own canonical short id -- still a real, resolvable name, never a raw "?"."""
     nameless = [r for r in rows if r["type"] == "Agent" and not r["handle"]]
     if not nameless:
         return {}
@@ -291,13 +319,13 @@ async def _nameless_agent_fallbacks(
         "  (SELECT a.value #>> '{}' FROM current_assertions a WHERE a.object_id=o.id "
         "   AND a.name='source_model' "
         "   ORDER BY a.confidence DESC, a.observed_at DESC LIMIT 1) AS model, "
-        "  (SELECT t.canonical FROM links l JOIN objects t ON t.id=l.to_id "
-        "   WHERE l.from_id=o.id AND l.type='works_in' "
-        "     AND (l.valid_until IS NULL OR l.valid_until > now()) "
-        "   ORDER BY l.id LIMIT 1) AS project "
+        "  (SELECT a.value #>> '{}' FROM current_assertions a WHERE a.object_id=o.id "
+        "   AND a.name='patronym' "
+        "   ORDER BY a.confidence DESC, a.observed_at DESC LIMIT 1) AS patronym, "
+        "  EXISTS(SELECT 1 FROM current_assertions a WHERE a.object_id=o.id "
+        "   AND a.name='is_sidechain' AND a.value #>> '{}' = 'true') AS is_sidechain "
         "FROM objects o WHERE o.id = ANY($1::uuid[])", ids)
-    model_by_id = {r["id"]: r["model"] for r in detail_rows}
-    project_by_id = {r["id"]: r["project"] for r in detail_rows}
+    detail_by_id = {r["id"]: r for r in detail_rows}
 
     out: dict[uuid.UUID, str] = {}
     for r in nameless:
@@ -306,10 +334,24 @@ async def _nameless_agent_fallbacks(
         if seat and seat.get("handle"):
             gen = _generation(canonical)[1]
             out[oid] = f"{seat['handle']} {_to_roman(gen)}" if gen > 1 else seat["handle"]
-        else:
-            model = model_by_id.get(oid) or "?"
-            project = (project_by_id.get(oid) or "unfiled").removeprefix("repo:")
-            out[oid] = f"Agent · {model} in {project}"
+            continue
+        detail = detail_by_id.get(oid)
+        patronym = detail["patronym"] if detail else None
+        if not patronym:
+            out[oid] = canonical.removeprefix("agent:")
+            continue
+        gen = _generation(canonical)[1]
+        # UPPERCASE roman, unlike the seat-branch above's own lowercase
+        # `_to_roman` -- disclosed inconsistency, not an oversight: the operator's
+        # own worked example (mail, grounds 9163b1c7) wrote "XXXVIII", and the
+        # seat-branch's established lowercase convention is untouched here.
+        label = f"{patronym} {_to_roman(gen).upper()}" if gen > 1 else patronym
+        model = detail["model"] if detail else None
+        if model:
+            label = f"{label} · {_model_short(model)}"
+        if detail and detail["is_sidechain"]:
+            label = f"{label} ⌊ sub"
+        out[oid] = label
     return out
 
 
