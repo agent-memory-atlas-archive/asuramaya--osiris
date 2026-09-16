@@ -1252,7 +1252,14 @@ export async function initSpace(container) {
     const angleStep = slotCount ? (2 * Math.PI / slotCount) : 0;
     let slot = 0;
     for (const key of keys) {
-      const members = groups.get(key);
+      // THE NO-OP EXPANSION FIX (Thoth mail 11359): oneHopByTypeDirection walks ALL edges
+      // touching id, including ones the ORIGINAL PATH_EDGE_TYPES walk already reached (a
+      // real Thread's own "possible_upstream|out" one-hop bucket can be entirely a subset
+      // of focusBasePathReachable) -- offering, and letting a reader page open, a group
+      // that adds zero new nodes to the reachable set is a dead click. Filter to members
+      // not already reachable; a group left with none is never offered at all.
+      const members = groups.get(key).filter((nd) => !focusBasePathReachable.has(nd.id));
+      if (members.length === 0) continue;
       const [type, direction] = key.split("|");
       const angle = slot * angleStep; slot++;
       const tx = cx + Math.cos(angle) * ringR, ty = cy + Math.sin(angle) * ringR;
@@ -1487,7 +1494,17 @@ export async function initSpace(container) {
     }
     return byType;
   }
+  // THE MEMBERSHIP-CLASS FIX (Thoth mail 11359): a high structural degree alone is not a
+  // container -- since spawned_by went structural (mail 11291), a busy Agent seat's own
+  // structural degree can exceed MAX_EGO_NODES the same way a real project's membership
+  // degree does, and the drill wrongly ate the whole focus (three count stubs, "0 shown",
+  // none of the agent's own succession/messages visible). Only genuine membership-container
+  // types ever take the drill; everything else, however high its structural degree, goes
+  // through the ordinary one-hop ego groups (which already page a huge bucket).
+  const CONTAINER_FOCUS_TYPES = new Set(["SoftwareProject", "Seat"]);
   function isContainerFocus(id) {
+    const nd = idById.get(id);
+    if (!nd || !CONTAINER_FOCUS_TYPES.has(nd.type)) return false;
     let n = 0;
     for (const e of edges) {
       if (e.edgeClass !== "structural") continue;
@@ -2107,9 +2124,14 @@ export async function initSpace(container) {
   // string as the label plus type, project and generation; label and card never
   // disagree." labelTextFor(nd) is already the SAME call pickLabels' own div.textContent
   // uses -- label and card were already structurally incapable of disagreeing, since both
-  // read the identical function on the identical node. Generation is the new piece: how
-  // many succeeded_from hops back this object sits from the newest in its own succession
-  // chain, or null (omitted) for anything that isn't part of one.
+  // read the identical function on the identical node.
+  // THE HONEST GENERATION FIX (Thoth mail 11359): this count is succeeded_from HOP DEPTH,
+  // not the seat's own generation numeral the label string carries (Khnum's roman numeral,
+  // seat_generation) -- for a seat whose own succession chain has gaps or a different root,
+  // the two numbers genuinely differ (sekhmet XLIV: label roman XLIV / seat_generation 44,
+  // this count 43). Parsing the label's own roman numeral client-side would silently break
+  // on every future label-format change Khnum makes; named for what it actually measures
+  // instead of claiming to be the generation.
   let succeededFromNext = null; // built lazily, once: id -> id it succeeded (older)
   let succeededFromMembers = null; // ids appearing anywhere in a succeeded_from edge
   function computeGeneration(nd) {
@@ -2132,7 +2154,7 @@ export async function initSpace(container) {
     const generation = computeGeneration(nd);
     hoverEl.innerHTML = `<div class="hover-label">${labelTextFor(nd)}</div>` +
       `<div class="hover-meta">${nd.type}${nd.project ? " · " + nd.project : ""}` +
-      `${generation != null ? " · gen " + generation : ""}</div>`;
+      `${generation != null ? " · chain depth " + generation : ""}</div>`;
   }
   function positionHoverCard(clientX, clientY) {
     const rect = wrap.getBoundingClientRect();
@@ -2370,8 +2392,16 @@ export async function initSpace(container) {
     const minY = camera.position.y - halfH, maxY = camera.position.y + halfH;
     const pool = idToNode.filter((nd) =>
       nodeVisible(nd) && nd.x >= minX && nd.x <= maxX && nd.y >= minY && nd.y <= maxY);
+    // THE FOCUS LABEL POOL FIX (Thoth mail 11359): a plain top-N-by-degree sort ignores the
+    // focus entirely -- a real focus's own reachable set is mostly low-natural-degree nodes
+    // (Message, chain members), so the pool filled with whatever happened to have the
+    // highest degree elsewhere in the viewport, leaving most of what the reader actually
+    // focused on unlabeled. Lit (focused/reachable/selected) nodes fill the pool FIRST,
+    // highest-degree-first among themselves; only remaining slots go to the ordinary
+    // degree ranking. Acceptance: every reachable node gets a label slot up to N_LABELS.
+    const isLit = (nd) => nd.id === pathFocusId || pathReachable.has(nd.id) || nd.id === selectedId;
     labeledNodes = pool.slice()
-      .sort((a, b) => (b.degree || 0) - (a.degree || 0))
+      .sort((a, b) => (isLit(b) ? 1 : 0) - (isLit(a) ? 1 : 0) || (b.degree || 0) - (a.degree || 0))
       .slice(0, N_LABELS);
     // reconcile DOM: remove divs for nodes no longer labeled, add for newly labeled ones —
     // reuses existing elements instead of an innerHTML rebuild every pick.
