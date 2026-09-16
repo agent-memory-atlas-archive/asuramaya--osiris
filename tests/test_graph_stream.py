@@ -311,7 +311,8 @@ async def test_fetch_snapshot_nameless_agent_falls_back_to_seat_handle_and_gener
 ) -> None:
     """THE NAMELESS-AGENT LABEL FIX (ruling e1cb9e3b(c)): a handle-less Agent whose
     lineage holds an active Seat labels as "<seat handle> <generation>", never its
-    own canonical id."""
+    own canonical id. EVERY AGENT LABEL CARRIES A NUMERAL (Thoth mail 11326):
+    generation 1 shows "I" too, not a bare handle."""
     now = datetime.now(UTC)
     seat = await actions.create_or_find_object("Seat", "seat:gs-nameless-a", "test")
     await actions.assert_property(seat, "handle", "Nefer", "test", now, 0.9)
@@ -321,7 +322,7 @@ async def test_fetch_snapshot_nameless_agent_falls_back_to_seat_handle_and_gener
     await layout_batch(actions, limit=1000)
     out = decode_snapshot(await fetch_snapshot(actions.pool))
     idx = out["object_ids"].index(str(agent))
-    assert out["labels"][idx] == "Nefer"
+    assert out["labels"][idx] == "Nefer I"
 
 
 async def test_fetch_snapshot_nameless_seat_holder_generation_is_uppercase_roman(
@@ -384,9 +385,12 @@ async def test_fetch_snapshot_nameless_agent_without_a_seat_falls_back_to_patron
     assert out["labels"][idx] == "Sekhmet VII · sonnet-5"
 
 
-async def test_fetch_snapshot_nameless_agent_generation_one_omits_the_roman_suffix(
+async def test_fetch_snapshot_nameless_agent_generation_one_shows_a_roman_numeral(
     actions: Actions,
 ) -> None:
+    """EVERY AGENT LABEL CARRIES A NUMERAL (Thoth mail 11326, w308 live header
+    check): generation 1 used to omit the roman suffix, indistinguishable from
+    the old handle-bypass -- show "I" like every other generation."""
     now = datetime.now(UTC)
     agent = await actions.create_or_find_object("Agent", "agent:gs-nameless-gen1", "test")
     await actions.assert_property(agent, "source_model", "claude-opus-5", "test", now, 0.9)
@@ -395,7 +399,7 @@ async def test_fetch_snapshot_nameless_agent_generation_one_omits_the_roman_suff
     await layout_batch(actions, limit=1000)
     out = decode_snapshot(await fetch_snapshot(actions.pool))
     idx = out["object_ids"].index(str(agent))
-    assert out["labels"][idx] == "Imhotep · opus-5"
+    assert out["labels"][idx] == "Imhotep I · opus-5"
 
 
 async def test_fetch_snapshot_nameless_sidechain_agent_gets_the_sub_marker(
@@ -448,6 +452,44 @@ async def test_fetch_snapshot_agent_with_only_a_bare_handle_still_gets_the_ident
     out = decode_snapshot(await fetch_snapshot(actions.pool))
     idx = out["object_ids"].index(str(agent))
     assert out["labels"][idx] == "Thoth VII · sonnet-5"
+
+
+async def test_fetch_snapshot_agent_auto_shaped_model_in_project_name_never_seeds_patronym(
+    actions: Actions,
+) -> None:
+    """THE 1,851 REMAINDER, shape 1 (Thoth mail 11326): a `name` assertion of the
+    auto-generated "<model> in <project>" shape (agents.py:4060, e.g.
+    "claude-haiku-4-5-20251001 in neo") is machinery, not a chosen name -- must
+    not seed the patronym slot, falling through to the canonical stem like a
+    patronym-less, handle-less agent always has."""
+    now = datetime.now(UTC)
+    agent = await actions.create_or_find_object("Agent", "agent:gs-auto-in-project", "test")
+    await actions.assert_property(
+        agent, "name", "claude-haiku-4-5-20251001 in neo", "test", now, 0.9)
+
+    await layout_batch(actions, limit=1000)
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    idx = out["object_ids"].index(str(agent))
+    assert out["labels"][idx] == "gs-auto-in-project"
+
+
+async def test_fetch_snapshot_agent_auto_shaped_spawn_name_never_seeds_patronym(
+    actions: Actions,
+) -> None:
+    """THE 1,851 REMAINDER, shape 2 (Thoth mail 11326): a `name` assertion of the
+    auto-generated "<agent_type> spawn" shape (lineage.py:358, e.g. "general-
+    purpose spawn") is a subagent-type stamp, not a name -- must not seed the
+    patronym slot either."""
+    now = datetime.now(UTC)
+    agent = await actions.create_or_find_object("Agent", "agent:gs-auto-spawn", "test")
+    await actions.assert_property(agent, "name", "general-purpose spawn", "test", now, 0.9)
+    await actions.assert_property(agent, "source_model", "claude-sonnet-5", "test", now, 0.9)
+    await actions.assert_property(agent, "is_sidechain", True, "test", now, 0.9)
+
+    await layout_batch(actions, limit=1000)
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    idx = out["object_ids"].index(str(agent))
+    assert out["labels"][idx] == "gs-auto-spawn"
 
 
 async def test_fetch_snapshot_edge_weight_is_raw_flat_for_now(actions: Actions) -> None:

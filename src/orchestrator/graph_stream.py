@@ -112,11 +112,19 @@ same tip since all three ship together here):
      as a bare "Thoth"/"Sekhmet", no numeral) -- resolved for EVERY Agent row
      now, that raw string only ever seeding the patronym slot when a real
      `patronym` assertion is absent, never standing in for the label itself.
+     THE 1,851 REMAINDER (Thoth mail 11326): of 19,540 Agent labels post-w308,
+     17,689 carried a numeral -- the rest were an AUTO-GENERATED `name`
+     assertion ("claude in osiris", "general-purpose spawn") wrongly seeding
+     the patronym slot as if it were a real name, or a generation-1 label
+     dropping its own roman numeral outright. Both closed: `_is_auto_shaped_name`
+     excludes the machinery shapes from the patronym slot, and every label now
+     shows a numeral unconditionally, "I" included.
 """
 from __future__ import annotations
 
 import json
 import math
+import re
 import struct
 import uuid
 from collections import defaultdict
@@ -131,6 +139,21 @@ SCHEMA_VERSION = 1
 STATUS_RETIRED = 1 << 0
 STATUS_CONTESTED = 1 << 1
 _LABEL_MAX_CHARS = 40
+
+# THE 1,851 REMAINDER (Thoth mail 11326, w308 live header check): the two auto-generated
+# `name` assertion shapes that must never seed the patronym slot -- neither carries a
+# real human-chosen name, so using either as a label's stem is the exact "labels show
+# machinery" shape the whole legibility pass exists to kill. `_MODEL_IN_PROJECT_RE`
+# matches `f"{identity.model or 'claude'} in {identity.project or '?'}"` (agents.py:4060,
+# e.g. "claude in osiris", "claude-haiku-4-5-20251001 in neo" -- model and project tokens
+# are both single-word slugs, so no real prose name collides with this shape). The
+# `" spawn"` suffix matches `f"{agent_type} spawn"` (lineage.py:358, e.g.
+# "general-purpose spawn") -- a subagent-type stamp, not a name.
+_MODEL_IN_PROJECT_RE = re.compile(r"^\S+ in \S+$")
+
+
+def _is_auto_shaped_name(name: str) -> bool:
+    return bool(_MODEL_IN_PROJECT_RE.match(name)) or name.endswith(" spawn")
 
 def _short_label(
     type_name: str, canonical: str, handle: str | None, name: str | None,
@@ -323,9 +346,20 @@ async def _agent_identity_labels(
     sidechain fork (`is_sidechain`) gets a trailing " ⌊ sub" marker on top of
     that same label, disclosure not suppression (mailbox.py's own is_sidechain
     disclosure rule, obligation 706c27dc). NEVER "?" and NEVER a bare name
-    with no numeral: an agent with no patronym AND no raw handle/name (not
-    observed live, disclosed rather than assumed impossible) falls back to its
-    own canonical short id -- still a real, resolvable name."""
+    with no numeral: an agent with no patronym AND no raw handle/usable name
+    falls back to its own canonical short id -- still a real, resolvable name.
+
+    THE 1,851 REMAINDER (Thoth mail 11326, w308 live header check -- 17,689 of
+    19,540 Agent labels carried a numeral post-w308, the rest two shapes):
+    (1) a `name` assertion of an AUTO-GENERATED shape (`_is_auto_shaped_name`:
+    "<model> in <project>" from agents.py:4060, or "<agent_type> spawn" from
+    lineage.py:358) is machinery, not a name -- it no longer seeds the
+    patronym slot, falling through to the canonical stem exactly like a
+    patronym-less, handle-less agent always has. (2) generation 1 used to
+    omit the roman suffix outright (a bare "anubis"/"Ferryman · opus-4-8",
+    indistinguishable from the old handle-bypass this whole arc exists to
+    kill) -- every Agent label now carries a numeral, "I" included, in both
+    the seat branch and the patronym branch."""
     agents = [r for r in rows if r["type"] == "Agent"]
     if not agents:
         return {}
@@ -374,8 +408,11 @@ async def _agent_identity_labels(
             # lowercase `_to_roman`'s own raw output; the fleet's own mail/seat
             # displays already write these uppercase, so this was the label
             # scheme's own outlier, not the other way around.
-            out[oid] = (
-                f"{seat['handle']} {_to_roman(gen).upper()}" if gen > 1 else seat["handle"])
+            # EVERY AGENT LABEL CARRIES A NUMERAL (Thoth mail 11326): generation 1
+            # used to omit the roman suffix entirely, so a first-generation
+            # seat-holder read as a bare handle indistinguishable from the old
+            # bypass this whole arc exists to kill -- show "I" rather than drop it.
+            out[oid] = f"{seat['handle']} {_to_roman(gen).upper()}"
             continue
         detail = detail_by_id.get(oid)
         # THE NAME ASSERTION ONLY SEEDS THE PATRONYM (Thoth mail 11317): a raw
@@ -383,12 +420,22 @@ async def _agent_identity_labels(
         # "Thoth") used to bypass the whole identity format outright; now it
         # only ever supplies the patronym slot when a real `patronym`
         # assertion is absent, so it still gets a real generation numeral.
-        patronym = (detail["patronym"] if detail else None) or r["handle"] or r["name"]
+        #
+        # THE AUTO-SHAPED NAME MUST NOT SEED IT EITHER (Thoth mail 11326, the
+        # 1,851 remainder): a `name` assertion of the machinery shapes
+        # `_is_auto_shaped_name` recognises ("claude in osiris", "general-
+        # purpose spawn") is not a real name any more than the id it replaced
+        # -- falls through to the canonical stem below, same as no name at all.
+        raw_name = r["name"]
+        usable_name = raw_name if raw_name and not _is_auto_shaped_name(raw_name) else None
+        patronym = (detail["patronym"] if detail else None) or r["handle"] or usable_name
         if not patronym:
             out[oid] = canonical.removeprefix("agent:")
             continue
         gen = _generation(canonical)[1]
-        label = f"{patronym} {_to_roman(gen).upper()}" if gen > 1 else patronym
+        # EVERY AGENT LABEL CARRIES A NUMERAL (Thoth mail 11326): same rule as
+        # the seat branch above -- "I" for generation 1, never a bare patronym.
+        label = f"{patronym} {_to_roman(gen).upper()}"
         model = detail["model"] if detail else None
         if model:
             label = f"{label} · {_model_short(model)}"
