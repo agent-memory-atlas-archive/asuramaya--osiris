@@ -135,8 +135,21 @@ def test_encode_snapshot_rejects_a_mismatched_labels_length() -> None:
 # --- _short_label: THE LEGIBILITY PASS, tip 2g/2c --------------------------------------
 
 
-def test_short_label_agent_uses_handle_never_the_id() -> None:
-    assert _short_label("Agent", "agent:deadbeef-g1", "Khnum", None, None) == "Khnum"
+def test_short_label_agent_uses_agent_fallback_never_the_raw_handle() -> None:
+    """THE IDENTITY FORMAT IS ALWAYS USED FOR AGENT (Thoth mail 11317): a raw
+    `handle` assertion used to win outright, bypassing the resolved identity
+    format -- now `agent_fallback` (required for type Agent) always wins."""
+    assert _short_label(
+        "Agent", "agent:deadbeef-g1", "Khnum", None, None,
+        agent_fallback="Khnum VII") == "Khnum VII"
+
+
+def test_short_label_agent_with_no_fallback_falls_through_to_title() -> None:
+    """A degenerate case (agent_fallback somehow unresolved) still never reads
+    the raw handle as a label of its own -- falls through to the generic
+    title/canonical chain like any other type."""
+    assert _short_label("Agent", "agent:deadbeef-g1", "Khnum", None, "some title") == (
+        "Agent some title")
 
 
 def test_short_label_software_project_strips_the_repo_scheme() -> None:
@@ -414,6 +427,27 @@ async def test_fetch_snapshot_nameless_agent_without_a_patronym_falls_back_to_ca
     idx = out["object_ids"].index(str(agent))
     assert out["labels"][idx] == "gs-nameless-nopat"
     assert "?" not in out["labels"][idx]
+
+
+async def test_fetch_snapshot_agent_with_only_a_bare_handle_still_gets_the_identity_format(
+    actions: Actions,
+) -> None:
+    """THE IDENTITY FORMAT IS ALWAYS USED FOR AGENT (Thoth mail 11317, live header
+    check after w307): 258 live agents had a raw `handle` assertion (their
+    lineage's own bare stamp, e.g. "Thoth") and no `patronym` -- _short_label's
+    old handle-first branch used it directly as the label, no generation, no
+    model, bypassing the identity resolver entirely. That raw handle must now
+    only SEED the patronym slot, still producing a real "<name> <ROMAN>"."""
+    now = datetime.now(UTC)
+    agent = await actions.create_or_find_object(
+        "Agent", "agent:gs-bare-handle-vii", "test")
+    await actions.assert_property(agent, "handle", "Thoth", "test", now, 0.9)
+    await actions.assert_property(agent, "source_model", "claude-sonnet-5", "test", now, 0.9)
+
+    await layout_batch(actions, limit=1000)
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    idx = out["object_ids"].index(str(agent))
+    assert out["labels"][idx] == "Thoth VII · sonnet-5"
 
 
 async def test_fetch_snapshot_edge_weight_is_raw_flat_for_now(actions: Actions) -> None:
