@@ -322,6 +322,9 @@ async def _nameless_agent_fallbacks(
         "  (SELECT a.value #>> '{}' FROM current_assertions a WHERE a.object_id=o.id "
         "   AND a.name='patronym' "
         "   ORDER BY a.confidence DESC, a.observed_at DESC LIMIT 1) AS patronym, "
+        "  (SELECT a.value #>> '{}' FROM current_assertions a WHERE a.object_id=o.id "
+        "   AND a.name='seat_generation' "
+        "   ORDER BY a.confidence DESC, a.observed_at DESC LIMIT 1) AS seat_generation, "
         "  EXISTS(SELECT 1 FROM current_assertions a WHERE a.object_id=o.id "
         "   AND a.name='is_sidechain' AND a.value #>> '{}' = 'true') AS is_sidechain "
         "FROM objects o WHERE o.id = ANY($1::uuid[])", ids)
@@ -332,7 +335,21 @@ async def _nameless_agent_fallbacks(
         oid, canonical = r["id"], r["canonical"]
         seat = await held_seat(pool, canonical)
         if seat and seat.get("handle"):
-            gen = _generation(canonical)[1]
+            # THE SEAT-GENERATION FIX (Thoth mail 11309, w306 review): a
+            # seat-succession canonical (agent:seat-<id>-g<N>) stamps its own
+            # ordinal as a `seat_generation` ASSERTION (`agents.seat_label`'s
+            # own authoritative source), never encoded in the canonical's own
+            # roman/g-suffix string the way an ordinary lineage id is --
+            # `_generation(canonical)` silently returned 1 for any such id
+            # below the "-g40" numeric-overflow threshold (a "-g3" or "-g45"
+            # canonical parses as a brand-new root, not a real generation),
+            # dropping the numeral and printing a bare handle. Read the real
+            # assertion first, falling back to the canonical parse only when
+            # it's genuinely absent (an agent claimed before the seat ruling,
+            # `seat_label`'s own documented fallback case).
+            detail = detail_by_id.get(oid)
+            seat_gen_raw = detail["seat_generation"] if detail else None
+            gen = int(seat_gen_raw) if seat_gen_raw else _generation(canonical)[1]
             # UPPERCASE (Thoth mail 11283: "unify the roman case... 'Thoth CVI'
             # and 'Sekhmet XXXVIII' is how the fleet already writes them") -- was
             # lowercase `_to_roman`'s own raw output; the fleet's own mail/seat
