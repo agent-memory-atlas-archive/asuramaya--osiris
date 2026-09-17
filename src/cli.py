@@ -8333,6 +8333,11 @@ def main(argv: list[str] | None = None) -> int:
             limit=args.limit, newest_first=args.newest_first,
             actor=args.actor, as_json=args.as_json))
     if args.command == "graph-migrate":
+        # this CLI's own event loop, not a subprocess call — the ratchet's
+        # has_subprocess gate coarsely sweeps in every .run(/.communicate( call
+        # anywhere in a file that imports subprocess at all, same as every other
+        # asyncio.run(cmd_*) dispatch line in this file.
+        # unbounded-wait-ok: asyncio.run() drives the event loop to completion
         return asyncio.run(cmd_graph_migrate(
             args.target, apply=args.apply, because=args.because,
             actor=args.actor, as_json=args.as_json))
