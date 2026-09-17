@@ -23,11 +23,13 @@ from typing import Any
 import asyncpg
 
 from src.actions.core import Actions
+from src.orchestrator.seats import seat_by_handle
 from src.parsers.base import EvidenceClass
 from src.parsers.evidence import confidence_for
 
 MIGRATION_TARGETS = frozenset({
     "repo_seats_fix", "file_the_unfiled", "assertion_links",
+    "owned_by_second_pass", "file_the_residual",
 })
 
 _TIER = EvidenceClass.DIRECT_OBSERVATION
@@ -50,6 +52,12 @@ async def run_migration(
             actions, actor=actor, dry_run=dry_run, because=because)
     if name == "assertion_links":
         return await migrate_assertion_links(
+            actions, actor=actor, dry_run=dry_run, because=because)
+    if name == "owned_by_second_pass":
+        return await migrate_owned_by_second_pass(
+            actions, actor=actor, dry_run=dry_run, because=because)
+    if name == "file_the_residual":
+        return await migrate_file_the_residual(
             actions, actor=actor, dry_run=dry_run, because=because)
     return {"error": f"unknown migration {name!r}", "valid_targets": sorted(MIGRATION_TARGETS)}
 
@@ -704,3 +712,186 @@ async def migrate_assertion_links(
         "already_present": vendor_already}
 
     return {"dry_run": dry_run, "receipt": receipt, "because": because if not dry_run else None}
+
+
+async def migrate_owned_by_second_pass(
+    actions: Actions, *, actor: str, dry_run: bool = True, because: str | None = None,
+) -> dict[str, Any]:
+    """OWNED_BY SECOND PASS (WAVE 26, PROVENANCE RESIDUE, Thoth mail 11535): the 847
+    Thread.owner values `migrate_assertion_links`'s own owned_by sub-migration left
+    unresolvable are two shapes neither of its two resolution paths (a Seat/Agent
+    canonical, or a bare active SoftwareProject name) can reach -- the literal word
+    "operator" (the human desk, minted as a Person under `principal:analyst:operator`
+    by every `register_agent` call, never a canonical the generic resolver would try)
+    and a BARE seat handle ("seshat", no `seat:` prefix, never resolved by a plain
+    canonical/uuid lookup) -- resolved here via `seats.seat_by_handle`, the house's own
+    name->Seat lookup (the same shape `team`'s own `--seat` argument already resolves
+    through), then the ordinary canonical resolve on the Seat it names.
+
+    ITS OWN MIGRATION TARGET, not folded back into `migrate_assertion_links`'s owned_by
+    sub-migration: the first pass's own two resolution paths are unchanged and still
+    correct for what they cover; this only adds the two fallback paths the live
+    `unresolvable_samples` actually showed, tried after the SAME canonical/uuid
+    resolution the first pass already tries -- so a value that already resolved under
+    the first pass is simply `already_present` here (owned_by is idempotent,
+    `_link_exists` checked before every mint, same as every other sub-migration in
+    this module).
+
+    DRY RUN IS THE DEFAULT. `dry_run=False` REQUIRES a non-blank `because`."""
+    if not dry_run and not (because or "").strip():
+        return {"error": "migrating without a because is an un-audited repair — cite "
+                         "the evidence/ruling that authorizes it"}
+    pool = actions.pool
+    now = datetime.now(UTC)
+    owner_rows = await pool.fetch(
+        "SELECT o.id AS subject_id, a.value #>> '{}' AS value "
+        "FROM objects o JOIN current_assertions a ON a.object_id=o.id "
+        "WHERE o.type='Thread' AND o.status='active' AND a.name='owner'")
+    minted = minted_as_operator = minted_as_handle = already_present = 0
+    unresolvable_samples: list[str] = []
+    for r in owner_rows:
+        value = (r["value"] or "").strip()
+        target_id = None
+        via_operator = via_handle = False
+        if value == "operator":
+            target_id = await _resolve_ref(
+                pool, "principal:analyst:operator", object_type="Person")
+            via_operator = target_id is not None
+        if target_id is None and value:
+            seat = await seat_by_handle(pool, value)
+            if seat is not None:
+                target_id = await _resolve_ref(pool, seat["seat_id"], object_type="Seat")
+                via_handle = target_id is not None
+        if target_id is None:
+            if len(unresolvable_samples) < 20:
+                unresolvable_samples.append(value or "<empty>")
+            continue
+        if await _link_exists(pool, r["subject_id"], target_id, "owned_by"):
+            already_present += 1
+            continue
+        minted += 1
+        if via_operator:
+            minted_as_operator += 1
+        if via_handle:
+            minted_as_handle += 1
+        if not dry_run:
+            await actions.create_link(
+                r["subject_id"], target_id, "owned_by", _SOURCE, now, _CONF,
+                evidence_class=_EC)
+    return {
+        "dry_run": dry_run,
+        "scanned": len(owner_rows),
+        "minted": minted, "minted_as_operator": minted_as_operator,
+        "minted_as_handle": minted_as_handle,
+        "skipped_unresolvable": len(owner_rows) - minted - already_present,
+        "already_present": already_present,
+        "unresolvable_samples": unresolvable_samples,
+        "because": because if not dry_run else None,
+    }
+
+
+async def migrate_file_the_residual(
+    actions: Actions, *, actor: str, dry_run: bool = True, because: str | None = None,
+) -> dict[str, Any]:
+    """FILE THE RESIDUAL (WAVE 26, PROVENANCE RESIDUE, Thoth mail 11535): 1,280 objects
+    stayed unfiled after `migrate_file_the_unfiled`'s own neighbour-majority vote,
+    mostly Message objects -- the top live ribbons off the unfiled fog are osiris<->
+    unfiled `broadcast_to` (800) and `addressed_to` (638), a rate the GENERIC any-link-
+    type vote can't clear cleanly: a Message's own `sent_by`/`addressed_to` agents
+    routinely sit in DIFFERENT projects (a cross-project DM), so the generic vote ties
+    and gives up exactly where a Message-SPECIFIC priority rule would not.
+
+    MESSAGE-ONLY, ITS OWN RULE, NOT A SECOND GENERIC PASS: a `broadcast_to` link names
+    the project directly (the SoftwareProject IS the target, its own bare name wins
+    outright, no vote needed) and wins first, whenever present -- a message broadcast
+    to a project is never miscounted as a tie against its own sender's project. Absent
+    that, every `sent_by`/`addressed_to` AGENT's own current `project` assertion is
+    tallied; a single distinct project among them files the message, more than one
+    distinct project is a genuine tie (a real cross-project DM) and stays unfiled,
+    counted, same "never guess between equally-supported candidates" law
+    `migrate_file_the_unfiled` already holds itself to. An object with neither shape
+    (no broadcast_to, no sent_by/addressed_to agent with a resolvable project) is
+    empty, also unfiled, also counted.
+
+    SCOPE DELIBERATELY NARROW: only `type='Message'` objects currently unfiled (no
+    `project` assertion, no live in_repo/works_in link) -- the residual's OTHER
+    members (non-Message) have no comparable rule stated for this wave and are left
+    exactly as `migrate_file_the_unfiled` already reported them, not silently guessed
+    at here.
+
+    DRY RUN IS THE DEFAULT. `dry_run=False` REQUIRES a non-blank `because`. Idempotent:
+    a repeat call finds no Message left both unfiled and resolvable by this rule."""
+    if not dry_run and not (because or "").strip():
+        return {"error": "migrating without a because is an un-audited repair — cite "
+                         "the evidence/ruling that authorizes it"}
+    pool = actions.pool
+    now = datetime.now(UTC)
+    unfiled_rows = await pool.fetch(
+        "SELECT o.id FROM objects o "
+        "WHERE o.type='Message' AND o.status NOT IN ('archived','merged','retired') "
+        "AND NOT EXISTS (SELECT 1 FROM current_assertions a "
+        "  WHERE a.object_id=o.id AND a.name='project') "
+        "AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_id=o.id "
+        "  AND l.type IN ('in_repo','works_in') "
+        "  AND (l.valid_until IS NULL OR l.valid_until > now()))")
+    unfiled_ids = [r["id"] for r in unfiled_rows]
+    filed: dict[uuid.UUID, str] = {}
+    filed_via_broadcast = 0
+    ties: list[dict[str, Any]] = []
+    still_unfiled = 0
+    if unfiled_ids:
+        broadcast_rows = await pool.fetch(
+            "SELECT l.from_id AS oid, p.canonical AS pcanon FROM links l "
+            "JOIN objects p ON p.id=l.to_id AND p.type='SoftwareProject' "
+            "  AND p.status='active' "
+            "WHERE l.type='broadcast_to' AND l.from_id = ANY($1::uuid[]) "
+            "AND (l.valid_until IS NULL OR l.valid_until > now())", unfiled_ids)
+        broadcast_project: dict[uuid.UUID, str] = {
+            r["oid"]: r["pcanon"].removeprefix("repo:") for r in broadcast_rows}
+
+        remaining = [oid for oid in unfiled_ids if oid not in broadcast_project]
+        agent_rows = await pool.fetch(
+            "SELECT l.from_id AS oid, l.to_id AS agent_id FROM links l "
+            "WHERE l.type IN ('sent_by','addressed_to') AND l.from_id = ANY($1::uuid[]) "
+            "AND (l.valid_until IS NULL OR l.valid_until > now())", remaining) \
+            if remaining else []
+        agents_by_oid: dict[uuid.UUID, set[uuid.UUID]] = defaultdict(set)
+        for r in agent_rows:
+            agents_by_oid[r["oid"]].add(r["agent_id"])
+        all_agent_ids = {a for s in agents_by_oid.values() for a in s}
+        project_by_agent: dict[uuid.UUID, str] = {}
+        if all_agent_ids:
+            proj_rows = await pool.fetch(
+                "SELECT object_id, value #>> '{}' AS pname FROM current_assertions "
+                "WHERE object_id = ANY($1::uuid[]) AND name='project'", list(all_agent_ids))
+            project_by_agent = {r["object_id"]: r["pname"] for r in proj_rows if r["pname"]}
+
+        for oid in unfiled_ids:
+            if oid in broadcast_project:
+                filed[oid] = broadcast_project[oid]
+                filed_via_broadcast += 1
+                continue
+            candidates = {project_by_agent[a] for a in agents_by_oid.get(oid, ())
+                         if a in project_by_agent}
+            if not candidates:
+                still_unfiled += 1
+                continue
+            if len(candidates) > 1:
+                ties.append({"object": str(oid)[:8], "candidates": sorted(candidates)})
+                still_unfiled += 1
+                continue
+            filed[oid] = next(iter(candidates))
+
+        if not dry_run:
+            for oid, name in filed.items():
+                await actions.assert_property(
+                    oid, "project", name, _SOURCE, now, _CONF, evidence_class=_EC)
+
+    return {
+        "dry_run": dry_run,
+        "scanned": len(unfiled_ids),
+        "filed": len(filed), "filed_via_broadcast": filed_via_broadcast,
+        "ties": len(ties), "ties_plan": ties,
+        "still_unfiled": still_unfiled,
+        "because": because if not dry_run else None,
+    }

@@ -141,6 +141,7 @@ import asyncpg
 
 from src.ontology.link_classes import link_class
 from src.orchestrator.capture import CONTESTED_SQL
+from src.orchestrator.project_identity import resolve_merge_survivors
 
 SCHEMA_VERSION = 1
 STATUS_RETIRED = 1 << 0
@@ -505,7 +506,7 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
         "  (SELECT a.value #>> '{}' FROM current_assertions a "
         "   WHERE a.object_id=o.id AND a.name IN ('summary','title','subject','name') "
         "   ORDER BY a.confidence DESC, a.observed_at DESC LIMIT 1) AS title, "
-        "  COALESCE(p.canonical, ap.canonical) AS project_canonical, "
+        "  COALESCE(p.id, ap.id) AS project_obj_id, "
         f"  {CONTESTED_SQL} AS contested "
         "FROM objects o "
         "LEFT JOIN links l ON l.from_id=o.id AND l.type='in_repo' "
@@ -518,6 +519,18 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
         "  AND EXISTS (SELECT 1 FROM current_assertions a "
         "    WHERE a.object_id=o.id AND a.name='graph_x') "
         "ORDER BY o.created_at ASC, o.id ASC")
+    # MEMBERSHIP FOLLOWS A MERGE (thread 826a1a13): either join above can name a
+    # SoftwareProject already folded into a survivor (in_repo minted, or a `project`
+    # assertion's bare name still matching the merged object's own canonical) --
+    # resolved through the SAME merged_into walk graph_physics' own membership union
+    # uses, id-batched rather than per-row, then mapped back to the survivor's live
+    # canonical (never the folded object's own stale one).
+    project_obj_ids = {r["project_obj_id"] for r in rows if r["project_obj_id"] is not None}
+    survivors = await resolve_merge_survivors(pool, project_obj_ids)
+    survivor_ids = set(survivors.values()) | (project_obj_ids - set(survivors))
+    canon_rows = await pool.fetch(
+        "SELECT id, canonical FROM objects WHERE id = ANY($1::uuid[])", list(survivor_ids))
+    canonical_by_id = {r["id"]: r["canonical"] for r in canon_rows}
     weight_rows = await pool.fetch(
         "SELECT node, count(*) AS n FROM ("
         "  SELECT from_id AS node FROM links "
@@ -548,7 +561,9 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
         xs.append(float(r["x"] or 0.0))
         ys.append(float(r["y"] or 0.0))
         type_codes.append(type_index.setdefault(r["type"], len(type_index)))
-        project_key = r["project_canonical"] or "unfiled"
+        project_obj_id = r["project_obj_id"]
+        resolved_id = survivors.get(project_obj_id, project_obj_id) if project_obj_id else None
+        project_key = canonical_by_id.get(resolved_id, "unfiled") if resolved_id else "unfiled"
         project_codes.append(project_index.setdefault(project_key, len(project_index)))
         weights.append(float(weight_by_id.get(oid, 0)))
         statuses.append(STATUS_CONTESTED if r["contested"] else 0)

@@ -257,6 +257,49 @@ async def test_fetch_snapshot_project_falls_back_to_the_project_assertion(
     assert out["projects"][pcode] != "unfiled"
 
 
+async def test_fetch_snapshot_project_follows_a_merge(actions: Actions) -> None:
+    """MEMBERSHIP FOLLOWS A MERGE (thread 826a1a13): a member's own in_repo link can
+    name a SoftwareProject that has since been folded into a survivor -- the snapshot
+    must key the object under the SURVIVOR's own live canonical, never the now-merged
+    dupe's, the same rule graph_physics' own membership union follows."""
+    survivor = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gs-merge-survivor", "test")
+    dupe = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gs-merge-dupe", "test")
+    member = await actions.create_or_find_object("Thread", "thread:gs-merge-member", "test")
+    now = datetime.now(UTC)
+    await actions.create_link(member, dupe, "in_repo", "test", now, 1.0)
+    await actions.merge_objects(survivor, dupe, "test merge", "test")
+    await layout_batch(actions, limit=1000)
+
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    idx = out["object_ids"].index(str(member))
+    pcode = out["project_code"][idx]
+    assert out["projects"][pcode] == "repo:gs-merge-survivor"
+
+
+async def test_fetch_snapshot_project_follows_a_merge_via_the_project_assertion(
+    actions: Actions,
+) -> None:
+    """The same fold, reached through the `project`-assertion fallback instead of a
+    live in_repo link."""
+    survivor = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gs-merge-survivor-2", "test")
+    dupe = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gs-merge-dupe-2", "test")
+    member = await actions.create_or_find_object(
+        "Thread", "thread:gs-merge-assertion-member", "test")
+    now = datetime.now(UTC)
+    await actions.assert_property(member, "project", "gs-merge-dupe-2", "test", now, 1.0)
+    await actions.merge_objects(survivor, dupe, "test merge", "test")
+    await layout_batch(actions, limit=1000)
+
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    idx = out["object_ids"].index(str(member))
+    pcode = out["project_code"][idx]
+    assert out["projects"][pcode] == "repo:gs-merge-survivor-2"
+
+
 async def test_fetch_snapshot_watermark_matches_the_live_outbox_tip(
     actions: Actions,
 ) -> None:
