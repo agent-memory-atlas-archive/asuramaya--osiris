@@ -726,6 +726,20 @@ def test_repo_from_cwd_walks_to_the_git_root(tmp_path: Path) -> None:
     assert _repo_from_cwd(None) is None
 
 
+def test_repo_from_cwd_refuses_the_bare_seat_office_container() -> None:
+    """THE repo:seats BUG (DRAWING THE WHOLE GRAPH, thread 325ef660): the bare
+    seat-office container (~/.osiris/seats, or OSIRIS_OFFICE_ROOT in tests) is not
+    a git repo, so the old fallback minted a "seats" phantom SoftwareProject from
+    it -- the same guard `offices.is_bare_office_root` already applies to
+    `seats.resolve_project` now applies here too, at git-ingest's own choke point.
+    A real seat's own office subdirectory is deliberately unaffected."""
+    from src.ingest.sessions import _repo_from_cwd
+    from src.orchestrator.offices import _default_office_root
+
+    container = _default_office_root()
+    assert _repo_from_cwd(str(container)) is None
+
+
 def test_locate_transcript_by_cwd_when_no_job_dir(tmp_path: Path) -> None:
     """The a-sibling fix: when CLAUDE_JOB_DIR is empty, find the session by its cwd's
     project dir (newest transcript = active session) instead of falling to 'unknown'."""

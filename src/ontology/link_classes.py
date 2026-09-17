@@ -47,6 +47,16 @@ STRUCTURAL_LINK_TYPES: frozenset[str] = frozenset({
     # unclassified by omission (THE PHYSICS LAYOUT, Thoth mail 11047): the same
     # membership/identity shape as in_repo/works_in above, not a content claim.
     "member_of",
+    # THE ASSERTION LINKS MIGRATION (DRAWING THE WHOLE GRAPH, thread 325ef660):
+    # recorded_by (Decision/Thread -> the Agent whose source_id minted it, an
+    # authorship/attribution edge, same shape as authored_by above, not a claim
+    # about content), owned_by (Thread -> its own owner, a standing-responsibility
+    # edge, same membership/identity shape as managed_by), admitted_by (Thread ->
+    # the Agent who admitted it, a dispatch/attribution edge), acknowledges
+    # (Decision -> prior art it cites as acknowledged, a provenance/attribution
+    # edge, not a content claim about the target itself), vendor_of (Reference ->
+    # its vendor, a membership/identity edge, same shape as committer_for).
+    "recorded_by", "owned_by", "admitted_by", "acknowledges", "vendor_of",
 })
 
 # every OTHER link type this codebase's write paths actually mint today (scanned via
@@ -77,6 +87,12 @@ SEMANTIC_LINK_TYPES_KNOWN: frozenset[str] = frozenset({
     "controlled_by", "has_account", "has_domain", "has_email", "has_url",
     "investigator", "litigation", "officer", "raises_for", "site", "sponsors",
     "transacted_with",
+    # THE ASSERTION LINKS MIGRATION (DRAWING THE WHOLE GRAPH, thread 325ef660):
+    # supersedes (Decision -> the Decision it supersedes) is a real claim about
+    # content ("this replaces that"), the same shape as revises/refuted_by above
+    # -- already walked as a path edge by the client (space.js's own
+    # PATH_EDGE_TYPES), unclassified here only by omission until now.
+    "supersedes",
 })
 
 

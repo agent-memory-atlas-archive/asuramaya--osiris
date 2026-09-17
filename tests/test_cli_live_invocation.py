@@ -74,6 +74,7 @@ from src.cli import (
     cmd_fold_project,
     cmd_fork_project,
     cmd_graph_export,
+    cmd_graph_migrate,
     cmd_heal_seat_anchor,
     cmd_heal_seat_transcript,
     cmd_inbox,
@@ -225,6 +226,8 @@ NO_WRITE_INVOCATIONS: dict[str, Any] = {
         "no-such-handle", ["/tmp/does-not-exist.jsonl"], apply=False, pool=a.pool),
     "backfill": lambda a: cmd_backfill(
         "bootstrap_orphan_references", apply=False, actor="operator", pool=a.pool),
+    "graph-migrate": lambda a: cmd_graph_migrate(
+        "repo_seats_fix", apply=False, actor="operator", pool=a.pool),
     "fleet-reconcile": lambda a: cmd_fleet_reconcile(
         execute=False, actor="operator", pool=a.pool),
     "fleet-prune": lambda a: cmd_fleet_prune(execute=False, actor="operator", pool=a.pool),
