@@ -160,6 +160,11 @@ async function fetchStreamSnapshot() {
       // wire (see graph_stream.py's own docstring item 11) -- fine for a timeline
       // spanning weeks/months/years, not sub-minute precision.
       createdAt: snap.created_at ? snap.created_at[i] : 0,
+      // WAVE 26, COMMUNITY REGIONS (mail 11592/11664): index-aligned, 0 = no real
+      // community (a small project, or a Leiden cluster too small to be a real
+      // district-refinement) -- Khnum's own graph_physics._detect_communities,
+      // unchanged, the same partition the compact-arrangement layout is built on.
+      communityCode: snap.community_code ? snap.community_code[i] : 0,
       // TIP 1b (Thoth mail 10755): "swap the client label fallback for the header
       // labels" -- Khnum's own labels array (index-aligned to object_ids, tip 2g) is
       // the label now, computed server-side with the exact same per-type rule and
@@ -211,7 +216,16 @@ async function fetchStreamSnapshot() {
   const districtAggregates = (snap.project_aggregates || []).map((a) => ({
     name: snap.projects[a.project], count: a.count, cx: a.cx, cy: a.cy, radius: a.radius,
   }));
-  return { nodes, edges, edgeClassByType, districtAggregates };
+  // WAVE 26, COMMUNITY REGIONS (mail 11592): `communities` is Khnum's own header table,
+  // the SAME shape as project_aggregates/type_aggregates -- one row per real (non-zero)
+  // community code, project resolved back to a name off the same `projects` table
+  // districts already use, so a community's own district membership is a plain string
+  // comparison, never a second id space to reconcile.
+  const communityAggregates = (snap.communities || []).map((c) => ({
+    code: c.community, districtName: snap.projects[c.project],
+    count: c.count, cx: c.cx, cy: c.cy, radius: c.radius,
+  }));
+  return { nodes, edges, edgeClassByType, districtAggregates, communityAggregates };
 }
 
 // resolves DOM refs from a passed-in container map, falling back to the same fixed ids
@@ -628,6 +642,17 @@ export async function initSpace(container) {
   let storylineMinT = 0, storylineMaxT = 1, storylineAxisWidthWorld = 1;
   let storylineLines = null;
   let storylineAxisEntries = []; // [{t, x, y, div}]
+  // WAVE 26, COMMUNITY REGIONS (mail 11592/11664): declared here for the same reason as
+  // the storyline state just above -- syncCommunityVisibility (further down) is read from
+  // fitToNodes' own initial synchronous call site, well before this point in the file
+  // would otherwise execute a `let` declared near its own function.
+  let communities = []; // [{code, districtName, count, cx, cy, radius}]
+  let communityByCode = new Map();
+  let communityRegionsVisible = false;
+  let communityRibbons = []; // [{a, b, type, count}] -- a/b are community codes, a <= b
+  let communityRibbonsResolvedKeys = new Set();
+  let communityLabelCandidates = [];
+  let communityMeshGroup = null;
   function ribbonKey(r) { return `${r.a}|${r.b}|${r.type}`; }
   function findLandmark(type) {
     const counts = new Map();
@@ -710,7 +735,7 @@ export async function initSpace(container) {
   // every live edge counted into EXACTLY one of fill/landmark/line/ribbon -- a live-
   // verification receipt hook, not consulted by the renderer itself.
   function edgeAccounting() {
-    let fill = 0, landmark = 0, line = 0, ribbon = 0, other = 0;
+    let fill = 0, landmark = 0, line = 0, ribbon = 0, communityRibbon = 0, other = 0;
     for (const e of edges) {
       if (DISTRICT_FILL_TYPES.has(e.type)) { fill++; continue; }
       const lm = landmarks[e.type];
@@ -723,11 +748,21 @@ export async function initSpace(container) {
         if (ribbonsResolvedKeys.has(`${a}|${b}|${e.type}`)) line++; else ribbon++;
         continue;
       }
+      // WAVE 26, PIECE 2: the SAME swap one level down, only live once communities are
+      // actually visible (mid zoom) -- below that, this bucket stays empty and every
+      // same-district edge counts as an ordinary "line", matching what's actually drawn.
+      if (communityRegionsVisible && na && nb && na.project === nb.project &&
+        na.communityCode && nb.communityCode && na.communityCode !== nb.communityCode) {
+        const ca = na.communityCode <= nb.communityCode ? na.communityCode : nb.communityCode;
+        const cb = na.communityCode <= nb.communityCode ? nb.communityCode : na.communityCode;
+        if (communityRibbonsResolvedKeys.has(`${ca}|${cb}|${e.type}`)) line++; else communityRibbon++;
+        continue;
+      }
       if (na && nb) { line++; continue; }
       other++; // an endpoint missing from idById -- should never happen, disclosed not hidden
     }
-    return { total: edges.length, fill, landmark, line, ribbon, other,
-      accounted: fill + landmark + line + ribbon + other };
+    return { total: edges.length, fill, landmark, line, ribbon, communityRibbon, other,
+      accounted: fill + landmark + line + ribbon + communityRibbon + other };
   }
   // recomputes the resolved set and rebuilds ONLY when it actually changed -- same
   // "rebuild on a deliberate step, not per frame" discipline as syncRibbonResolve's own
@@ -832,6 +867,150 @@ export async function initSpace(container) {
     }
   }
 
+  // WAVE 26, PIECE 2: COMMUNITY REGIONS (Thoth mail 11592/11664, thread 3683a12a): "at mid
+  // zoom inside a district, each community is a labelled region refined from the district
+  // fill, never replacing it." Khnum's own `communities` header table is the SAME Leiden
+  // partition his compact-arrangement layout is already built on -- reused, never
+  // re-derived. Nested inside the district model, not a peer of it: a community only ever
+  // exists WITHIN one district (a small project never has one at all, community_code stays
+  // 0 for every one of its members), so every community-level check below runs on top of
+  // an edge/node that already passed its own district-level check first.
+  const COMMUNITY_LABEL_MIN_COUNT = 20; // below this member count, a community never labels
+  function buildCommunityModel(communityAggregates) {
+    communities = communityAggregates || [];
+    communityByCode = new Map(communities.map((c) => [c.code, c]));
+    communityRibbonsResolvedKeys = new Set();
+    communityLabelCandidates = communities
+      .filter((c) => c.count >= COMMUNITY_LABEL_MIN_COUNT)
+      .map((c) => ({
+        __isCommunity: true, id: `community:${c.code}`, name: `${c.districtName} · community ${c.code}`,
+        x: c.cx, y: c.cy, degree: c.count,
+      }));
+    computeCommunityZoomViewSize();
+  }
+  // "AT MID ZOOM": a single global viewSize gate (not per-community -- the ask is "zoomed
+  // into roughly a district's own scale," a whole-view state, not a per-region one) --
+  // the median community radius is the same "one outlier district dominates the extent"
+  // defence THE DRAWING TIP's own spike used for its first (later replaced) ribbon
+  // threshold, reused here because visibility genuinely IS a single yes/no at this zoom,
+  // unlike ribbon resolution (which stays per-ribbon, computeResolvedCommunityRibbonKeys
+  // below).
+  let communityZoomViewSize = 0;
+  function computeCommunityZoomViewSize() {
+    if (!communities.length) { communityZoomViewSize = 0; return; }
+    const radii = communities.map((c) => c.radius).sort((a, b) => a - b);
+    communityZoomViewSize = radii[Math.floor(radii.length / 2)] * 3;
+  }
+  function buildCommunityFills() {
+    if (communityMeshGroup) { scene.remove(communityMeshGroup); communityMeshGroup = null; }
+    if (!communities.length) return;
+    communityMeshGroup = new THREE.Group();
+    const cc = new THREE.Color("#3a2f5f"); // a distinct, warmer tone from the district fill's
+    for (const c of communities) {          // #2a3f5f -- nesting must read visually, not just logically
+      const geo = new THREE.CircleGeometry(Math.max(c.radius, 1), 24);
+      const mat = new THREE.MeshBasicMaterial({ color: cc, transparent: true, opacity: 0.22, depthWrite: false });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set(c.cx, c.cy, -0.45); // between the district fill (-0.5) and edges (-0.1)
+      communityMeshGroup.add(mesh);
+    }
+    communityMeshGroup.visible = communityRegionsVisible;
+    scene.add(communityMeshGroup);
+  }
+  function computeCommunityRibbons() {
+    const counts = new Map(); // "a|b|type" -> count
+    const meta = new Map();
+    for (const e of edges) {
+      if (DISTRICT_FILL_TYPES.has(e.type)) continue;
+      const lm = landmarks[e.type];
+      if (lm && e.target === lm.id) continue;
+      const na = idById.get(e.source), nb = idById.get(e.target);
+      if (!na || !nb || na.project !== nb.project) continue; // community ribbons are SAME-district only
+      const ca = na.communityCode, cb = nb.communityCode;
+      if (!ca || !cb || ca === cb) continue; // same-community: drawn individually, like same-district
+      const [a, b] = ca <= cb ? [ca, cb] : [cb, ca];
+      const key = `${a}|${b}|${e.type}`;
+      counts.set(key, (counts.get(key) || 0) + 1);
+      meta.set(key, { a, b, type: e.type });
+    }
+    communityRibbons = [...counts.entries()]
+      .map(([key, count]) => ({ ...meta.get(key), count }))
+      .sort((x, y) => y.count - x.count);
+    return communityRibbons;
+  }
+  // per-ribbon screen-distance resolve, same convention as computeResolvedRibbonKeys --
+  // "ribbons between communities resolve the same way district ribbons do" (mail 11664).
+  function pointScreenPx(x, y) {
+    _screenV.set(x, y, 0).project(camera);
+    return { x: (_screenV.x * 0.5 + 0.5) * wrap.clientWidth, y: (-_screenV.y * 0.5 + 0.5) * wrap.clientHeight };
+  }
+  function computeResolvedCommunityRibbonKeys() {
+    const resolved = new Set();
+    if (!communityRegionsVisible) return resolved; // hidden entirely below mid zoom
+    for (const r of communityRibbons) {
+      const ca = communityByCode.get(r.a), cb = communityByCode.get(r.b);
+      if (!ca || !cb) continue;
+      const pa = pointScreenPx(ca.cx, ca.cy), pb = pointScreenPx(cb.cx, cb.cy);
+      if (Math.hypot(pa.x - pb.x, pa.y - pb.y) > RIBBON_RESOLVE_SCREEN_PX) resolved.add(ribbonKey(r));
+    }
+    return resolved;
+  }
+  let communityRibbonLines = null;
+  function buildCommunityRibbonLines() {
+    if (communityRibbonLines) {
+      scene.remove(communityRibbonLines);
+      communityRibbonLines.geometry.dispose();
+      communityRibbonLines.material.dispose();
+      communityRibbonLines = null;
+    }
+    computeCommunityRibbons();
+    const unresolved = communityRegionsVisible
+      ? communityRibbons.filter((r) => !communityRibbonsResolvedKeys.has(ribbonKey(r)))
+      : []; // never drawn at all below mid zoom -- the plain same-district line covers it
+    if (!unresolved.length) return;
+    const positions = new Float32Array(unresolved.length * 6);
+    const otherPositions = new Float32Array(unresolved.length * 6);
+    const colors = new Float32Array(unresolved.length * 6);
+    const maxCount = Math.max(...unresolved.map((r) => r.count));
+    const ec = new THREE.Color();
+    let vi = 0;
+    for (const r of unresolved) {
+      const ca = communityByCode.get(r.a), cb = communityByCode.get(r.b);
+      if (!ca || !cb) continue;
+      const bright = Math.max(RIBBON_ALPHA_FLOOR, Math.log1p(r.count) / Math.log1p(maxCount));
+      ec.set(colorForEdgeType(r.type)).multiplyScalar(bright);
+      positions[vi] = ca.cx; positions[vi + 1] = ca.cy; positions[vi + 2] = -0.15;
+      otherPositions[vi] = cb.cx; otherPositions[vi + 1] = cb.cy; otherPositions[vi + 2] = -0.15;
+      vi += 3;
+      positions[vi] = cb.cx; positions[vi + 1] = cb.cy; positions[vi + 2] = -0.15;
+      otherPositions[vi] = ca.cx; otherPositions[vi + 1] = ca.cy; otherPositions[vi + 2] = -0.15;
+      vi += 3;
+      colors[vi - 6] = ec.r; colors[vi - 5] = ec.g; colors[vi - 4] = ec.b;
+      colors[vi - 3] = ec.r; colors[vi - 2] = ec.g; colors[vi - 1] = ec.b;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(positions.subarray(0, vi), 3));
+    geo.setAttribute("otherPosition", new THREE.BufferAttribute(otherPositions.subarray(0, vi), 3));
+    geo.setAttribute("color", new THREE.BufferAttribute(colors.subarray(0, vi), 3));
+    communityRibbonLines = new THREE.LineSegments(geo, makeEdgeFadeMaterial());
+    scene.add(communityRibbonLines);
+  }
+  // recomputes visibility + the resolved set, rebuilding ONLY when either actually changed
+  // -- same "deliberate step, never per frame" discipline as syncRibbonResolve.
+  function syncCommunityVisibility() {
+    if (!communities.length) return;
+    const wasVisible = communityRegionsVisible;
+    communityRegionsVisible = communityZoomViewSize > 0 && viewSize < communityZoomViewSize;
+    const resolved = computeResolvedCommunityRibbonKeys();
+    const resolvedChanged = !ribbonKeySetsEqual(resolved, communityRibbonsResolvedKeys);
+    if (wasVisible === communityRegionsVisible && !resolvedChanged) return;
+    communityRibbonsResolvedKeys = resolved;
+    if (communityMeshGroup) communityMeshGroup.visible = communityRegionsVisible;
+    buildEdgeLines(idToNode, edges);
+    buildCommunityRibbonLines();
+    if (wasVisible !== communityRegionsVisible) scheduleLabelPick(); // label pool membership changed
+    markDirty();
+  }
+
   // legend state: which edge classes/types are hidden from the base render. Structural was
   // hidden by DEFAULT under the old "not drawn at rest" rule (ruling c5953bb1); THE DRAWING
   // TIP's own operator ruling (4a51cab1/1178e7d9) retires that rule outright -- "nothing
@@ -877,6 +1056,16 @@ export async function initSpace(container) {
         const a = na.project <= nb.project ? na.project : nb.project;
         const b = na.project <= nb.project ? nb.project : na.project;
         if (!ribbonsResolvedKeys.has(`${a}|${b}|${e.type}`)) return false;
+      } else if (communityRegionsVisible && na && nb && na.project === nb.project &&
+        na.communityCode && nb.communityCode && na.communityCode !== nb.communityCode) {
+        // WAVE 26, PIECE 2: a same-district edge refines one level further once the
+        // reader is zoomed to community scale -- the same "line unless the ribbon hasn't
+        // resolved" swap, one level down, only checked at all when communities are
+        // actually showing (never below mid zoom, where the plain same-district line
+        // this `else` skips is exactly right).
+        const ca = na.communityCode <= nb.communityCode ? na.communityCode : nb.communityCode;
+        const cb = na.communityCode <= nb.communityCode ? nb.communityCode : na.communityCode;
+        if (!communityRibbonsResolvedKeys.has(`${ca}|${cb}|${e.type}`)) return false;
       }
       return !hiddenEdgeClasses.has(e.edgeClass) && !hiddenEdgeTypes.has(e.type) &&
         nodeVisible(byId.get(e.source)) && nodeVisible(byId.get(e.target));
@@ -1041,6 +1230,8 @@ export async function initSpace(container) {
     buildDistrictFills();
     buildLandmarkBadges();
     buildRibbonLines(); // needs idById, built above -- first real call after buildDistrictModel
+    buildCommunityFills();
+    buildCommunityRibbonLines(); // needs idById too, same reason
     buildEdgeLines(nodes, edges);
     applyDim();
     markDirty();
@@ -1165,6 +1356,7 @@ export async function initSpace(container) {
     rescaleForZoom();
     syncRibbonResolve();
     syncStorylineAxis();
+    syncCommunityVisibility();
     markDirty();
   }
 
@@ -1175,8 +1367,10 @@ export async function initSpace(container) {
   // positionLabels/pickLabels below for the one label rule that replaces it (viewport
   // top-N by degree, de-overlapped, at every zoom, no separate project-label pass).
   setStatus("loading the whole graph…");
-  let { nodes, edges, edgeClassByType, districtAggregates } = await fetchStreamSnapshot();
+  let { nodes, edges, edgeClassByType, districtAggregates, communityAggregates } =
+    await fetchStreamSnapshot();
   buildDistrictModel(districtAggregates, edges);
+  buildCommunityModel(communityAggregates);
   buildScene(nodes, edges);
   fitToNodes(nodes);
   setStatus(`${nodes.length} objects, ${edges.length} edges`);
@@ -2559,6 +2753,7 @@ export async function initSpace(container) {
     rescaleForZoom();
     syncRibbonResolve();
     syncStorylineAxis();
+    syncCommunityVisibility();
     const t2 = window.__spaceWheelTiming ? performance.now() : 0;
     scheduleLabelPick();
     markDirty();
@@ -2970,6 +3165,10 @@ export async function initSpace(container) {
     const inView = (nd) => nd.x >= minX && nd.x <= maxX && nd.y >= minY && nd.y <= maxY;
     const pool = idToNode.filter((nd) => nodeVisible(nd) && inView(nd));
     const districtPool = districtLabelCandidates.filter(inView);
+    // WAVE 26, PIECE 2: community labels only ever compete for a slot once communities
+    // are actually visible (mid zoom) -- below that they'd just be noise nobody asked for
+    // yet, the exact same reasoning the fill/ribbon gates above already use.
+    const communityPool = communityRegionsVisible ? communityLabelCandidates.filter(inView) : [];
     // THE FOCUS LABEL POOL FIX (Thoth mail 11359): a plain top-N-by-degree sort ignores the
     // focus entirely -- a real focus's own reachable set is mostly low-natural-degree nodes
     // (Message, chain members), so the pool filled with whatever happened to have the
@@ -2978,8 +3177,16 @@ export async function initSpace(container) {
     // highest-degree-first among themselves; only remaining slots go to the ordinary
     // degree ranking. Acceptance: every reachable node gets a label slot up to N_LABELS.
     const isLit = (nd) => nd.id === pathFocusId || pathReachable.has(nd.id) || nd.id === selectedId;
-    labeledNodes = pool.concat(districtPool)
-      .sort((a, b) => (isLit(b) ? 1 : 0) - (isLit(a) ? 1 : 0) || (b.degree || 0) - (a.degree || 0))
+    // WAVE 26 live-verification finding: a district's own count (thousands) always beat an
+    // ordinary node's degree by luck, so it never needed special priority -- a community's
+    // own count (order 10s-100s, same order as plenty of individual node degrees) does not
+    // have that luck, and the plain degree sort silently crowded every community label out
+    // (0 ever won a slot against ordinary high-degree nodes in the same view). A district/
+    // community pseudo-node now sits in its own tier, between lit and ordinary -- ranked
+    // by its own size within that tier, never competing against unrelated object degree.
+    const tier = (nd) => (isLit(nd) ? 2 : (nd.__isDistrict || nd.__isCommunity) ? 1 : 0);
+    labeledNodes = pool.concat(districtPool, communityPool)
+      .sort((a, b) => tier(b) - tier(a) || (b.degree || 0) - (a.degree || 0))
       .slice(0, N_LABELS);
     // reconcile DOM: remove divs for nodes no longer labeled, add for newly labeled ones —
     // reuses existing elements instead of an innerHTML rebuild every pick.
@@ -2990,9 +3197,11 @@ export async function initSpace(container) {
     for (const nd of labeledNodes) {
       if (labelDivs.has(nd)) continue;
       const div = document.createElement("div");
-      div.className = nd.__isDistrict ? "lbl district-label" : "lbl";
+      div.className = nd.__isDistrict ? "lbl district-label"
+        : nd.__isCommunity ? "lbl community-label" : "lbl";
       // fallback text now, swapped for the real name async (real nodes only)
-      div.textContent = nd.__isDistrict ? `${nd.name} (${nd.degree})` : labelTextFor(nd);
+      div.textContent = (nd.__isDistrict || nd.__isCommunity)
+        ? `${nd.name} (${nd.degree})` : labelTextFor(nd);
       labelsEl.appendChild(div);
       labelDivs.set(nd, div);
       // THE REAL-WIDTH DECLUTTER FIX (live-verification finding, mail 11471's own "overlap
@@ -3036,10 +3245,10 @@ export async function initSpace(container) {
       const x = (_screenV.x * 0.5 + 0.5) * wrap.clientWidth;
       const y = (-_screenV.y * 0.5 + 0.5) * wrap.clientHeight;
       const w = labelWidths.get(nd) || LABEL_W;
-      // a district pseudo-node is never focus-reachable and never the succession-chain
-      // declutter's own concern -- it just competes for a slot and yields to overlap like
-      // any ordinary (non-lit) label, keeping its own "district-label" class untouched.
-      if (nd.__isDistrict) {
+      // a district (or WAVE 26 community) pseudo-node is never focus-reachable and never
+      // the succession-chain declutter's own concern -- it just competes for a slot and
+      // yields to overlap like any ordinary (non-lit) label, keeping its own class untouched.
+      if (nd.__isDistrict || nd.__isCommunity) {
         if (overlapsPlaced(x, y, w)) { div.hidden = true; continue; }
         div.hidden = false;
         div.style.left = `${x}px`;
@@ -3141,6 +3350,14 @@ export async function initSpace(container) {
     get storylineTickCount() { return storylineTickOf.size; },
     get storylineTimeSpanSeconds() { return storylineMaxT - storylineMinT; },
     get storylineAxisLabelCount() { return storylineAxisEntries.length; },
+    // WAVE 26, PIECE 2: COMMUNITY REGIONS (mail 11592/11664) -- live-verification hooks.
+    get communities() { return communities.map((c) => ({ ...c })); },
+    get communityRegionsVisible() { return communityRegionsVisible; },
+    get communityRibbons() { return communityRibbons.map((r) => ({ ...r })); },
+    get communityRibbonsResolvedKeys() { return [...communityRibbonsResolvedKeys]; },
+    get communityLabelCandidateCount() { return communityLabelCandidates.length; },
+    get communityZoomViewSize() { return communityZoomViewSize; },
+    get communityRegionsDrawn() { return communityRegionsVisible ? communities.length : 0; },
     get edgeSegmentsDrawn() { return edgeLines ? edgeLines.geometry.attributes.position.count / 2 : 0; },
     get ribbonSegmentsDrawn() { return ribbonLines ? ribbonLines.geometry.attributes.position.count / 2 : 0; },
     camera, pickAt, mesh: () => mesh, worldPerPx, nodeScreenPx, renderer,

@@ -103,15 +103,15 @@ def test_district_label_candidates_gate_on_a_minimum_size() -> None:
 
 
 def test_pick_labels_merges_district_candidates_into_the_same_n_labels_pool() -> None:
-    body = _SPACE_JS.split("function pickLabels()", 1)[1][:1800]
+    body = _SPACE_JS.split("function pickLabels()", 1)[1][:2500]
     assert "const districtPool = districtLabelCandidates.filter(inView);" in body
-    assert "labeledNodes = pool.concat(districtPool)" in body
+    assert "labeledNodes = pool.concat(districtPool, communityPool)" in body
     assert ".slice(0, N_LABELS);" in body
 
 
 def test_a_district_label_declutters_like_an_ordinary_label_and_keeps_its_own_class() -> None:
     body = _SPACE_JS.split("function positionLabels()", 1)[1][:1500]
-    assert "if (nd.__isDistrict) {" in body
+    assert "if (nd.__isDistrict || nd.__isCommunity) {" in body
     assert "if (overlapsPlaced(x, y, w)) { div.hidden = true; continue; }" in body
 
 
@@ -122,7 +122,7 @@ def test_declutter_uses_each_labels_own_real_rendered_width_not_a_fixed_box() ->
     # visual overlap the old fixed-box declutter had no way to catch. Caught live (1 overlap
     # pair measured against the real DOM), fixed, reverified (0 overlap pairs after).
     assert "const labelWidths = new Map();" in _SPACE_JS
-    pick_body = _SPACE_JS.split("function pickLabels()", 1)[1][:3000]
+    pick_body = _SPACE_JS.split("function pickLabels()", 1)[1][:4200]
     assert "labelWidths.set(nd, div.offsetWidth || LABEL_W);" in pick_body
     assert "labelWidths.delete(nd);" in pick_body
     pos_body = _SPACE_JS.split("function positionLabels()", 1)[1][:1000]
@@ -160,11 +160,11 @@ def test_supersedes_stays_in_the_path_walk() -> None:
 # --- accounting exact (the receipt's own acceptance line) -----------------------------------
 
 def test_edge_accounting_classifies_every_edge_into_exactly_one_bucket() -> None:
-    body = _SPACE_JS.split("function edgeAccounting()", 1)[1][:1400]
+    body = _SPACE_JS.split("function edgeAccounting()", 1)[1][:1900]
     assert "if (DISTRICT_FILL_TYPES.has(e.type)) { fill++; continue; }" in body
     assert "if (lm && e.target === lm.id) { landmark++; continue; }" in body
     assert "if (ribbonsResolvedKeys.has(`${a}|${b}|${e.type}`)) line++; else ribbon++;" in body
-    assert "accounted: fill + landmark + line + ribbon + other };" in body
+    assert "accounted: fill + landmark + line + ribbon + communityRibbon + other };" in body
 
 
 def test_district_label_candidates_state_is_declared_before_its_first_write() -> None:
