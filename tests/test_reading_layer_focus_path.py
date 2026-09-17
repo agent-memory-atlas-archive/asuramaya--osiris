@@ -130,7 +130,7 @@ def test_focus_hides_unreachable_outright_not_a_softer_dim() -> None:
 def test_focus_is_never_empty_a_lone_reachable_node_widens_one_structural_hop() -> None:
     # Thoth's own live measurement (mail 10708): a degree-8 Decision with no PATH_EDGE_TYPES
     # links reached only itself and fit the camera to a point at 300x.
-    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:2300]
+    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:2700]
     assert "if (pathReachable.size <= 1) {" in body
     assert 'if (e.edgeClass !== "structural") continue;' in body
 

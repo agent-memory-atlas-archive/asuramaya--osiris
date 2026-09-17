@@ -90,7 +90,7 @@ def test_focus_uses_a_per_instance_visibility_flag_not_a_dim_scalar() -> None:
 def test_a_focused_node_with_no_semantic_edges_still_lights_its_structural_neighbours() -> None:
     # THE DRILL (ruling d7d55257) inserted a container-focus dispatch and clearDrillState()
     # call at the top of focusObject, pushing this fallback further into the body.
-    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:2500]
+    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:2900]
     assert "if (pathReachable.size <= 1) {" in body
     assert 'if (e.edgeClass !== "structural") continue;' in body
     assert "pathReachable.add(other);" in body
@@ -187,8 +187,11 @@ def test_the_visual_work_is_synchronous_the_inspector_fetch_is_awaited_last() ->
     # THE DRILL (ruling d7d55257) inserted an early-exit container dispatch at the top -- a
     # SEPARATE branch (renderContainerDrill owns its own synchronous-then-one-await shape)
     # that returns before any of the ordinary ego-walk work below ever runs, excluded here.
+    # WAVE 26, THE STORYLINE (mail 11534) added a second, sibling early-exit branch
+    # (renderStoryline, same shape) for an Agent focus -- excluded for the identical reason.
     awaits = [ln.strip() for ln in fn_body.splitlines()
-              if "await " in ln and "renderContainerDrill" not in ln]
+              if "await " in ln and "renderContainerDrill" not in ln
+              and "renderStoryline" not in ln]
     assert awaits, "expected at least one await in focusObject"
     assert awaits[-1] == "await inspect(id);"
     assert len(awaits) == 1  # the ONLY await is the trailing inspector fetch
@@ -202,7 +205,7 @@ def test_depth_is_unlimited_by_default_until_roots() -> None:
 
 def test_downstream_is_a_toggle_off_by_default() -> None:
     assert "let includeDownstream = false;" in _SPACE_JS
-    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:1200]
+    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:1700]
     assert "includeDownstream ? bfsHops(inAdjPath, id, focusDepth) : new Map([[id, 0]])" in body
     btn_body = _SPACE_JS.split("if (downstreamBtn) {", 1)[1][:500]
     assert "includeDownstream = !includeDownstream;" in btn_body

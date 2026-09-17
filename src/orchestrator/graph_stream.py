@@ -126,6 +126,20 @@ same tip since all three ship together here):
      closed-endedly, and a compound patronym's own embedded roman+ordinal is
      read as the complete generation field rather than recomputed and
      appended again -- see `_agent_identity_labels`'s own docstring.
+ 11. `created_at` -- a new index-aligned Float32 array (epoch seconds, added to
+     `_ARRAY_ORDER`, same real-wire-format-change convention as `edge_weight` above)
+     for WAVE 26's own LINEAGES ARE TIME lane (thread 3683a12a, operator ruling
+     1178e7d9's fourth principle): a focused Agent's own succession chain lays out on
+     a real time axis, needing each body's own first-seen moment. `o.created_at` was
+     already SELECTed (it drives this query's own stable ORDER BY) but never left the
+     query as data -- genuinely free, no second query, no extra join. Precision is
+     whatever `objects.created_at` already carries (row-insert time, not a curated
+     "minted" assertion) -- named `created_at` rather than `minted_at` on the wire to
+     say exactly that, honestly, rather than implying a richer provenance concept this
+     one column doesn't carry. Float32, not float64, like every other array here: at
+     today's epoch magnitude (~1.79e9) the ULP is 128s, so a value can round up to
+     ~64s off its real timestamp -- fine for a timeline spanning weeks/months/years,
+     disclosed for any future consumer that reaches for sub-minute precision.
 """
 from __future__ import annotations
 
@@ -260,6 +274,7 @@ _ARRAY_ORDER: tuple[tuple[str, str], ...] = (
     ("type_code", "H"), ("project_code", "H"),
     ("weight", "f"), ("status_flag", "B"),
     ("edge_src", "I"), ("edge_dst", "I"), ("edge_type_code", "B"), ("edge_weight", "f"),
+    ("created_at", "f"),
 )
 
 
@@ -270,7 +285,7 @@ def encode_snapshot(
     status_flag: list[int], edge_src: list[int], edge_dst: list[int],
     edge_type_code: list[int], edge_weight: list[float], types: list[str],
     projects: list[str], edge_types: list[str], link_type_class: list[str],
-    labels: list[str],
+    labels: list[str], created_at: list[float],
     watermark: int = 0,
     project_aggregates: list[dict[str, Any]] | None = None,
     type_aggregates: list[dict[str, Any]] | None = None,
@@ -284,11 +299,12 @@ def encode_snapshot(
     edge_count = len(edge_src)
     arrays: dict[str, list[Any]] = {
         "x": x, "y": y, "type_code": type_code, "project_code": project_code,
-        "weight": weight, "status_flag": status_flag,
+        "weight": weight, "status_flag": status_flag, "created_at": created_at,
         "edge_src": edge_src, "edge_dst": edge_dst, "edge_type_code": edge_type_code,
         "edge_weight": edge_weight,
     }
-    for name in ("x", "y", "type_code", "project_code", "weight", "status_flag"):
+    for name in ("x", "y", "type_code", "project_code", "weight", "status_flag",
+                 "created_at"):
         if len(arrays[name]) != count:
             raise ValueError(
                 f"{name} has {len(arrays[name])} entries, expected {count} (count)")
@@ -525,7 +541,7 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
     effect the snapshot already carried), never a silent drop."""
     watermark = int(await pool.fetchval("SELECT COALESCE(max(id), 0) FROM outbox"))
     rows = await pool.fetch(
-        "SELECT o.id, o.type, o.canonical, "
+        "SELECT o.id, o.type, o.canonical, o.created_at, "
         "  (SELECT (a.value #>> '{}')::float8 FROM current_assertions a "
         "   WHERE a.object_id=o.id AND a.name='graph_x') AS x, "
         "  (SELECT (a.value #>> '{}')::float8 FROM current_assertions a "
@@ -586,6 +602,7 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
     weights: list[float] = []
     statuses: list[int] = []
     labels: list[str] = []
+    created_ats: list[float] = []
 
     for i, r in enumerate(rows):
         oid = r["id"]
@@ -603,6 +620,7 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
         labels.append(_short_label(
             r["type"], r["canonical"], r["handle"], r["name"], r["title"],
             agent_fallback=agent_fallback_by_id.get(oid)))
+        created_ats.append(r["created_at"].timestamp() if r["created_at"] else 0.0)
 
     edge_src: list[int] = []
     edge_dst: list[int] = []
@@ -703,7 +721,8 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
         edge_src=edge_src, edge_dst=edge_dst, edge_type_code=edge_type_codes,
         edge_weight=edge_weights,
         types=types, projects=projects, edge_types=edge_types,
-        link_type_class=link_type_class, labels=labels, watermark=watermark,
+        link_type_class=link_type_class, labels=labels, created_at=created_ats,
+        watermark=watermark,
         project_aggregates=project_aggregates, type_aggregates=type_aggregates,
         cluster_edges=cluster_edges, type_pair_edges=type_pair_edges,
     )

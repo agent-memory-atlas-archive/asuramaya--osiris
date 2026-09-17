@@ -51,6 +51,7 @@ def test_snapshot_round_trips_through_the_decoder_with_the_exact_count() -> None
         types=["Thread", "Decision"], projects=["repo:x", "repo:y"],
         edge_types=["cites", "in_repo"], link_type_class=["semantic", "structural"],
         labels=["Thread abc", "Decision def", "Thread ghi"],
+        created_at=[100.0, 200.0, 300.0],
         project_aggregates=[{"project": 0, "count": 2, "cx": 1.5, "cy": 4.5, "radius": 1.0}],
         cluster_edges=[{"a": 0, "b": 1, "class": "semantic", "count": 1}],
         type_pair_edges=[{"a": {"project": 0, "type": 0}, "b": {"project": 0, "type": 1},
@@ -82,6 +83,7 @@ def test_snapshot_round_trips_through_the_decoder_with_the_exact_count() -> None
     assert out["edge_dst"] == [1, 2]
     assert out["edge_type_code"] == [0, 1]
     assert out["edge_weight"] == pytest.approx([0.5, 1.0])
+    assert out["created_at"] == pytest.approx([100.0, 200.0, 300.0])
 
 
 def test_snapshot_with_no_edges_still_round_trips() -> None:
@@ -90,7 +92,7 @@ def test_snapshot_with_no_edges_still_round_trips() -> None:
         weight=[0.0], status_flag=[0], edge_src=[], edge_dst=[], edge_type_code=[],
         edge_weight=[],
         types=["Thread"], projects=["unfiled"], edge_types=[], link_type_class=[],
-        labels=["Thread only"],
+        labels=["Thread only"], created_at=[0.0],
     )
     out = decode_snapshot(data)
     assert out["count"] == 1
@@ -110,6 +112,7 @@ def test_encode_snapshot_rejects_a_mismatched_node_column_length() -> None:
             project_code=[0, 0], weight=[0.0, 0.0], status_flag=[0, 0],
             edge_src=[], edge_dst=[], edge_type_code=[], edge_weight=[], types=[],
             projects=[], edge_types=[], link_type_class=[], labels=["a", "b"],
+            created_at=[0.0, 0.0],
         )
 
 
@@ -119,7 +122,7 @@ def test_encode_snapshot_rejects_a_mismatched_edge_column_length() -> None:
             object_ids=["a"], x=[1.0], y=[1.0], type_code=[0], project_code=[0],
             weight=[0.0], status_flag=[0], edge_src=[0, 0], edge_dst=[0],
             edge_type_code=[0, 0], edge_weight=[0.0, 0.0], types=[], projects=[],
-            edge_types=[], link_type_class=[], labels=["a"],
+            edge_types=[], link_type_class=[], labels=["a"], created_at=[0.0],
         )
 
 
@@ -130,6 +133,7 @@ def test_encode_snapshot_rejects_a_mismatched_labels_length() -> None:
             project_code=[0, 0], weight=[0.0, 0.0], status_flag=[0, 0],
             edge_src=[], edge_dst=[], edge_type_code=[], edge_weight=[], types=[],
             projects=[], edge_types=[], link_type_class=[], labels=["only-one"],
+            created_at=[0.0, 0.0],
         )
 
 
@@ -248,6 +252,26 @@ async def test_fetch_snapshot_excludes_unplaced_objects(actions: Actions) -> Non
     oid = await actions.create_or_find_object("Thread", "thread:gs-unplaced", "test")
     out = decode_snapshot(await fetch_snapshot(actions.pool))
     assert str(oid) not in out["object_ids"]
+
+
+async def test_fetch_snapshot_created_at_is_index_aligned_and_real(
+    actions: Actions,
+) -> None:
+    # WAVE 26, LINEAGES ARE TIME (thread 3683a12a): a real epoch timestamp per object,
+    # index-aligned to object_ids same as x/y -- a genuinely later-created object reads
+    # a later created_at, never a placeholder.
+    before = datetime.now(UTC).timestamp()
+    oid = await actions.create_or_find_object("Thread", "thread:gs-created-at", "test")
+    await layout_batch(actions, limit=1000)
+    after = datetime.now(UTC).timestamp()
+
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    assert len(out["created_at"]) == out["count"]
+    idx = out["object_ids"].index(str(oid))
+    # Float32 on the wire, not float64: at today's epoch magnitude (~1.79e9) the ULP is
+    # 128s, so a value can round up to ~64s past its real value -- tolerance reflects
+    # that honestly rather than asserting a sub-second precision the wire doesn't carry.
+    assert before - 100 <= out["created_at"][idx] <= after + 100
 
 
 async def test_fetch_snapshot_project_falls_back_to_the_project_assertion(

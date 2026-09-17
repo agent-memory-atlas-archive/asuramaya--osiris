@@ -156,6 +156,10 @@ async function fetchStreamSnapshot() {
       x: snap.x[i], y: snap.y[i],
       degree: snap.weight[i],
       statusFlag: snap.status_flag[i],
+      // WAVE 26, LINEAGES ARE TIME (thread 3683a12a): epoch seconds, float32 on the
+      // wire (see graph_stream.py's own docstring item 11) -- fine for a timeline
+      // spanning weeks/months/years, not sub-minute precision.
+      createdAt: snap.created_at ? snap.created_at[i] : 0,
       // TIP 1b (Thoth mail 10755): "swap the client label fallback for the header
       // labels" -- Khnum's own labels array (index-aligned to object_ids, tip 2g) is
       // the label now, computed server-side with the exact same per-type rule and
@@ -613,6 +617,17 @@ export async function initSpace(container) {
   let ribbons = []; // [{a, b, type, count}] -- a/b are district names, a <= b
   let ribbonsResolvedKeys = new Set(); // "a|b|type" keys currently resolved to individual lines
   let districtLabelCandidates = []; // pseudo-nodes for pickLabels' own shared budget, below
+  // WAVE 26, THE STORYLINE (mail 11534): declared here, well before fitToNodes' own initial
+  // synchronous call site (below) reads storylineActive via syncStorylineAxis -- the exact
+  // TDZ crash class districtLabelCandidates above already hit once; see renderStoryline's
+  // own docstring, further down, for what these actually mean.
+  let storylineActive = false;
+  let storylineChainIds = new Set();
+  let storylineSubAgentOf = new Map();
+  let storylineTickOf = new Map();
+  let storylineMinT = 0, storylineMaxT = 1, storylineAxisWidthWorld = 1;
+  let storylineLines = null;
+  let storylineAxisEntries = []; // [{t, x, y, div}]
   function ribbonKey(r) { return `${r.a}|${r.b}|${r.type}`; }
   function findLandmark(type) {
     const counts = new Map();
@@ -1149,6 +1164,7 @@ export async function initSpace(container) {
     updateFrustum();
     rescaleForZoom();
     syncRibbonResolve();
+    syncStorylineAxis();
     markDirty();
   }
 
@@ -1930,6 +1946,274 @@ export async function initSpace(container) {
     await inspect(id);
   }
 
+  // WAVE 26, THE STORYLINE (Thoth mail 11534, operator's word "keep cooking, everyone
+  // gets a lane"; ruling 1178e7d9's fourth principle -- lineages are time; held thread
+  // 3683a12a): focusing an Agent lays its own succession chain (succeeded_from/
+  // succeeds_seat, both directions from the focus, up to 100+ generations) out on a real
+  // horizontal TIME axis instead of the ordinary ranked-column ego tree -- x from each
+  // body's own `createdAt` (now on the wire, graph_stream.py item 11), one row for the
+  // chain itself, a sub-agent (spawned_by a chain member, but not itself IN the chain --
+  // a fork, not a successor) hangs as a short branch off its own parent's row at its own
+  // spawn time, and a Decision/Thread `recorded_by` a chain member or sub-agent sits as a
+  // tick directly ON that body's own row at its own time -- literally a ruler tick, the
+  // node's own ontology color already distinguishing it from an Agent body without any
+  // separate styling. "Nothing hidden" (this WAVE's own standing rule, carried over from
+  // THE DRAWING TIP): every chain member, every sub-agent, every tick is positioned and
+  // drawn, none paged/capped by count -- MAX_STORYLINE_NODES below is a crash-guard
+  // against a pathological/cyclic graph, never a designed display budget.
+  function isAgentFocus(id) {
+    const nd = idById.get(id);
+    return !!nd && nd.type === "Agent";
+  }
+  const MAX_STORYLINE_NODES = 4000;
+  const STORYLINE_LINE_TYPES = new Set(["succeeded_from", "succeeds_seat", "spawned_by"]);
+  const STORYLINE_AXIS_WIDTH_PX = 3600;
+  const STORYLINE_ROW_OFFSET_PX = 90;
+  const STORYLINE_SUBROW_STEP_PX = 26;
+  const STORYLINE_SUBROW_TIERS = 5;
+  const STORYLINE_AXIS_TICK_COUNT = 6;
+  function buildSuccessionAdjacency() {
+    const adj = new Map();
+    for (const e of edges) {
+      if (!SUCCESSION_EDGE_TYPES.has(e.type)) continue;
+      (adj.get(e.source) || (adj.set(e.source, new Set()), adj.get(e.source))).add(e.target);
+      (adj.get(e.target) || (adj.set(e.target, new Set()), adj.get(e.target))).add(e.source);
+    }
+    return adj;
+  }
+  function buildStorylineChain(focusId, adj) {
+    const chain = new Set([focusId]);
+    let frontier = [focusId];
+    while (frontier.length && chain.size < MAX_STORYLINE_NODES) {
+      const next = [];
+      for (const id of frontier) {
+        for (const other of adj.get(id) || []) {
+          if (chain.has(other)) continue;
+          chain.add(other);
+          next.push(other);
+          if (chain.size >= MAX_STORYLINE_NODES) break;
+        }
+        if (chain.size >= MAX_STORYLINE_NODES) break;
+      }
+      frontier = next;
+    }
+    return chain;
+  }
+  // one pass each for branches (spawned_by INTO a chain member, from a non-chain-member --
+  // a fork off that body) and ticks (recorded_by INTO a chain member or a sub-agent) --
+  // first-writer-wins on a rare double attribution, same convention as the rest of this
+  // file's grouping passes (oneHopByTypeDirection et al).
+  function buildStorylineBranchesAndTicks(chainIds) {
+    const subAgentOf = new Map(); // subAgentId -> parent chain-member id
+    for (const e of edges) {
+      if (e.type !== "spawned_by" || !chainIds.has(e.target) || chainIds.has(e.source)) continue;
+      if (!subAgentOf.has(e.source)) subAgentOf.set(e.source, e.target);
+    }
+    const bodyIds = new Set([...chainIds, ...subAgentOf.keys()]);
+    const ticksOf = new Map(); // tickId -> body id (chain member or sub-agent) it's recorded_by
+    for (const e of edges) {
+      if (e.type !== "recorded_by" || !bodyIds.has(e.target)) continue;
+      if (!ticksOf.has(e.source)) ticksOf.set(e.source, e.target);
+    }
+    return { subAgentOf, ticksOf };
+  }
+  function disposeStorylineAxis() {
+    for (const e of storylineAxisEntries) e.div.remove();
+    storylineAxisEntries = [];
+  }
+  function clearStorylineState() {
+    if (storylineLines) {
+      scene.remove(storylineLines);
+      storylineLines.geometry.dispose();
+      storylineLines.material.dispose();
+      storylineLines = null;
+    }
+    disposeStorylineAxis();
+    storylineActive = false;
+    storylineChainIds = new Set();
+    storylineSubAgentOf = new Map();
+    storylineTickOf = new Map();
+  }
+  // a dedicated straight-line overlay -- NOT updatePathEdges (its own cross-cluster bow/
+  // bundle logic answers a different question, "how far apart are two projects", which
+  // means nothing on a time axis where every body sits in the same single view).
+  function buildStorylineLines() {
+    if (storylineLines) {
+      scene.remove(storylineLines);
+      storylineLines.geometry.dispose();
+      storylineLines.material.dispose();
+      storylineLines = null;
+    }
+    const segs = [];
+    for (const e of edges) {
+      if (!STORYLINE_LINE_TYPES.has(e.type)) continue;
+      if (!pathReachable.has(e.source) || !pathReachable.has(e.target)) continue;
+      const a = idById.get(e.source), b = idById.get(e.target);
+      if (!a || !b) continue;
+      segs.push(a, b);
+    }
+    if (!segs.length) return;
+    const positions = new Float32Array(segs.length * 3);
+    const otherPositions = new Float32Array(segs.length * 3);
+    const colors = new Float32Array(segs.length * 3);
+    const ec = new THREE.Color("#58a6ff");
+    for (let i = 0; i < segs.length; i += 2) {
+      const a = segs[i], b = segs[i + 1];
+      positions[i * 3] = a.x || 0; positions[i * 3 + 1] = a.y || 0; positions[i * 3 + 2] = -0.1;
+      positions[(i + 1) * 3] = b.x || 0; positions[(i + 1) * 3 + 1] = b.y || 0; positions[(i + 1) * 3 + 2] = -0.1;
+      otherPositions[i * 3] = b.x || 0; otherPositions[i * 3 + 1] = b.y || 0; otherPositions[i * 3 + 2] = -0.1;
+      otherPositions[(i + 1) * 3] = a.x || 0; otherPositions[(i + 1) * 3 + 1] = a.y || 0; otherPositions[(i + 1) * 3 + 2] = -0.1;
+      colors[i * 3] = ec.r; colors[i * 3 + 1] = ec.g; colors[i * 3 + 2] = ec.b;
+      colors[(i + 1) * 3] = ec.r; colors[(i + 1) * 3 + 1] = ec.g; colors[(i + 1) * 3 + 2] = ec.b;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute("otherPosition", new THREE.BufferAttribute(otherPositions, 3));
+    geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+    storylineLines = new THREE.LineSegments(geo, makeEdgeFadeMaterial());
+    scene.add(storylineLines);
+  }
+  // "the axis carries date labels; zoom scrubs time": regenerated (not just repositioned)
+  // on every deliberate zoom step (syncStorylineAxis, called from zoomAt/fitToNodes) over
+  // whatever time window the camera's own current frustum actually covers -- a reader
+  // zoomed into one decade of a long chain sees date labels for that decade, not the
+  // whole span. Cheap to fully rebuild: STORYLINE_AXIS_TICK_COUNT+1 divs, never more.
+  function buildStorylineAxis(fromT, toT) {
+    disposeStorylineAxis();
+    if (!Number.isFinite(fromT) || !Number.isFinite(toT) || toT <= fromT) return;
+    const wpp = maxViewSize / wrap.clientHeight;
+    const axisY = -((STORYLINE_ROW_OFFSET_PX + STORYLINE_SUBROW_TIERS * STORYLINE_SUBROW_STEP_PX + 40) * wpp);
+    for (let i = 0; i <= STORYLINE_AXIS_TICK_COUNT; i++) {
+      const frac = i / STORYLINE_AXIS_TICK_COUNT;
+      const t = fromT + frac * (toT - fromT);
+      const x = ((t - storylineMinT) / (storylineMaxT - storylineMinT || 1)) * storylineAxisWidthWorld;
+      const div = document.createElement("div");
+      div.className = "lod-glyph-label storyline-axis-label";
+      div.textContent = new Date(t * 1000).toISOString().slice(0, 10);
+      labelsEl.appendChild(div);
+      storylineAxisEntries.push({ t, x, y: axisY, div });
+    }
+  }
+  function positionStorylineAxis() {
+    for (const e of storylineAxisEntries) {
+      _screenV.set(e.x, e.y, 0).project(camera);
+      e.div.style.left = `${(_screenV.x * 0.5 + 0.5) * wrap.clientWidth}px`;
+      e.div.style.top = `${(-_screenV.y * 0.5 + 0.5) * wrap.clientHeight}px`;
+    }
+  }
+  function syncStorylineAxis() {
+    if (!storylineActive) return;
+    const halfW = (camera.right - camera.left) / 2;
+    const visLeft = camera.position.x - halfW, visRight = camera.position.x + halfW;
+    const clamp = (v) => Math.max(0, Math.min(storylineAxisWidthWorld, v));
+    const fromT = storylineMinT +
+      (clamp(visLeft) / (storylineAxisWidthWorld || 1)) * (storylineMaxT - storylineMinT);
+    const toT = storylineMinT +
+      (clamp(visRight) / (storylineAxisWidthWorld || 1)) * (storylineMaxT - storylineMinT);
+    buildStorylineAxis(fromT, toT);
+  }
+  async function renderStoryline(id, opts) {
+    const t0 = performance.now();
+    const options = opts || {};
+    const restored = egoSaved ? new Set(egoSaved.keys()) : null;
+    restoreEgoLayout();
+    if (restored) syncMovedInstancePositions(restored);
+    clearDrillState();
+    clearEgoGroupState();
+    disposeProjectAnchors();
+    clearStorylineState();
+
+    selectedId = id;
+    pathFocusId = id;
+    if (!options.skipStackPush) pushFocusStack(id);
+
+    const adj = buildSuccessionAdjacency();
+    const chainIds = buildStorylineChain(id, adj);
+    const { subAgentOf, ticksOf } = buildStorylineBranchesAndTicks(chainIds);
+    pathReachable = new Set([...chainIds, ...subAgentOf.keys(), ...ticksOf.keys()]);
+    focusBasePathReachable = new Set(pathReachable);
+
+    let minT = Infinity, maxT = -Infinity;
+    for (const rid of pathReachable) {
+      const nd = idById.get(rid);
+      if (!nd) continue;
+      const t = nd.createdAt || 0;
+      if (t < minT) minT = t;
+      if (t > maxT) maxT = t;
+    }
+    if (!Number.isFinite(minT) || !Number.isFinite(maxT)) { minT = 0; maxT = 1; }
+    const timeSpan = Math.max(maxT - minT, 1);
+    const wpp = maxViewSize / wrap.clientHeight;
+    const axisWidth = STORYLINE_AXIS_WIDTH_PX * wpp;
+    const rowOffset = STORYLINE_ROW_OFFSET_PX * wpp;
+    const subrowStep = STORYLINE_SUBROW_STEP_PX * wpp;
+    const timeToX = (t) => ((t - minT) / timeSpan) * axisWidth;
+    storylineMinT = minT; storylineMaxT = maxT; storylineAxisWidthWorld = axisWidth;
+
+    egoSaved = new Map();
+    for (const rid of pathReachable) {
+      const nd = idById.get(rid);
+      if (nd) egoSaved.set(rid, { x: nd.x, y: nd.y });
+    }
+    for (const rid of chainIds) {
+      const nd = idById.get(rid);
+      if (!nd) continue;
+      nd.x = timeToX(nd.createdAt || minT);
+      nd.y = 0;
+    }
+    const subAgentRow = new Map(); // parentId -> siblings placed so far (staggers them)
+    for (const [subId, parentId] of subAgentOf) {
+      const nd = idById.get(subId);
+      if (!nd) continue;
+      const n = subAgentRow.get(parentId) || 0;
+      subAgentRow.set(parentId, n + 1);
+      const dir = n % 2 === 0 ? 1 : -1;
+      const tier = Math.floor(n / 2) % STORYLINE_SUBROW_TIERS;
+      nd.x = timeToX(nd.createdAt || minT);
+      nd.y = dir * (rowOffset + tier * subrowStep);
+    }
+    for (const [tickId, bodyId] of ticksOf) {
+      const nd = idById.get(tickId), body = idById.get(bodyId);
+      if (!nd || !body) continue;
+      nd.x = timeToX(nd.createdAt || minT);
+      nd.y = body.y;
+    }
+    syncMovedInstancePositions(new Set(egoSaved.keys()));
+    storylineChainIds = chainIds;
+    storylineSubAgentOf = subAgentOf;
+    storylineTickOf = ticksOf;
+    storylineActive = true;
+    buildStorylineLines();
+    buildStorylineAxis(minT, maxT);
+
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const rid of pathReachable) {
+      const nd = idById.get(rid);
+      if (!nd || nd.x == null || nd.y == null) continue;
+      minX = Math.min(minX, nd.x); maxX = Math.max(maxX, nd.x);
+      minY = Math.min(minY, nd.y); maxY = Math.max(maxY, nd.y);
+    }
+    if (Number.isFinite(minX)) {
+      camera.position.x = (minX + maxX) / 2;
+      camera.position.y = (minY + maxY) / 2;
+      const span = Math.max(maxX - minX, maxY - minY, 0);
+      const STORYLINE_FIT_MIN_VIEWSIZE = 400;
+      viewSize = Math.max(STORYLINE_FIT_MIN_VIEWSIZE, Math.min(maxViewSize, span * 1.6 + 200));
+      updateFrustum();
+      rescaleForZoom();
+    }
+
+    applyDim();
+    buildEdgeLines(idToNode, edges);
+    if (onFocus) onFocus(id);
+    setStatus(`storyline: ${chainIds.size} chain, ${subAgentOf.size} sub-agents, ` +
+      `${ticksOf.size} ticks`);
+    scheduleLabelPick();
+    markDirty();
+    if (window.__spaceDebugTiming) console.debug("renderStoryline sync ms:", performance.now() - t0);
+    await inspect(id);
+  }
+
   // THE DRILL, items 2/4: "the walk stops at a container... containers passed through are
   // single anchor nodes, so a thread-to-decision walk across two projects reads as two
   // anchors and the path." The ordinary ego walk (bfsHops over outAdjPath/inAdjPath) only
@@ -2274,6 +2558,7 @@ export async function initSpace(container) {
     camera.position.y = worldY - THREE.MathUtils.lerp(camera.top, camera.bottom, ny);
     rescaleForZoom();
     syncRibbonResolve();
+    syncStorylineAxis();
     const t2 = window.__spaceWheelTiming ? performance.now() : 0;
     scheduleLabelPick();
     markDirty();
@@ -2451,6 +2736,7 @@ export async function initSpace(container) {
     if (restored) syncMovedInstancePositions(restored);
     clearDrillState();
     clearEgoGroupState();
+    clearStorylineState();
     focusBasePathReachable = new Set();
     disposeProjectAnchors();
     applyDim();
@@ -2515,6 +2801,11 @@ export async function initSpace(container) {
     // operator's own observed bug) silently truncate while updatePathEdges still drew every
     // one of the focus's own uncapped structural edges, "a solid disc."
     if (isContainerFocus(id)) { await renderContainerDrill(id, opts); return; }
+    // WAVE 26, THE STORYLINE (mail 11534): an Agent focus lays out on a time axis
+    // instead of the ordinary ranked-column ego tree -- checked after the container
+    // gate (an Agent is never a CONTAINER_FOCUS_TYPES member, so this never races it).
+    if (isAgentFocus(id)) { await renderStoryline(id, opts); return; }
+    if (storylineActive) clearStorylineState(); // leaving a storyline for an ordinary focus
     clearDrillState(); // leaving a drill (if any) for an ordinary small-object focus
     const t0 = performance.now();
     const options = opts || {};
@@ -2765,10 +3056,20 @@ export async function initSpace(container) {
       // multiple of 5; every other generation declutters like an ordinary label instead.
       const generation = lit ? computeGeneration(nd) : null;
       const chainDeclutters = generation != null && generation !== 1 && generation % 5 !== 0;
+      // WAVE 26, THE STORYLINE (live-verification finding, mail 11534's own "label overlaps
+      // 0" acceptance line): in a storyline, pathReachable IS the whole chain+sub-agent+tick
+      // population -- often thousands -- so EVERY storyline node reads "lit," and the
+      // generation-modulo-5 exception above only ever fires for true succeeded_from chain
+      // members, not the sub-agents/ticks that make up most of that population. The result
+      // was 780 overlap pairs measured live against the real DOM. A storyline never gets the
+      // "lit always wins" guarantee at all -- every storyline label declutters like an
+      // ordinary one; the focus node still wins its own slot in practice because pickLabels'
+      // own isLit-first sort already places it first into an empty _placed.
+      const alwaysShown = lit && !storylineActive;
       // lit/focused labels always win their spot (never declutter the thing you asked to
-      // see) UNLESS this chain rule says otherwise; ordinary labels yield to anything
-      // already placed.
-      if ((!lit || chainDeclutters) && overlapsPlaced(x, y, w)) { div.hidden = true; continue; }
+      // see) UNLESS this chain rule (or being in a storyline) says otherwise; ordinary
+      // labels yield to anything already placed.
+      if ((!alwaysShown || chainDeclutters) && overlapsPlaced(x, y, w)) { div.hidden = true; continue; }
       div.hidden = false;
       div.style.left = `${x}px`;
       div.style.top = `${y}px`;
@@ -2780,6 +3081,7 @@ export async function initSpace(container) {
     }
     positionFocusRing();
     positionLandmarkBadges();
+    positionStorylineAxis();
     if (window.__spaceWheelTiming) {
       const t0 = performance.now();
       positionDrillDivs();
@@ -2831,6 +3133,14 @@ export async function initSpace(container) {
     get ribbonsResolvedKeys() { return [...ribbonsResolvedKeys]; },
     get districtLabelCandidateCount() { return districtLabelCandidates.length; },
     edgeAccounting,
+    // WAVE 26, THE STORYLINE (mail 11534) -- live-verification hooks, same convention.
+    isAgentFocus,
+    get storylineActive() { return storylineActive; },
+    get storylineChainLength() { return storylineChainIds.size; },
+    get storylineSubAgentCount() { return storylineSubAgentOf.size; },
+    get storylineTickCount() { return storylineTickOf.size; },
+    get storylineTimeSpanSeconds() { return storylineMaxT - storylineMinT; },
+    get storylineAxisLabelCount() { return storylineAxisEntries.length; },
     get edgeSegmentsDrawn() { return edgeLines ? edgeLines.geometry.attributes.position.count / 2 : 0; },
     get ribbonSegmentsDrawn() { return ribbonLines ? ribbonLines.geometry.attributes.position.count / 2 : 0; },
     camera, pickAt, mesh: () => mesh, worldPerPx, nodeScreenPx, renderer,
