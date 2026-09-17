@@ -803,6 +803,27 @@ async def cmd_layout(
                         f"\n  edges over 20k units: {receipt['layout_long_edge_total']}"
                         f"{by_type}"
                         f"\n  container vertices relocated to hub zone: {relocated}")
+                compact_note = ""
+                if "layout_compactness_ratio" in receipt:
+                    ratio = receipt["layout_compactness_ratio"]
+                    ratio_s = f"{ratio:.2f}" if ratio is not None else "n/a"
+                    osiris_bbox = receipt.get("layout_osiris_bbox_width")
+                    intra = receipt.get("layout_intra_district_edge_length", {})
+                    cross = receipt.get("layout_cross_district_edge_length", {})
+                    anchor_n = receipt.get("layout_anchor_displacement_n", 0)
+                    anchor_note = (
+                        f"\n  anchor displacement (n={anchor_n}): mean "
+                        f"{receipt['layout_anchor_displacement_mean']:.1f}, max "
+                        f"{receipt['layout_anchor_displacement_max']:.1f}"
+                        if anchor_n else "\n  anchor displacement: n=0 (no previous run)")
+                    compact_note = (
+                        f"\n  compactness ratio (bbox area / Sigma district area): {ratio_s}"
+                        f"\n  osiris-only bbox width: {osiris_bbox if osiris_bbox else 'n/a'}"
+                        f"\n  intra-district edge length p50/p95 (n={intra.get('n', 0)}): "
+                        f"{intra.get('p50')}/{intra.get('p95')}"
+                        f"\n  cross-district edge length p50/p95 (n={cross.get('n', 0)}): "
+                        f"{cross.get('p50')}/{cross.get('p95')}"
+                        f"{anchor_note}")
                 acceptance_note = (
                     f"\n  bbox width {receipt['layout_bbox_width']}"
                     f"\n  min top-10 centroid gap vs. R_a+R_b: "
@@ -811,7 +832,7 @@ async def cmd_layout(
                     f"{receipt['layout_biggest_project_5nn_purity']}"
                     f"\n  communities: {receipt.get('community_count', 'n/a')} "
                     f"({receipt.get('community_seed_scheme', 'n/a')})"
-                    f"{top5_note}{long_edge_note}"
+                    f"{top5_note}{long_edge_note}{compact_note}"
                     if "layout_bbox_width" in receipt else f"{top5_note}{long_edge_note}")
                 if "error" in receipt:
                     print(f"osiris layout: {receipt['error']}{rss_note}{declump_note}"
