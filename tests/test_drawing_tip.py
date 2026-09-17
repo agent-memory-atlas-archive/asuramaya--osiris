@@ -112,7 +112,21 @@ def test_pick_labels_merges_district_candidates_into_the_same_n_labels_pool() ->
 def test_a_district_label_declutters_like_an_ordinary_label_and_keeps_its_own_class() -> None:
     body = _SPACE_JS.split("function positionLabels()", 1)[1][:1500]
     assert "if (nd.__isDistrict) {" in body
-    assert "if (overlapsPlaced(x, y)) { div.hidden = true; continue; }" in body
+    assert "if (overlapsPlaced(x, y, w)) { div.hidden = true; continue; }" in body
+
+
+def test_declutter_uses_each_labels_own_real_rendered_width_not_a_fixed_box() -> None:
+    # live-verification finding (mail 11471's own "overlap pairs" acceptance line): a long
+    # label (a full Decision title can render 200px+ wide) was always boxed at the same
+    # fixed LABEL_W=90 for overlap purposes regardless of its own real width -- a genuine
+    # visual overlap the old fixed-box declutter had no way to catch. Caught live (1 overlap
+    # pair measured against the real DOM), fixed, reverified (0 overlap pairs after).
+    assert "const labelWidths = new Map();" in _SPACE_JS
+    pick_body = _SPACE_JS.split("function pickLabels()", 1)[1][:3000]
+    assert "labelWidths.set(nd, div.offsetWidth || LABEL_W);" in pick_body
+    assert "labelWidths.delete(nd);" in pick_body
+    pos_body = _SPACE_JS.split("function positionLabels()", 1)[1][:1000]
+    assert "const w = labelWidths.get(nd) || LABEL_W;" in pos_body
 
 
 def test_a_district_below_the_label_gate_stays_an_unlabeled_fill() -> None:

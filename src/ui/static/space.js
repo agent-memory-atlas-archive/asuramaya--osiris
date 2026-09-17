@@ -2646,6 +2646,7 @@ export async function initSpace(container) {
   const N_LABELS = 40;
   let labeledNodes = [];
   const labelDivs = new Map(); // node -> div, reused across frames instead of rebuilt
+  const labelWidths = new Map(); // node -> real rendered px width, measured once at creation
   let labelPickTimer = null;
   function scheduleLabelPick() {
     if (labelPickTimer) return;
@@ -2693,7 +2694,7 @@ export async function initSpace(container) {
     // reuses existing elements instead of an innerHTML rebuild every pick.
     const wanted = new Set(labeledNodes);
     for (const [nd, div] of labelDivs) {
-      if (!wanted.has(nd)) { div.remove(); labelDivs.delete(nd); }
+      if (!wanted.has(nd)) { div.remove(); labelDivs.delete(nd); labelWidths.delete(nd); }
     }
     for (const nd of labeledNodes) {
       if (labelDivs.has(nd)) continue;
@@ -2703,6 +2704,13 @@ export async function initSpace(container) {
       div.textContent = nd.__isDistrict ? `${nd.name} (${nd.degree})` : labelTextFor(nd);
       labelsEl.appendChild(div);
       labelDivs.set(nd, div);
+      // THE REAL-WIDTH DECLUTTER FIX (live-verification finding, mail 11471's own "overlap
+      // pairs" acceptance line): a long label (a Decision title can run 200px+) was always
+      // boxed at the same fixed LABEL_W=90 for overlap purposes, regardless of its own real
+      // rendered width -- a genuine visual overlap the fixed-box declutter had no way to
+      // catch. Measured once, right here, before the div is ever hidden (offsetWidth reads
+      // 0 once `hidden` -- display:none -- applies, so this is the only safe moment).
+      labelWidths.set(nd, div.offsetWidth || LABEL_W);
     }
     markDirty(); // newly (un)labeled divs need one more positionLabels() pass to place them
   }
@@ -2716,8 +2724,11 @@ export async function initSpace(container) {
   // of overlapping strings into an unreadable wall of text.
   const _placed = []; // [x0,y0,x1,y1] boxes already shown this frame
   const LABEL_W = 90, LABEL_H = 16, LABEL_GAP = 4;
-  function overlapsPlaced(x, y) {
-    const x0 = x - LABEL_W / 2, x1 = x + LABEL_W / 2, y0 = y - LABEL_H, y1 = y;
+  // `w` defaults to LABEL_W for any caller that doesn't have a real measured width handy
+  // (e.g. a synthetic probe) -- every real call site below always passes the label's own
+  // cached labelWidths entry.
+  function overlapsPlaced(x, y, w = LABEL_W) {
+    const x0 = x - w / 2, x1 = x + w / 2, y0 = y - LABEL_H, y1 = y;
     for (const b of _placed) {
       if (x0 < b[2] + LABEL_GAP && x1 > b[0] - LABEL_GAP && y0 < b[3] + LABEL_GAP && y1 > b[1] - LABEL_GAP) return true;
     }
@@ -2733,15 +2744,16 @@ export async function initSpace(container) {
       _screenV.set(nd.x || 0, nd.y || 0, 0).project(camera);
       const x = (_screenV.x * 0.5 + 0.5) * wrap.clientWidth;
       const y = (-_screenV.y * 0.5 + 0.5) * wrap.clientHeight;
+      const w = labelWidths.get(nd) || LABEL_W;
       // a district pseudo-node is never focus-reachable and never the succession-chain
       // declutter's own concern -- it just competes for a slot and yields to overlap like
       // any ordinary (non-lit) label, keeping its own "district-label" class untouched.
       if (nd.__isDistrict) {
-        if (overlapsPlaced(x, y)) { div.hidden = true; continue; }
+        if (overlapsPlaced(x, y, w)) { div.hidden = true; continue; }
         div.hidden = false;
         div.style.left = `${x}px`;
         div.style.top = `${y}px`;
-        _placed.push([x - LABEL_W / 2, y - LABEL_H, x + LABEL_W / 2, y]);
+        _placed.push([x - w / 2, y - LABEL_H, x + w / 2, y]);
         continue;
       }
       const lit = nd.id === pathFocusId || pathReachable.has(nd.id) || nd.id === selectedId;
@@ -2756,7 +2768,7 @@ export async function initSpace(container) {
       // lit/focused labels always win their spot (never declutter the thing you asked to
       // see) UNLESS this chain rule says otherwise; ordinary labels yield to anything
       // already placed.
-      if ((!lit || chainDeclutters) && overlapsPlaced(x, y)) { div.hidden = true; continue; }
+      if ((!lit || chainDeclutters) && overlapsPlaced(x, y, w)) { div.hidden = true; continue; }
       div.hidden = false;
       div.style.left = `${x}px`;
       div.style.top = `${y}px`;
@@ -2764,7 +2776,7 @@ export async function initSpace(container) {
       // strictly bigger than a merely-lit one, never just bold-and-bright -- pinned is
       // already true for it via `lit` above, this is the "larger" half of the same ask.
       div.className = "lbl" + (lit ? " lit" : "") + (nd.id === pathFocusId ? " focus-label" : "");
-      _placed.push([x - LABEL_W / 2, y - LABEL_H, x + LABEL_W / 2, y]);
+      _placed.push([x - w / 2, y - LABEL_H, x + w / 2, y]);
     }
     positionFocusRing();
     positionLandmarkBadges();

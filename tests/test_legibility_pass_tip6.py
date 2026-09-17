@@ -261,7 +261,7 @@ def test_chain_labels_declutter_past_generation_1_not_every_single_one() -> None
     assert "const generation = lit ? computeGeneration(nd) : null;" in body
     assert "const chainDeclutters = generation != null && generation !== 1 " \
         "&& generation % 5 !== 0;" in body
-    assert "if ((!lit || chainDeclutters) && overlapsPlaced(x, y))" in body
+    assert "if ((!lit || chainDeclutters) && overlapsPlaced(x, y, w))" in body
 
 
 def test_group_expansion_notifies_the_table_not_just_the_initial_focus() -> None:
