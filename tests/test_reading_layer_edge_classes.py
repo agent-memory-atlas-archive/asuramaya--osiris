@@ -69,16 +69,23 @@ def test_effective_edge_class_debug_hook_exists() -> None:
     assert "get edgeClassByType()" in body
 
 
-# --- structural edges are NOT drawn at rest; the legend is the only way to opt back in ----
+# --- the legend still opts a class/type OUT; nothing is hidden by default any more --------
 
-def test_structural_class_is_hidden_by_default() -> None:
-    assert 'const hiddenEdgeClasses = new Set(["structural"]);' in _SPACE_JS
+def test_structural_class_is_no_longer_hidden_by_default() -> None:
+    # ruling c5953bb1's own "structural hidden at rest" is superseded outright by THE
+    # DRAWING TIP's own operator ruling (4a51cab1/1178e7d9, thread 325ef660, mail 11408):
+    # "nothing hidden, nothing drawn twice" -- caps and hides were the old answer to
+    # density; membership is a district fill and the two universal fans are landmarks now,
+    # not a blanket structural-class hide. See tests/test_drawing_tip.py for the full model.
+    assert 'const hiddenEdgeClasses = new Set();' in _SPACE_JS
+    assert 'const hiddenEdgeClasses = new Set(["structural"]);' not in _SPACE_JS
 
 
 def test_edge_geometry_build_filters_by_hidden_classes_and_types() -> None:
     # TIP 4 (operator ruling "DENSITY NOT DISCS", mail 11011) reverted the parameter back
-    # to edgeList -- no more zoom-tier edge budget.
-    body = _SPACE_JS.split("function buildEdgeLines(nodes, edgeList)", 1)[1][:600]
+    # to edgeList -- no more zoom-tier edge budget. hiddenEdgeClasses/hiddenEdgeTypes start
+    # empty now (THE DRAWING TIP) but the legend-toggle filter mechanism itself is unchanged.
+    body = _SPACE_JS.split("function buildEdgeLines(nodes, edgeList)", 1)[1][:1600]
     assert "!hiddenEdgeClasses.has(e.edgeClass)" in body
     assert "!hiddenEdgeTypes.has(e.type)" in body
 

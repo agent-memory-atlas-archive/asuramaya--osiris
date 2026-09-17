@@ -99,7 +99,7 @@ def test_focus_label_is_bigger_than_a_merely_lit_label() -> None:
     for html in ("index.html", "space.html"):
         page = (_STATIC / html).read_text()
         assert ".lbl.focus-label { font-size: 13px" in page
-    body = _SPACE_JS.split("function positionLabels()", 1)[1][:2200]
+    body = _SPACE_JS.split("function positionLabels()", 1)[1][:2800]
     assert '(nd.id === pathFocusId ? " focus-label" : "")' in body
     assert "positionFocusRing();" in body
 
@@ -257,11 +257,11 @@ def test_chain_labels_declutter_past_generation_1_not_every_single_one() -> None
     # succession chain (up to 50+ pinned members, ALL lit since they're all in
     # pathReachable) tried to show every single one at once. A chain member keeps the
     # always-shown guarantee only at generation 1 or a multiple of 5.
-    body = _SPACE_JS.split("function positionLabels()", 1)[1][:1700]
+    body = _SPACE_JS.split("function positionLabels()", 1)[1][:2200]
     assert "const generation = lit ? computeGeneration(nd) : null;" in body
     assert "const chainDeclutters = generation != null && generation !== 1 " \
         "&& generation % 5 !== 0;" in body
-    assert "if ((!lit || chainDeclutters) && overlapsPlaced(x, y))" in body
+    assert "if ((!lit || chainDeclutters) && overlapsPlaced(x, y, w))" in body
 
 
 def test_group_expansion_notifies_the_table_not_just_the_initial_focus() -> None:
