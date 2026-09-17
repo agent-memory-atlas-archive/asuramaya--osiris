@@ -50,7 +50,7 @@ def test_header_container_class_normalizes_to_structural() -> None:
     # "container" (membership/containment, distinct from ordinary structural) hides at
     # rest exactly like "structural" -- every existing check in this file only ever
     # distinguishes "structural" from everything else.
-    body = _SPACE_JS.split("async function fetchStreamSnapshot()", 1)[1][:2900]
+    body = _SPACE_JS.split("async function fetchStreamSnapshot()", 1)[1][:3200]
     assert 'if (cls === "container") cls = "structural";' in body
 
 
@@ -58,7 +58,7 @@ def test_a_header_class_overrides_the_client_fallback_table() -> None:
     # live-verified regression (mail 11291): the browser marked authored_by "semantic"
     # (STRUCTURAL_EDGE_TYPES doesn't list it) while the header's own link_type_class says
     # authored_by is structural -- edgeClassByType must prefer the header's own value.
-    body = _SPACE_JS.split("async function fetchStreamSnapshot()", 1)[1][:2900]
+    body = _SPACE_JS.split("async function fetchStreamSnapshot()", 1)[1][:3200]
     assert "let cls = snap.link_type_class && snap.link_type_class[i];" in body
     assert "edgeClassByType[t] = cls || classOfEdgeType(t);" in body
 
@@ -85,7 +85,7 @@ def test_edge_geometry_build_filters_by_hidden_classes_and_types() -> None:
     # TIP 4 (operator ruling "DENSITY NOT DISCS", mail 11011) reverted the parameter back
     # to edgeList -- no more zoom-tier edge budget. hiddenEdgeClasses/hiddenEdgeTypes start
     # empty now (THE DRAWING TIP) but the legend-toggle filter mechanism itself is unchanged.
-    body = _SPACE_JS.split("function buildEdgeLines(nodes, edgeList)", 1)[1][:1600]
+    body = _SPACE_JS.split("function buildEdgeLines(nodes, edgeList)", 1)[1][:2300]
     assert "!hiddenEdgeClasses.has(e.edgeClass)" in body
     assert "!hiddenEdgeTypes.has(e.type)" in body
 

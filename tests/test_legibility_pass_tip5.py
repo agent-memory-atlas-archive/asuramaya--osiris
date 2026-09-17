@@ -133,7 +133,7 @@ def test_point_opacity_was_raised_now_that_tone_mapping_owns_the_saturation_cap(
 # --- rule 2: an edge draws only when both ends are visible, no structural-hop exception ----
 
 def test_base_edge_layer_requires_both_ends_visible_no_exception() -> None:
-    body = _SPACE_JS.split("function buildEdgeLines(nodes, edgeList)", 1)[1][:1700]
+    body = _SPACE_JS.split("function buildEdgeLines(nodes, edgeList)", 1)[1][:2300]
     assert "nodeVisible(byId.get(e.source)) && nodeVisible(byId.get(e.target))" in body
 
 
@@ -159,7 +159,7 @@ def test_edges_are_no_longer_bundled_or_density_scaled() -> None:
 # --- rule 3: top-N-by-degree labels inside the current viewport, every zoom, no tiers ------
 
 def test_labels_are_top_n_by_degree_within_the_viewport_no_tier_gating() -> None:
-    body = _SPACE_JS.split("function pickLabels()", 1)[1][:1400]
+    body = _SPACE_JS.split("function pickLabels()", 1)[1][:2500]
     # THE DRAWING TIP (mail 11408) factored the viewport bounds check into a shared `inView`
     # predicate (district labels reuse it too) -- the underlying rule is unchanged: a node
     # must be nodeVisible AND genuinely on screen to be a label candidate.

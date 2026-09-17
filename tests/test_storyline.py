@@ -127,8 +127,9 @@ def test_zoom_scrubs_the_axis_to_the_current_visible_time_window() -> None:
     assert "if (!storylineActive) return;" in body
     assert "buildStorylineAxis(fromT, toT);" in body
     for call_site in ('updateFrustum();\n    rescaleForZoom();\n    syncRibbonResolve();\n'
-                       '    syncStorylineAxis();\n    markDirty();',
-                       'rescaleForZoom();\n    syncRibbonResolve();\n    syncStorylineAxis();'):
+                       '    syncStorylineAxis();\n    syncCommunityVisibility();\n    markDirty();',
+                       'rescaleForZoom();\n    syncRibbonResolve();\n    syncStorylineAxis();\n'
+                       '    syncCommunityVisibility();'):
         assert call_site in _SPACE_JS
 
 

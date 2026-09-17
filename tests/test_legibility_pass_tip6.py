@@ -295,11 +295,13 @@ def test_label_pool_fills_lit_nodes_before_ranking_by_degree() -> None:
     # top-N-by-degree alone ignores the focus: a real ego focus is mostly low-natural-degree
     # nodes (Message, chain members), so the old sort filled the pool with unrelated
     # high-degree nodes elsewhere in the viewport instead of what was actually focused.
-    body = _SPACE_JS.split("function pickLabels()", 1)[1][:1400]
+    body = _SPACE_JS.split("function pickLabels()", 1)[1][:2500]
     assert "const isLit = (nd) => nd.id === pathFocusId || pathReachable.has(nd.id) || " \
         "nd.id === selectedId;" in body
-    assert "(isLit(b) ? 1 : 0) - (isLit(a) ? 1 : 0) || (b.degree || 0) - (a.degree || 0)" \
-        in body
+    # WAVE 26's own tier() wraps isLit -- lit still ranks strictly highest (tier 2), the
+    # sort's own outcome for a lit node is unchanged; see test_community_regions.py for
+    # the tier() rework itself.
+    assert "tier(b) - tier(a) || (b.degree || 0) - (a.degree || 0)" in body
 
 
 def test_hover_card_generation_is_named_honestly_not_claimed_as_the_labels_own() -> None:
