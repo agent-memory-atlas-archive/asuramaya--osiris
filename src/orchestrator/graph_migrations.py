@@ -68,7 +68,21 @@ async def migrate_repo_seats_fix(
     Compensating, never a delete: every Agent whose CURRENT `project` assertion
     reads "seats" is re-stamped to "osiris" (the fleet's own house -- the bare
     container belongs to no ONE seat, so there is no per-seat house to derive,
-    only the shared fleet root); every LIVE link INTO repo:seats (any type -- a
+    only the shared fleet root) via `assert_singular_property`, NOT the plain
+    `assert_property` the first cut of this door used (Thoth's live finding on
+    the w316 apply, mail 11469): `assert_property`'s own supersession is
+    SAME-SOURCE ONLY, so a re-stamp written by this migration's own actor sat
+    BESIDE the agent's own prior self-declared "seats" row rather than retiring
+    it -- both simultaneously `is_current`, and the stream header (reading
+    whichever `current_assertions` row it finds first, over a set the write
+    path never proved unique -- the exact failure shape the house's own
+    ORDER-BY-without-a-total-tiebreak lesson names) kept filing all 54 agents
+    under repo:seats even after the "successful" apply. `assert_singular_property`
+    is the house's OWN blessed door for this shape (ruling 1335332e, thread
+    6361): a property that is single-valued per object regardless of who wrote
+    the prior value collapses every other current row for (object, "project")
+    down to the one this call mints, cross-source. Every LIVE link INTO
+    repo:seats (any type -- a
     phantom container's own edges are fixed whatever its status, THOTH'S OWN
     CORRECTION mail 11448: the original status=='active' gate silently skipped
     the repair the instant the container drifted out of that one status) is
@@ -109,6 +123,19 @@ async def migrate_repo_seats_fix(
         "SELECT o.id, o.canonical FROM objects o "
         "JOIN current_assertions a ON a.object_id=o.id "
         "WHERE a.name='project' AND a.value #>> '{}' = 'seats' AND o.type='Agent'")
+    agent_ids = [r["id"] for r in agent_rows]
+    # how many CURRENT `project` rows each agent carries right now, any source --
+    # assert_singular_property collapses every one of them to the single new
+    # "osiris" row it mints, so this count IS the per-agent supersede count
+    # (1 in the clean case; >1 if a prior partial/botched apply already left an
+    # extra current row beside the original "seats" one, e.g. the w316 finding).
+    current_project_counts: dict[uuid.UUID, int] = {}
+    if agent_ids:
+        count_rows = await pool.fetch(
+            "SELECT object_id, count(*) AS n FROM current_assertions "
+            "WHERE object_id = ANY($1::uuid[]) AND name='project' GROUP BY object_id",
+            agent_ids)
+        current_project_counts = {r["object_id"]: r["n"] for r in count_rows}
     # every live link INTO repo:seats, any type -- the container's own status is
     # never consulted here (Thoth's correction): a phantom's edges are fixed
     # whatever state the phantom itself is in.
@@ -117,7 +144,6 @@ async def migrate_repo_seats_fix(
         "FROM links l JOIN objects o ON o.id=l.from_id "
         "WHERE l.to_id=$1 "
         "AND (l.valid_until IS NULL OR l.valid_until > now())", seats_id)
-    agent_ids = [r["id"] for r in agent_rows]
     # READ-ONLY, for the record, never written: live links between the 54
     # seats-stamped agents and any OTHER object already in osiris (in_repo/
     # works_in to repo:osiris, or a current project assertion of 'osiris') --
@@ -143,13 +169,22 @@ async def migrate_repo_seats_fix(
             agent_ids, osiris_id)
 
     now = datetime.now(UTC)
-    agents_plan = [{"agent": str(r["id"])[:8], "canonical": r["canonical"]} for r in agent_rows]
+    agents_plan = [
+        {"agent": str(r["id"])[:8], "canonical": r["canonical"],
+         "superseded": current_project_counts.get(r["id"], 1)}
+        for r in agent_rows
+    ]
+    superseded_total = sum(a["superseded"] for a in agents_plan)
     edges_by_type: Counter[str] = Counter(r["type"] for r in edge_rows)
 
     if not dry_run:
         for r in agent_rows:
-            await actions.assert_property(
-                r["id"], "project", "osiris", actor, now, _CONF, evidence_class=_EC)
+            await actions.assert_singular_property(
+                r["id"], "project", "osiris", actor, now, _CONF,
+                because=f"{because} (migrate_repo_seats_fix: cross-source collapse of "
+                        "the agent's prior 'seats' self-declaration -- project is "
+                        "single-valued per object, ruling 1335332e)",
+                evidence_class=_EC, actor=actor)
         for r in edge_rows:
             await actions.invalidate_link(
                 r["from_id"], seats_id, r["type"], actor, now,
@@ -176,6 +211,7 @@ async def migrate_repo_seats_fix(
     return {
         "dry_run": dry_run,
         "agents_scanned": len(agent_rows), "agents_plan": agents_plan,
+        "superseded_total": superseded_total,
         "edges_scanned": len(edge_rows), "edges_retired_or_refiled_by_type": dict(edges_by_type),
         "agents_to_osiris_links_unchanged": agents_to_osiris_count,
         "osiris_seats_edges_after": osiris_seats_edges_after,
