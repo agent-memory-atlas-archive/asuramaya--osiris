@@ -1121,17 +1121,28 @@ def _level2_raw_layout_for_project(
 
 def _level2_extent(raw: dict[uuid.UUID, np.ndarray]) -> float:
     """The REAL radius `raw`'s own (already floor-respecting, per
-    `_level2_raw_layout_for_project`) spread needs -- the 95th percentile member
-    radius from the project's own recentred FR position, same statistic the old
-    scheme used, just no longer fed straight into a scale factor that could shrink
-    below 1.0. Floored at `_MIN_SEPARATION` so an empty or single-member project
-    still gets a little real clearance in level 1's own separation pass."""
+    `_level2_raw_layout_for_project`) spread needs. THE PACKING GAP FIX (THE
+    COMPACT ARRANGEMENT follow-up, Thoth mail 11597/11605): this used to be the
+    95th percentile member radius (v8's own statistic, kept when `_level1_layout`
+    still added FR-then-`_separate_extents` slack on top) -- under v9's own tight
+    circle packing, `_level1_layout` reserves EXACTLY this radius plus a fixed
+    gutter for each project, so the 5% of members the 95th percentile always
+    excludes by construction were already landing outside their own project's
+    packed disc even in the RAW layout, before any downstream nudge/declump ever
+    touched them. Measured live (Thoth's v9 write, mail 11597): the top-10
+    centroid gap went negative (-184.5 to -812.7) on a map where the old, looser
+    v8 scheme always measured it positive. The TRUE max, not the 95th
+    percentile, is what `_level1_layout`'s own packing radius must cover -- this
+    also tightens `_level2_finalize`'s own scale-up-only guarantee (never
+    rescale a project's members past their own true spread). Floored at
+    `_MIN_SEPARATION` so an empty or single-member project still gets a little
+    real clearance in level 1's own separation pass."""
     if not raw:
         return _MIN_SEPARATION
     pts = np.array(list(raw.values()))
     if len(pts) == 1:
         return max(_MIN_SEPARATION, float(np.linalg.norm(pts[0])))
-    return max(_MIN_SEPARATION, float(np.percentile(np.linalg.norm(pts, axis=1), 95)))
+    return max(_MIN_SEPARATION, float(np.max(np.linalg.norm(pts, axis=1))))
 
 
 def _level2_finalize(
@@ -1293,6 +1304,17 @@ def _place_unfiled(
     return out
 
 
+class TopologyAcceptanceFailed(Exception):
+    """Raised by `_physics_positions` when the top-10 centroid gap comes back
+    negative -- THE COMPACT ARRANGEMENT follow-up (Thoth mail 11597/11605): two
+    of the biggest districts' own member clouds genuinely overlap on the packed
+    map, not a residual `_declump` can clean up (that pass only ever enforces
+    the flat per-object floor, blind to which project a pair belongs to). A hard
+    refusal, never a silent write of a visibly overlapping map -- the same
+    "loud, not shipped" discipline `DeclumpVerificationFailed` already holds for
+    the flat floor, one level up."""
+
+
 class DeclumpVerificationFailed(Exception):
     """Raised by `_verify_min_separation` when the post-declump population still
     holds a pair closer than `_PHYSICS_VERIFY_FAIL_RATIO * min_sep` -- a genuine
@@ -1432,8 +1454,9 @@ async def _physics_positions(
     final declump, now CONVERGE-OR-BUDGET (`_declump_until_converged_or_budget`,
     Thoth mail 11191) -> PROPORTIONALLY VERIFIED (`_verify_min_separation`, fails
     only on a genuine collapse, not a narrow residual). Real object positions
-    only. Can raise `MemoryBudgetExceeded` or `DeclumpVerificationFailed` -- the
-    caller (`run_physics_migrate`) turns either into a written refusal receipt
+    only. Can raise `MemoryBudgetExceeded`, `DeclumpVerificationFailed`, or (THE
+    COMPACT ARRANGEMENT follow-up) `TopologyAcceptanceFailed` -- the
+    caller (`run_physics_migrate`) turns any of them into a written refusal receipt
     rather than letting a bad layout write. `diagnostics`, when given, is filled
     with `declump_worst_residual`/`declump_iterations` regardless of outcome --
     Thoth's own ask, "the receipt reports the worst residual pair and iteration
@@ -1575,7 +1598,8 @@ async def _physics_positions(
         final_positions = {oid: declumped[i] for i, oid in enumerate(object_ids)}
         diagnostics.update(_long_edge_counts(link_rows, final_positions))
         diagnostics.update(_layout_acceptance_metrics(
-            declumped, object_ids, membership, groups, project_ids, radii))
+            declumped, object_ids, membership, groups, project_ids, radii,
+            packed_centroids=centroids))
         diagnostics.update(_edge_length_percentiles(link_rows, membership, final_positions))
         osiris_pid = await actions.pool.fetchval(
             "SELECT id FROM objects WHERE canonical='repo:osiris' "
@@ -1583,6 +1607,11 @@ async def _physics_positions(
         diagnostics.update(_compactness_metrics(
             declumped, project_ids, radii, osiris_pid, object_ids, groups))
         diagnostics.update(_anchor_displacement(anchor, final_positions))
+        gap = diagnostics.get("layout_min_top10_centroid_gap")
+        if gap is not None and gap < 0:
+            raise TopologyAcceptanceFailed(
+                f"top-10 centroid gap is {gap:.1f} (negative) -- two of the "
+                "biggest districts' own member clouds overlap on the packed map")
     _verify_min_separation(worst_residual, min_sep=_MIN_SEPARATION)
 
     return {oid: (float(declumped[i, 0]), float(declumped[i, 1]))
@@ -1720,6 +1749,7 @@ def _layout_acceptance_metrics(
     pos: np.ndarray, object_ids: list[uuid.UUID], membership: dict[uuid.UUID, uuid.UUID],
     groups: dict[uuid.UUID, list[uuid.UUID]], project_ids: list[uuid.UUID],
     radii: dict[uuid.UUID, float],
+    packed_centroids: dict[uuid.UUID, np.ndarray] | None = None,
 ) -> dict[str, Any]:
     """THE ACCEPTANCE METRICS (Thoth mail 11208, required in every verify-only
     receipt from now on): per-project centroid/r50/r95/N for the top 10 projects,
@@ -1727,7 +1757,22 @@ def _layout_acceptance_metrics(
     same-project purity for the biggest project, and the global bbox. Computed
     from the SAME final positions the migration would write (or refuse) -- the
     exact numbers Thoth's own live measurement caught v8's first real write
-    failing on (163k-unit bbox, every centroid near-coincident, 0.32 purity)."""
+    failing on (163k-unit bbox, every centroid near-coincident, 0.32 purity).
+
+    THE GAP-CHECK CENTROID FIX (THE COMPACT ARRANGEMENT follow-up, Thoth mail
+    11597/11605): `project_stats`' own reported `centroid`/`r50`/`r95` still
+    recompute from final MEMBER positions (a genuinely useful diagnostic: how
+    the actual population sits). But the min-gap OVERLAP check now compares
+    `packed_centroids` -- v9's own exact, stable `_level1_layout` output -- not
+    that recomputed mean. `radii` is that same centroid's own reserved packing
+    radius (`_pack_siblings`' own guarantee: any two packed centroids are at
+    least `radii[a]+radii[b]+gutter` apart, by construction); a bridge nudge or
+    the post-nudge/final declump can shift a handful of MEMBERS toward a
+    neighbour without moving the project's own packed anchor at all, and it is
+    the anchor -- what a district fill actually renders around -- whose
+    separation this check exists to guarantee. Falls back to the recomputed
+    mean when `packed_centroids` is omitted (pre-v9 callers, and this
+    function's own direct unit tests)."""
     idx = {oid: i for i, oid in enumerate(object_ids)}
     top = sorted(project_ids, key=lambda p: -len(groups[p]))[:10]
 
@@ -1739,7 +1784,9 @@ def _layout_acceptance_metrics(
             continue
         pts = pos[member_idx]
         centroid = pts.mean(axis=0)
-        top_centroids[pid] = centroid
+        top_centroids[pid] = (
+            packed_centroids[pid] if packed_centroids and pid in packed_centroids
+            else centroid)
         dists = np.linalg.norm(pts - centroid, axis=1)
         project_stats.append({
             "project": str(pid), "n": len(member_idx),
@@ -1819,8 +1866,9 @@ async def run_physics_migrate(
     `run_layout_migrate` so nothing else touches graph_x/graph_y while this runs.
     Yields coarse stage receipts (not one per batch, since there are none) and a
     final `{"done": True, "placed": N, "peak_rss_kb": N}` -- `_physics_positions` can
-    raise `MemoryBudgetExceeded` (THE COLLAPSED-CONTAINER FIX, Thoth mail 11111) or
-    `DeclumpVerificationFailed` (item 2, Thoth mail 11128), either turned here into a
+    raise `MemoryBudgetExceeded` (THE COLLAPSED-CONTAINER FIX, Thoth mail 11111),
+    `DeclumpVerificationFailed` (item 2, Thoth mail 11128), or `TopologyAcceptanceFailed`
+    (THE COMPACT ARRANGEMENT follow-up, Thoth mail 11597/11605), any turned here into a
     single `{"error": ...}` receipt with no write. `peak_rss_kb` (THE RECEIPT-STATS
     TIP, decision cc2f2ea7) rides on EVERY receipt shape now, not just a real
     write's own -- `--verify-only`, this session's own standard diagnostic tool,
@@ -1846,7 +1894,8 @@ async def run_physics_migrate(
             diagnostics: dict[str, Any] = {}
             try:
                 positions = await _physics_positions(actions, diagnostics=diagnostics)
-            except (MemoryBudgetExceeded, DeclumpVerificationFailed) as exc:
+            except (MemoryBudgetExceeded, DeclumpVerificationFailed,
+                    TopologyAcceptanceFailed) as exc:
                 peak_rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
                 yield {"error": str(exc), "peak_rss_kb": peak_rss_kb, **diagnostics}
                 return

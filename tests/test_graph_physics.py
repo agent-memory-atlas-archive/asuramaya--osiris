@@ -626,6 +626,54 @@ def test_level1_layout_anchors_onto_a_previous_run_when_given() -> None:
         assert float(np.linalg.norm(out[oid] - anchor[oid])) < 1200.0
 
 
+def test_level2_extent_uses_the_true_max_not_the_95th_percentile() -> None:
+    """THE PACKING GAP FIX (Thoth mail 11597/11605): under v9's tight circle
+    packing, `_level1_layout` reserves EXACTLY this radius for a project -- the
+    95th percentile always excludes the outermost 5% of members by
+    construction, which is exactly what produced the live negative top-10
+    gap. One point far outside the 95th-percentile band must still be
+    covered."""
+    raw = {uuid.uuid4(): np.array([float(i), 0.0]) for i in range(20)}
+    far_id = uuid.uuid4()
+    raw[far_id] = np.array([500.0, 0.0])  # a genuine outlier
+    extent = graph_physics._level2_extent(raw)
+    assert extent == pytest.approx(500.0)
+
+
+def test_layout_acceptance_metrics_gap_check_uses_packed_centroids_not_member_drift() -> None:
+    """THE GAP-CHECK CENTROID FIX (Thoth mail 11597/11605): a member cloud
+    biased hard toward a neighbouring project (simulating what a bridge nudge
+    does at scale) must never make the gap check go negative, as long as the
+    PACKED centroids themselves still respect their own radii+gutter -- the
+    metric is a promise about the rendered district anchor, not about where an
+    individual member's own position happens to have drifted to."""
+    import math as _math
+
+    from src.orchestrator.graph_physics import _layout_acceptance_metrics
+
+    a, b = uuid.uuid4(), uuid.uuid4()
+    radii = {a: 500.0, b: 500.0}
+    gutter = 45.0
+    packed_centroids = {a: np.array([0.0, 0.0]),
+                        b: np.array([500.0 + 500.0 + gutter, 0.0])}
+    # every member of `a` biased hard toward `b`'s own centroid, well past
+    # where the honest recomputed mean would put an unbiased population --
+    # exactly what a bridge nudge does to a handful of real members, just
+    # applied to the whole population for a clean worst-case test.
+    members_a = [np.array([490.0, 0.0]) for _ in range(20)]
+    members_b = [np.array([500.0 + 500.0 + gutter - 490.0, 0.0]) for _ in range(20)]
+    pos = np.array(members_a + members_b)
+    object_ids = [uuid.uuid4() for _ in members_a] + [uuid.uuid4() for _ in members_b]
+    groups = {a: object_ids[:20], b: object_ids[20:]}
+    membership = {oid: a for oid in object_ids[:20]} | {oid: b for oid in object_ids[20:]}
+
+    out = _layout_acceptance_metrics(
+        pos, object_ids, membership, groups, [a, b], radii,
+        packed_centroids=packed_centroids)
+    assert out["layout_min_top10_centroid_gap"] == pytest.approx(gutter, abs=1e-6)
+    assert not _math.isnan(out["layout_min_top10_centroid_gap"])
+
+
 def test_level1_layout_places_a_single_project_at_the_origin_ish() -> None:
     pid = uuid.uuid4()
     out = _level1_layout([pid], {pid: 20.0}, {})
