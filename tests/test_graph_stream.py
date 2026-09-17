@@ -56,6 +56,9 @@ def test_snapshot_round_trips_through_the_decoder_with_the_exact_count() -> None
         cluster_edges=[{"a": 0, "b": 1, "class": "semantic", "count": 1}],
         type_pair_edges=[{"a": {"project": 0, "type": 0}, "b": {"project": 0, "type": 1},
                            "class": "semantic", "count": 1}],
+        community_code=[1, 1, 0],
+        communities=[{"community": 1, "project": 1, "count": 2, "cx": 1.5, "cy": 4.5,
+                      "radius": 0.5}],
     )
     out = decode_snapshot(data)
     assert out["count"] == 3
@@ -84,6 +87,40 @@ def test_snapshot_round_trips_through_the_decoder_with_the_exact_count() -> None
     assert out["edge_type_code"] == [0, 1]
     assert out["edge_weight"] == pytest.approx([0.5, 1.0])
     assert out["created_at"] == pytest.approx([100.0, 200.0, 300.0])
+    assert out["community_code"] == [1, 1, 0]
+    assert out["communities"] == [
+        {"community": 1, "project": 1, "count": 2, "cx": 1.5, "cy": 4.5, "radius": 0.5}]
+
+
+def test_snapshot_community_code_defaults_to_all_zeros() -> None:
+    """THE COMPACT ARRANGEMENT's own wire addition (Thoth mail 11533, operator
+    ruling 40a30905 -- Seshat's own second lane waits on this): a caller that
+    never passes `community_code` (every pre-existing test, and any live
+    population where no project exceeds `_COMMUNITY_MIN_MEMBERS`) must still get
+    a valid, index-aligned all-zero array, never a missing key or a length
+    mismatch -- 0 is the sentinel for "no real community", same as
+    `project_aggregates`' own empty-list default for "no aggregates computed"."""
+    data = encode_snapshot(
+        object_ids=["a", "b"], x=[0.0, 1.0], y=[0.0, 1.0], type_code=[0, 0],
+        project_code=[0, 0], weight=[0.0, 0.0], status_flag=[0, 0],
+        edge_src=[], edge_dst=[], edge_type_code=[], edge_weight=[],
+        types=["Thread"], projects=["unfiled"], edge_types=[], link_type_class=[],
+        labels=["a", "b"], created_at=[0.0, 0.0],
+    )
+    out = decode_snapshot(data)
+    assert out["community_code"] == [0, 0]
+    assert out["communities"] == []
+
+
+def test_encode_snapshot_rejects_a_mismatched_community_code_length() -> None:
+    with pytest.raises(ValueError, match="community_code has"):
+        encode_snapshot(
+            object_ids=["a", "b"], x=[1.0, 2.0], y=[1.0, 2.0], type_code=[0, 0],
+            project_code=[0, 0], weight=[0.0, 0.0], status_flag=[0, 0],
+            edge_src=[], edge_dst=[], edge_type_code=[], edge_weight=[],
+            types=["Thread"], projects=["unfiled"], edge_types=[], link_type_class=[],
+            labels=["a", "b"], created_at=[0.0, 0.0], community_code=[1],
+        )
 
 
 def test_snapshot_with_no_edges_still_round_trips() -> None:
@@ -272,6 +309,33 @@ async def test_fetch_snapshot_created_at_is_index_aligned_and_real(
     # 128s, so a value can round up to ~64s past its real value -- tolerance reflects
     # that honestly rather than asserting a sub-second precision the wire doesn't carry.
     assert before - 100 <= out["created_at"][idx] <= after + 100
+
+
+async def test_fetch_snapshot_community_code_is_index_aligned_and_zero_below_threshold(
+    actions: Actions,
+) -> None:
+    """THE COMPACT ARRANGEMENT's own wire addition (Thoth mail 11533, operator
+    ruling 40a30905): the live query wiring end to end, for the ordinary case --
+    a project well under `_COMMUNITY_MIN_MEMBERS` (500) has no real Leiden
+    community, so every member's own `community_code` reads 0 and `communities`
+    stays empty, never a crash or a missing key (a hermetic 500+-member
+    population isn't worth the setup cost here; the pure encode/decode tests
+    above already cover a real non-zero code end to end)."""
+    proj = await actions.create_or_find_object("SoftwareProject", "repo:gs-community", "test")
+    a = await actions.create_or_find_object("Thread", "thread:gs-comm-a", "test")
+    b = await actions.create_or_find_object("Thread", "thread:gs-comm-b", "test")
+    now = datetime.now(UTC)
+    await actions.create_link(a, proj, "in_repo", "test", now, 1.0)
+    await actions.create_link(b, proj, "in_repo", "test", now, 1.0)
+    await actions.create_link(a, b, "cites", "test", now, 1.0)
+    await layout_batch(actions, limit=1000)
+
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    assert len(out["community_code"]) == out["count"]
+    ia, ib = out["object_ids"].index(str(a)), out["object_ids"].index(str(b))
+    assert out["community_code"][ia] == 0
+    assert out["community_code"][ib] == 0
+    assert out["communities"] == []
 
 
 async def test_fetch_snapshot_project_falls_back_to_the_project_assertion(
