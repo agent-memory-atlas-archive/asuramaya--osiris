@@ -302,11 +302,28 @@ async def test_register_agent_mount_still_downgrades_a_genuine_unrelated_rename(
                               model="claude-fable-5")
     await register_agent(actions, ident2, actor="analyst:operator")
 
-    rows = await actions.pool.fetch(
+    # THE UNORDERED-DICT REGRESSION (Thoth mail 11499, w317 bisect): assert_property's
+    # own supersession is same-source-only (agents.py's own documented design, see
+    # register_agent's PROJECT-NAME CLOBBER comment) -- session 1's ORIGINAL
+    # self_declared "renamedx" row is never superseded by session 2's DERIVED
+    # "renamedx" row, since the two sessions are different sources. Both stay
+    # `is_current` at once, so `current_assertions` genuinely holds TWO rows reading
+    # "renamedx" here (one self_declared, one derived) -- collapsing them into a bare
+    # {value: evidence_class} dict from an ORDER-BY-less fetch silently picks
+    # whichever row Postgres happens to return last, which is exactly the "pick the
+    # current one over a set never proven unique" shape the house's own standing
+    # practice warns about (confirmed: a content-only change elsewhere in the
+    # codebase -- one fewer catalog Type row seeded by seed_catalog -- flipped this
+    # test's own pass/fail with zero change to the logic under test). Fixed: read the
+    # MOST RECENT current row for this name deterministically (observed_at DESC),
+    # which is provably session 2's own write (it is the last write in this test,
+    # nothing else touches this object's `name` afterward) -- exactly the row whose
+    # tier this test means to check.
+    latest = await actions.pool.fetchrow(
         "SELECT value#>>'{}' AS v, evidence_class FROM current_assertions "
-        "WHERE object_id=$1 AND name='name'", proj)
-    by_value = {r["v"]: r["evidence_class"] for r in rows}
-    assert by_value.get("renamedx") == EvidenceClass.DERIVED.value, (
+        "WHERE object_id=$1 AND name='name' ORDER BY observed_at DESC LIMIT 1", proj)
+    assert latest["v"] == "renamedx"
+    assert latest["evidence_class"] == EvidenceClass.DERIVED.value, (
         "an unrelated disagreement with no merge record behind it must still be "
         "recorded at derived-tier confidence, same as before this guard")
 
