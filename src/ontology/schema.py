@@ -495,12 +495,6 @@ _LINK_TYPES: tuple[LinkType, ...] = (
              "having admitted it. Minted by the ASSERTION LINKS migration (DRAWING "
              "THE WHOLE GRAPH, thread 325ef660) from the pre-existing property.",
              ("Thread",), ("Agent",)),
-    LinkType("acknowledges", "A Decision's own `prior_art_acknowledged` assertion, naming "
-             "prior art it credits — a provenance/attribution edge, not a content "
-             "claim about the target (unlike `cites` below). Minted by the ASSERTION "
-             "LINKS migration (DRAWING THE WHOLE GRAPH, thread 325ef660) from the "
-             "pre-existing property.",
-             ("Decision",), ("Decision",)),
     LinkType("vendor_of", "The vendor entity (resolved from a Reference's own free-text "
              "`vendor` property against an active SoftwareProject's canonical) IS "
              "vendor of that Reference. Minted by the ASSERTION LINKS migration "

@@ -52,11 +52,13 @@ STRUCTURAL_LINK_TYPES: frozenset[str] = frozenset({
     # authorship/attribution edge, same shape as authored_by above, not a claim
     # about content), owned_by (Thread -> its own owner, a standing-responsibility
     # edge, same membership/identity shape as managed_by), admitted_by (Thread ->
-    # the Agent who admitted it, a dispatch/attribution edge), acknowledges
-    # (Decision -> prior art it cites as acknowledged, a provenance/attribution
-    # edge, not a content claim about the target itself), vendor_of (Reference ->
-    # its vendor, a membership/identity edge, same shape as committer_for).
-    "recorded_by", "owned_by", "admitted_by", "acknowledges", "vendor_of",
+    # the Agent who admitted it, a dispatch/attribution edge), vendor_of
+    # (Reference -> its vendor, a membership/identity edge, same shape as
+    # committer_for). NOT acknowledges (Thoth mail 11448): Decision.prior_art_
+    # acknowledged's own confirmation already mints a real `cites` edge
+    # (acknowledge_prior_art's own docstring) -- a distinct type would be
+    # redundant, dropped from the migration entirely, never classified here.
+    "recorded_by", "owned_by", "admitted_by", "vendor_of",
 })
 
 # every OTHER link type this codebase's write paths actually mint today (scanned via
