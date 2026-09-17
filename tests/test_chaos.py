@@ -473,12 +473,27 @@ async def test_chaos_replay_all_green_against_isolated_real_daemons(
     transient lock landing in the narrow post-recovery sampling instant could false-
     positive as a leak; `ADVISORY_LOCK_NOISE_TOLERANCE` (chaos.py) now absorbs that
     measured noise without masking the leak-reproduction test's own deliberate 10-key
-    signal."""
+    signal.
+
+    A THIRD TIMING DEPENDENCY (WAVE 26 item 2, thread 01c08600, Thoth DM 11536 — this
+    still failed a full gate under load and passed alone even with both fixes above):
+    this call tightened `recovery_ceiling_secs` to 30.0, below `chaos_replay`'s own
+    60.0 default, purely to make the ordinary (quiet-box) case of this test faster.
+    The poll backoff (2, 4, 8, 8, 8...) sums to exactly 30 at 5 iterations — so with
+    that override, this test carried almost NO margin beyond the ~1.5-2s cold-start
+    baseline the comment above measured under UNCONTENDED conditions. Real `-n4`
+    full-suite load competes for the same CPU/IO the freshly SIGKILL-restarted
+    `osiris-mcp`/`osiris-worker` subprocesses need to cold-start, and that contention
+    (not a hang, not a regression) is exactly what a tight, test-local ceiling has no
+    room to absorb. Fixed by dropping the override and inheriting chaos_replay's own
+    already-proven 60.0s default — a longer wait bound that is still bounded, not a
+    skip: a genuine non-recovery still fails this test, just with the same headroom
+    every OTHER caller of chaos_replay already gets."""
     report = await chaos_replay(
         actions.pool, units=DEFAULT_CHAOS_UNITS,
         kill=isolated_chaos_daemons.kill, restart=isolated_chaos_daemons.restart,
         fire_storm=_real_fire_storm, automount_probe=isolated_chaos_daemons._whisper_probe,
-        agents_json=_agents_json_sequence([[]]), recovery_ceiling_secs=30.0)
+        agents_json=_agents_json_sequence([[]]))
     assert report["storm_fired"] == 25
     assert report["ok"] is True, report["findings"]
     assert report["findings"] == []
