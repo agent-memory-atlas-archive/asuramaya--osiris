@@ -7,7 +7,9 @@ from datetime import UTC, datetime
 from src.actions.core import Actions
 from src.orchestrator.graph_migrations import (
     migrate_assertion_links,
+    migrate_file_the_residual,
     migrate_file_the_unfiled,
+    migrate_owned_by_second_pass,
     migrate_repo_seats_fix,
     run_migration,
 )
@@ -378,3 +380,181 @@ async def test_assertion_links_owned_by_falls_back_to_a_project_name(
     assert await actions.pool.fetchval(
         "SELECT 1 FROM links WHERE from_id=$1 AND to_id=$2 AND type='owned_by' "
         "AND (valid_until IS NULL OR valid_until > now())", thread, proj)
+
+
+# --- owned_by_second_pass -----------------------------------------------------------
+
+
+async def test_owned_by_second_pass_requires_because_to_apply(actions: Actions) -> None:
+    out = await migrate_owned_by_second_pass(actions, actor="test", dry_run=False, because="")
+    assert "error" in out
+
+
+async def test_owned_by_second_pass_resolves_operator_to_the_principal(
+    actions: Actions,
+) -> None:
+    now = datetime.now(UTC)
+    operator = await actions.create_or_find_object(
+        "Person", "principal:analyst:operator", "test")
+    thread = await actions.create_or_find_object("Thread", "thread:gm-op-owner", "test")
+    await actions.assert_property(thread, "owner", "operator", "test", now, 0.9)
+
+    dry = await migrate_owned_by_second_pass(actions, actor="test", dry_run=True)
+    assert dry["minted"] >= 1
+    assert dry["minted_as_operator"] >= 1
+
+    out = await migrate_owned_by_second_pass(
+        actions, actor="test", dry_run=False, because="test cleanup")
+    assert out["minted_as_operator"] >= 1
+    assert await actions.pool.fetchval(
+        "SELECT 1 FROM links WHERE from_id=$1 AND to_id=$2 AND type='owned_by' "
+        "AND (valid_until IS NULL OR valid_until > now())", thread, operator)
+
+    # idempotent: a repeat call finds it already present
+    again = await migrate_owned_by_second_pass(actions, actor="test", dry_run=True)
+    assert again["already_present"] >= 1
+
+
+async def test_owned_by_second_pass_resolves_a_bare_seat_handle(actions: Actions) -> None:
+    now = datetime.now(UTC)
+    seat = await actions.create_or_find_object("Seat", "seat:gm-owner-handle", "test")
+    await actions.assert_property(seat, "handle", "gm-owner-handle-name", "test", now, 0.9)
+    thread = await actions.create_or_find_object("Thread", "thread:gm-handle-owner", "test")
+    await actions.assert_property(
+        thread, "owner", "gm-owner-handle-name", "test", now, 0.9)
+
+    out = await migrate_owned_by_second_pass(
+        actions, actor="test", dry_run=False, because="test cleanup")
+    assert out["minted_as_handle"] >= 1
+    assert await actions.pool.fetchval(
+        "SELECT 1 FROM links WHERE from_id=$1 AND to_id=$2 AND type='owned_by' "
+        "AND (valid_until IS NULL OR valid_until > now())", thread, seat)
+
+
+async def test_owned_by_second_pass_still_unresolvable_is_counted_not_guessed(
+    actions: Actions,
+) -> None:
+    now = datetime.now(UTC)
+    thread = await actions.create_or_find_object("Thread", "thread:gm-still-ghost", "test")
+    await actions.assert_property(
+        thread, "owner", "gm-no-such-handle-at-all", "test", now, 0.9)
+
+    out = await migrate_owned_by_second_pass(actions, actor="test", dry_run=True)
+    assert out["skipped_unresolvable"] >= 1
+    assert "gm-no-such-handle-at-all" in out["unresolvable_samples"]
+
+
+# --- file_the_residual ---------------------------------------------------------------
+
+
+async def test_file_the_residual_requires_because_to_apply(actions: Actions) -> None:
+    out = await migrate_file_the_residual(actions, actor="test", dry_run=False, because="")
+    assert "error" in out
+
+
+async def test_file_the_residual_files_a_message_via_broadcast_to(actions: Actions) -> None:
+    now = datetime.now(UTC)
+    proj = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gm-residual-broadcast", "test")
+    msg = await actions.create_or_find_object("Message", "message:gm-residual-1", "test")
+    await actions.create_link(msg, proj, "broadcast_to", "test", now, 1.0)
+
+    dry = await migrate_file_the_residual(actions, actor="test", dry_run=True)
+    assert dry["filed"] >= 1
+    assert dry["filed_via_broadcast"] >= 1
+
+    out = await migrate_file_the_residual(
+        actions, actor="test", dry_run=False, because="test cleanup")
+    assert out["filed_via_broadcast"] >= 1
+    project_name = await actions.pool.fetchval(
+        "SELECT value #>> '{}' FROM current_assertions WHERE object_id=$1 AND name='project'",
+        msg)
+    assert project_name == "gm-residual-broadcast"
+
+
+async def test_file_the_residual_falls_back_to_sent_by_agent_project(
+    actions: Actions,
+) -> None:
+    now = datetime.now(UTC)
+    await actions.create_or_find_object("SoftwareProject", "repo:gm-residual-sender", "test")
+    agent = await actions.create_or_find_object("Agent", "agent:gm-residual-sender", "test")
+    await actions.assert_property(agent, "project", "gm-residual-sender", "test", now, 0.9)
+    msg = await actions.create_or_find_object("Message", "message:gm-residual-2", "test")
+    await actions.create_link(msg, agent, "sent_by", "test", now, 1.0)
+
+    out = await migrate_file_the_residual(
+        actions, actor="test", dry_run=False, because="test cleanup")
+    assert out["filed"] >= 1
+    project_name = await actions.pool.fetchval(
+        "SELECT value #>> '{}' FROM current_assertions WHERE object_id=$1 AND name='project'",
+        msg)
+    assert project_name == "gm-residual-sender"
+
+
+async def test_file_the_residual_broadcast_wins_over_sender_disagreement(
+    actions: Actions,
+) -> None:
+    now = datetime.now(UTC)
+    broadcast_proj = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gm-residual-priority", "test")
+    await actions.create_or_find_object(
+        "SoftwareProject", "repo:gm-residual-sender-other", "test")
+    agent = await actions.create_or_find_object(
+        "Agent", "agent:gm-residual-priority-sender", "test")
+    await actions.assert_property(
+        agent, "project", "gm-residual-sender-other", "test", now, 0.9)
+    msg = await actions.create_or_find_object("Message", "message:gm-residual-3", "test")
+    await actions.create_link(msg, broadcast_proj, "broadcast_to", "test", now, 1.0)
+    await actions.create_link(msg, agent, "sent_by", "test", now, 1.0)
+
+    out = await migrate_file_the_residual(
+        actions, actor="test", dry_run=False, because="test cleanup")
+    assert out["filed_via_broadcast"] >= 1
+    project_name = await actions.pool.fetchval(
+        "SELECT value #>> '{}' FROM current_assertions WHERE object_id=$1 AND name='project'",
+        msg)
+    assert project_name == "gm-residual-priority"
+
+
+async def test_file_the_residual_cross_project_dm_ties_and_stays_unfiled(
+    actions: Actions,
+) -> None:
+    now = datetime.now(UTC)
+    await actions.create_or_find_object("SoftwareProject", "repo:gm-residual-tie-a", "test")
+    await actions.create_or_find_object("SoftwareProject", "repo:gm-residual-tie-b", "test")
+    sender = await actions.create_or_find_object(
+        "Agent", "agent:gm-residual-tie-sender", "test")
+    await actions.assert_property(sender, "project", "gm-residual-tie-a", "test", now, 0.9)
+    recipient = await actions.create_or_find_object(
+        "Agent", "agent:gm-residual-tie-recipient", "test")
+    await actions.assert_property(recipient, "project", "gm-residual-tie-b", "test", now, 0.9)
+    msg = await actions.create_or_find_object("Message", "message:gm-residual-tie", "test")
+    await actions.create_link(msg, sender, "sent_by", "test", now, 1.0)
+    await actions.create_link(msg, recipient, "addressed_to", "test", now, 1.0)
+
+    out = await migrate_file_the_residual(actions, actor="test", dry_run=True)
+    tie_entries = [t for t in out["ties_plan"] if t["object"] == str(msg)[:8]]
+    assert len(tie_entries) == 1
+    assert out["still_unfiled"] >= 1
+
+
+async def test_file_the_residual_no_signal_stays_unfiled(actions: Actions) -> None:
+    await actions.create_or_find_object("Message", "message:gm-residual-lonely", "test")
+    out = await migrate_file_the_residual(actions, actor="test", dry_run=True)
+    assert out["filed"] == 0
+    assert out["still_unfiled"] >= 1
+
+
+async def test_file_the_residual_only_touches_messages(actions: Actions) -> None:
+    """SCOPE DELIBERATELY NARROW (docstring): a non-Message residual object is left
+    exactly as `migrate_file_the_unfiled` already reported it -- never guessed at
+    here, even if it happens to carry a broadcast_to-shaped edge."""
+    now = datetime.now(UTC)
+    proj = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gm-residual-non-message", "test")
+    thread = await actions.create_or_find_object(
+        "Thread", "thread:gm-residual-non-message", "test")
+    await actions.create_link(thread, proj, "broadcast_to", "test", now, 1.0)
+
+    out = await migrate_file_the_residual(actions, actor="test", dry_run=True)
+    assert out["scanned"] == 0

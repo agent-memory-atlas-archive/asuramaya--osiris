@@ -62,6 +62,7 @@ behind an argument default is not a declaration.
 from __future__ import annotations
 
 import subprocess
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -355,6 +356,44 @@ async def _normalize_project_label_through_merge(
         return await _live_label(conn_or_pool, winner, row["canonical"]), None
     canon = await conn_or_pool.fetchval("SELECT canonical FROM objects WHERE id=$1", winner)
     return await _live_label(conn_or_pool, winner, canon), None
+
+
+async def resolve_merge_survivors(
+    conn_or_pool: asyncpg.Pool | asyncpg.Connection, ids: set[uuid.UUID],
+) -> dict[uuid.UUID, uuid.UUID]:
+    """MEMBERSHIP FOLLOWS A MERGE (thread 826a1a13): batch id->id resolution through the
+    `merged_into` chain, for a caller that already has real object ids in hand (graph_
+    stream's own project_canonical join, graph_physics' `_project_membership`) rather
+    than a bare project LABEL -- `_normalize_project_label_through_merge`'s own shape,
+    one round trip per label, is the wrong tool at graph-snapshot scale (thousands of
+    member objects resolving down to a small, repeated set of project ids); this does
+    the identical walk (same terminal condition: `merged_into IS NULL`, same cycle
+    refusal) but ONE recursive query for the WHOLE distinct set at once, keyed by id
+    rather than by canonical string.
+
+    Every id in `ids` that resolves cleanly maps to its living survivor id (itself,
+    when never merged). An id caught in a cycle (the walk revisits an id already seen
+    on ITS OWN chain) is DROPPED from the result rather than guessed at — same refusal
+    doctrine as the label-based walk's own confession string, just without a string to
+    carry it (a caller reads a missing key as "unresolved, fall back to the id as
+    given," never as "resolves to nothing"). Empty `ids` is a no-op, no query issued."""
+    if not ids:
+        return {}
+    rows = await conn_or_pool.fetch(
+        "WITH RECURSIVE chain(start_id, current_id, merged_into, depth) AS ( "
+        "  SELECT o.id, o.id, o.merged_into, 0 FROM objects o WHERE o.id = ANY($1::uuid[]) "
+        "  UNION ALL "
+        "  SELECT c.start_id, o.id, o.merged_into, c.depth + 1 "
+        "  FROM objects o JOIN chain c ON o.id = c.merged_into WHERE c.depth < 100"
+        ") "
+        "SELECT start_id, current_id FROM chain WHERE merged_into IS NULL",
+        list(ids))
+    survivors: dict[uuid.UUID, uuid.UUID] = {}
+    for r in rows:
+        # a cycle never reaches merged_into IS NULL within the depth cap, so its
+        # start_id simply never appears above -- dropped, never guessed.
+        survivors.setdefault(r["start_id"], r["current_id"])
+    return survivors
 
 
 async def _declared_charter(pool: asyncpg.Pool, seat_id: str, seat_oid: Any,

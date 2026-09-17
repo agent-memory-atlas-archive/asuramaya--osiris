@@ -184,6 +184,7 @@ from src.orchestrator.graph_layout import (
     _sunflower_point,
     _try_acquire_layout_lock,
 )
+from src.orchestrator.project_identity import resolve_merge_survivors
 
 _CONTAINER_SPRING_WEIGHT = 0.05  # flat, NOT degree-normalised -- "weak gravity", never
                                 # a real spring; small enough that a member's own
@@ -389,7 +390,18 @@ async def _project_membership(actions: Actions) -> dict[uuid.UUID, uuid.UUID]:
     with a project but never actually linked in_repo -- and the OLD in_repo-only
     query laid every one of them out as unfiled fog. in_repo wins when an object
     somehow carries both and they disagree (the assertion is a `dict.setdefault`
-    fallback, never an override)."""
+    fallback, never an override).
+
+    MEMBERSHIP FOLLOWS A MERGE (thread 826a1a13): either source can name a
+    SoftwareProject that has since been folded into a survivor (`status='merged'`,
+    `merged_into` set) -- an in_repo link minted before the fold, or a `project`
+    assertion whose bare name still resolves to the now-merged object's own
+    canonical, neither one rewritten by the fold itself (resolve-on-read, same
+    doctrine as every other merged_into reader in this codebase). Both project_id
+    columns above are resolved through `resolve_merge_survivors` before the union
+    so a member never lands in a district that no longer draws -- an id the
+    resolver can't place (a broken/cyclic chain) passes through unresolved rather
+    than being dropped from membership entirely."""
     rows = await actions.pool.fetch(
         "SELECT DISTINCT ON (l.from_id) l.from_id AS object_id, l.to_id AS project_id "
         "FROM links l WHERE l.type='in_repo' "
@@ -405,6 +417,10 @@ async def _project_membership(actions: Actions) -> dict[uuid.UUID, uuid.UUID]:
         "WHERE a.name='project'")
     for r in assertion_rows:
         membership.setdefault(r["object_id"], r["project_id"])
+
+    survivors = await resolve_merge_survivors(actions.pool, set(membership.values()))
+    for oid, pid in membership.items():
+        membership[oid] = survivors.get(pid, pid)
     return membership
 
 

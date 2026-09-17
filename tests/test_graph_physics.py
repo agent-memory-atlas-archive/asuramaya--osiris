@@ -213,6 +213,44 @@ async def test_project_membership_prefers_in_repo_over_the_assertion_on_disagree
     assert membership.get(member) == proj_a
 
 
+async def test_project_membership_follows_a_merge(actions: Actions) -> None:
+    """MEMBERSHIP FOLLOWS A MERGE (thread 826a1a13): a member's own in_repo link (or
+    `project` assertion) can name a SoftwareProject that has since been folded into a
+    survivor -- neither the link nor the assertion is rewritten by the fold itself
+    (resolve-on-read), so membership must resolve through `merged_into` to land the
+    member in the SURVIVOR's district, never the now-merged dupe's own."""
+    survivor = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gp-merge-survivor", "test")
+    dupe = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gp-merge-dupe", "test")
+    member = await actions.create_or_find_object("Thread", "thread:gp-merge-member", "test")
+    await actions.create_link(member, dupe, "in_repo", "test", datetime.now(UTC), 1.0)
+    await actions.merge_objects(survivor, dupe, "test merge", "test")
+
+    membership = await _project_membership(actions)
+    assert membership.get(member) == survivor
+
+
+async def test_project_membership_follows_a_merge_via_the_project_assertion(
+    actions: Actions,
+) -> None:
+    """The SAME fold, reached through the `project`-assertion fallback instead of a
+    live in_repo link -- an object filed by bare name against a repo that has since
+    been merged away must still resolve to the survivor."""
+    survivor = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gp-merge-survivor-2", "test")
+    dupe = await actions.create_or_find_object(
+        "SoftwareProject", "repo:gp-merge-dupe-2", "test")
+    member = await actions.create_or_find_object(
+        "Thread", "thread:gp-merge-assertion-member", "test")
+    await actions.assert_property(
+        member, "project", "gp-merge-dupe-2", "test", datetime.now(UTC), 1.0)
+    await actions.merge_objects(survivor, dupe, "test merge", "test")
+
+    membership = await _project_membership(actions)
+    assert membership.get(member) == survivor
+
+
 async def test_detect_communities_finds_real_clusters_above_threshold(
     actions: Actions, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
