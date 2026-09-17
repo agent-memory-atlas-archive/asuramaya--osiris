@@ -68,11 +68,23 @@ async def migrate_repo_seats_fix(
     Compensating, never a delete: every Agent whose CURRENT `project` assertion
     reads "seats" is re-stamped to "osiris" (the fleet's own house -- the bare
     container belongs to no ONE seat, so there is no per-seat house to derive,
-    only the shared fleet root); every live works_in/in_repo edge INTO repo:seats
-    is invalidated and re-minted pointing at repo:osiris instead. Once every edge
-    is moved, repo:seats is retired via `projects.retire_project` (a real status
-    flip, never a raw DELETE) -- never before every edge off it is moved, so it is
-    never retired while still load-bearing.
+    only the shared fleet root); every LIVE link INTO repo:seats (any type -- a
+    phantom container's own edges are fixed whatever its status, THOTH'S OWN
+    CORRECTION mail 11448: the original status=='active' gate silently skipped
+    the repair the instant the container drifted out of that one status) is
+    invalidated and re-minted pointing at repo:osiris instead. Retired via
+    `projects.retire_project` (a real status flip, never a raw DELETE) only
+    once every edge off it is moved AND it was not already retired -- calling
+    retire_project on an already-retired object is a wasted, confusing call,
+    not a real repair.
+
+    THE 8,609 FIGURE WAS A DIFFERENT MEASUREMENT (Thoth mail 11449): not edges
+    on repo:seats itself (measured ~95: 57 works_in, 13+5+2 in_repo, 17
+    informs, 1 same_as) but edges between the 54 seats-stamped Agents and
+    OTHER osiris objects, counted cross-district by Seshat's own spike after
+    it folded nearby unfiled messages into repo:seats by nearest centroid --
+    an artifact of that fold, not a defect this migration repairs. Reported
+    read-only, for the record, unchanged by this migration either way.
 
     DRY RUN IS THE DEFAULT. `dry_run=False` REQUIRES a non-blank `because`.
     Idempotent: a repeat call finds no "seats"-stamped agents and no live edges
@@ -97,18 +109,42 @@ async def migrate_repo_seats_fix(
         "SELECT o.id, o.canonical FROM objects o "
         "JOIN current_assertions a ON a.object_id=o.id "
         "WHERE a.name='project' AND a.value #>> '{}' = 'seats' AND o.type='Agent'")
-    edge_rows = (await pool.fetch(
+    # every live link INTO repo:seats, any type -- the container's own status is
+    # never consulted here (Thoth's correction): a phantom's edges are fixed
+    # whatever state the phantom itself is in.
+    edge_rows = await pool.fetch(
         "SELECT l.from_id, l.type, o.type AS from_type "
         "FROM links l JOIN objects o ON o.id=l.from_id "
-        "WHERE l.to_id=$1 AND l.type IN ('works_in','in_repo') "
+        "WHERE l.to_id=$1 "
         "AND (l.valid_until IS NULL OR l.valid_until > now())", seats_id)
-                if seats_status == "active" else [])
+    agent_ids = [r["id"] for r in agent_rows]
+    # READ-ONLY, for the record, never written: live links between the 54
+    # seats-stamped agents and any OTHER object already in osiris (in_repo/
+    # works_in to repo:osiris, or a current project assertion of 'osiris') --
+    # these become same-district the moment the agents above are re-stamped
+    # and need no edge rewrite of their own (Thoth mail 11448).
+    agents_to_osiris_count = 0
+    if agent_ids:
+        agents_to_osiris_count = await pool.fetchval(
+            "SELECT count(*) FROM links l "
+            "WHERE (l.valid_until IS NULL OR l.valid_until > now()) "
+            "AND ((l.from_id = ANY($1::uuid[]) AND ("
+            "    EXISTS (SELECT 1 FROM links l2 WHERE l2.from_id=l.to_id "
+            "      AND l2.to_id=$2 AND l2.type IN ('in_repo','works_in') "
+            "      AND (l2.valid_until IS NULL OR l2.valid_until > now())) "
+            "    OR EXISTS (SELECT 1 FROM current_assertions a WHERE a.object_id=l.to_id "
+            "      AND a.name='project' AND a.value #>> '{}' = 'osiris'))) "
+            "  OR (l.to_id = ANY($1::uuid[]) AND ("
+            "    EXISTS (SELECT 1 FROM links l2 WHERE l2.from_id=l.from_id "
+            "      AND l2.to_id=$2 AND l2.type IN ('in_repo','works_in') "
+            "      AND (l2.valid_until IS NULL OR l2.valid_until > now())) "
+            "    OR EXISTS (SELECT 1 FROM current_assertions a WHERE a.object_id=l.from_id "
+            "      AND a.name='project' AND a.value #>> '{}' = 'osiris'))))",
+            agent_ids, osiris_id)
 
     now = datetime.now(UTC)
     agents_plan = [{"agent": str(r["id"])[:8], "canonical": r["canonical"]} for r in agent_rows]
-    edges_plan = [
-        {"from": str(r["from_id"])[:8], "from_type": r["from_type"], "type": r["type"]}
-        for r in edge_rows]
+    edges_by_type: Counter[str] = Counter(r["type"] for r in edge_rows)
 
     if not dry_run:
         for r in agent_rows:
@@ -128,7 +164,7 @@ async def migrate_repo_seats_fix(
         osiris_seats_edges_after = await pool.fetchval(
             "SELECT count(*) FROM links WHERE to_id=$1 "
             "AND (valid_until IS NULL OR valid_until > now())", seats_id)
-        if osiris_seats_edges_after == 0 and seats_status == "active":
+        if osiris_seats_edges_after == 0 and seats_status != "retired":
             from src.orchestrator.projects import retire_project
 
             result = await retire_project(
@@ -140,60 +176,42 @@ async def migrate_repo_seats_fix(
     return {
         "dry_run": dry_run,
         "agents_scanned": len(agent_rows), "agents_plan": agents_plan,
-        "edges_scanned": len(edge_rows), "edges_plan": edges_plan,
+        "edges_scanned": len(edge_rows), "edges_retired_or_refiled_by_type": dict(edges_by_type),
+        "agents_to_osiris_links_unchanged": agents_to_osiris_count,
         "osiris_seats_edges_after": osiris_seats_edges_after,
+        "seats_status_before": seats_status,
         "retired": retired,
         "because": because if not dry_run else None,
     }
 
 
-async def migrate_file_the_unfiled(
-    actions: Actions, *, actor: str, dry_run: bool = True, because: str | None = None,
+_UNFILED_EXCLUDED_TYPES = ("SoftwareProject", "Person", "Seat")
+_MAX_FILING_PASSES = 10
+
+
+async def _unfiled_pass(
+    pool: asyncpg.Pool, *, already_filed: dict[uuid.UUID, str],
 ) -> dict[str, Any]:
-    """FILE THE UNFILED (DRAWING THE WHOLE GRAPH, thread 325ef660): ~7,300 active,
-    non-SoftwareProject objects carry neither a `project` assertion nor a live
-    in_repo/works_in link -- the physics layout's own "unfiled fog" (THE LONG EDGES
-    RULING, ruling d9c10467), placed only by neighbour-centroid pull today, never
-    actually filed.
-
-    MAJORITY PROJECT OVER DIRECT NEIGHBOURS, ANY LINK TYPE: every live edge touching
-    an unfiled object (either direction, any type -- membership is a vote here, not
-    a spring; THE READING LAYER's structural/semantic split governs the LAYOUT, not
-    this tally) contributes one vote for that neighbour's own project -- itself,
-    when the neighbour IS an active SoftwareProject, else the neighbour's own
-    in_repo/works_in target. TIE OR EMPTY STAYS UNFILED, AND IS COUNTED: a tie
-    between two-or-more top projects, or an unfiled object with no neighbour that
-    resolves to any project at all, is left exactly as it was -- never a guess
-    between equally-supported candidates. Two unfiled objects linked to EACH OTHER
-    cast no vote for one another (neither carries a project to lend); this stays a
-    single hop, never a chained/transitive resolution.
-
-    The winning project asserts as `project` (the bare name, matching every other
-    `project` assertion's own shape in this codebase, e.g. `resolve_and_persist_
-    seated_project`'s), source=`graph_migrations` -- the vote tally itself is the
-    evidence, carried in full in this function's own receipt (`plan`), not a second
-    copy embedded in the assertion row.
-
-    DRY RUN IS THE DEFAULT. `dry_run=False` REQUIRES a non-blank `because`.
-    Idempotent: a repeat call finds no unfiled objects left that this run actually
-    filed (a still-unfiled tie/empty object stays a legitimate candidate for a
-    LATER run, once more links exist to break the tie)."""
-    if not dry_run and not (because or "").strip():
-        return {"error": "migrating without a because is an un-audited repair — cite "
-                         "the evidence/ruling that authorizes it"}
-    pool = actions.pool
+    """One pass of the majority vote, `already_filed` (oid -> project bare name)
+    carrying every object a PRIOR pass in this same run filed -- in a dry run
+    nothing is written, so this is the only way a later pass can see an earlier
+    pass's own result; in a real run the DB read below already reflects it, and
+    `already_filed` just widens the excluded-from-rescan set for objects this
+    run itself already resolved. See `migrate_file_the_unfiled`'s own docstring
+    for the full rule."""
     unfiled_rows = await pool.fetch(
         "SELECT o.id FROM objects o "
         "WHERE o.status NOT IN ('archived','merged','retired') "
-        "AND o.type != 'SoftwareProject' "
+        "AND o.type != ALL($1::text[]) "
         "AND NOT EXISTS (SELECT 1 FROM current_assertions a "
         "  WHERE a.object_id=o.id AND a.name='project') "
         "AND NOT EXISTS (SELECT 1 FROM links l WHERE l.from_id=o.id "
         "  AND l.type IN ('in_repo','works_in') "
-        "  AND (l.valid_until IS NULL OR l.valid_until > now()))")
-    unfiled_ids: set[uuid.UUID] = {r["id"] for r in unfiled_rows}
+        "  AND (l.valid_until IS NULL OR l.valid_until > now()))",
+        list(_UNFILED_EXCLUDED_TYPES))
+    unfiled_ids: set[uuid.UUID] = {r["id"] for r in unfiled_rows if r["id"] not in already_filed}
     if not unfiled_ids:
-        return {"dry_run": dry_run, "scanned": 0}
+        return {"scanned": 0, "filed": {}, "ties": [], "still_unfiled": 0}
 
     neighbour_edge_rows = await pool.fetch(
         "SELECT from_id, to_id FROM links "
@@ -209,74 +227,164 @@ async def migrate_file_the_unfiled(
             neighbours_by_unfiled[t].add(f)
 
     all_neighbour_ids = {n for s in neighbours_by_unfiled.values() for n in s}
-    project_by_neighbour: dict[uuid.UUID, uuid.UUID] = {}
+    project_name_by_neighbour: dict[uuid.UUID, str] = {}
     if all_neighbour_ids:
         sw_rows = await pool.fetch(
-            "SELECT id FROM objects WHERE id = ANY($1::uuid[]) "
+            "SELECT id, canonical FROM objects WHERE id = ANY($1::uuid[]) "
             "AND type='SoftwareProject' AND status='active'", list(all_neighbour_ids))
         for r in sw_rows:
-            project_by_neighbour[r["id"]] = r["id"]
-        remaining = [n for n in all_neighbour_ids if n not in project_by_neighbour]
+            project_name_by_neighbour[r["id"]] = r["canonical"].removeprefix("repo:")
+        remaining = [n for n in all_neighbour_ids if n not in project_name_by_neighbour]
         if remaining:
             link_rows = await pool.fetch(
-                "SELECT l.from_id AS oid, l.to_id AS pid FROM links l "
-                "JOIN objects o ON o.id=l.to_id AND o.type='SoftwareProject' "
-                "  AND o.status='active' "
+                "SELECT l.from_id AS oid, p.canonical AS pcanon FROM links l "
+                "JOIN objects p ON p.id=l.to_id AND p.type='SoftwareProject' "
+                "  AND p.status='active' "
                 "WHERE l.type IN ('in_repo','works_in') AND l.from_id = ANY($1::uuid[]) "
                 "AND (l.valid_until IS NULL OR l.valid_until > now())", remaining)
             for r in link_rows:
-                project_by_neighbour.setdefault(r["oid"], r["pid"])
+                project_name_by_neighbour.setdefault(
+                    r["oid"], r["pcanon"].removeprefix("repo:"))
+            still_remaining = [n for n in remaining if n not in project_name_by_neighbour]
+            if still_remaining:
+                # a neighbour FILED by this same run (a prior pass, real write or
+                # simulated dry-run) or by an earlier live process: its own current
+                # `project` assertion, resolved against an active SoftwareProject's
+                # bare name -- the fixed-point iteration's own load-bearing step,
+                # since a project ASSERTION alone (no in_repo/works_in link) is
+                # exactly the shape this migration itself mints.
+                assertion_rows = await pool.fetch(
+                    "SELECT a.object_id AS oid, a.value #>> '{}' AS pname "
+                    "FROM current_assertions a "
+                    "WHERE a.object_id = ANY($1::uuid[]) AND a.name='project'",
+                    still_remaining)
+                names = {r["pname"] for r in assertion_rows if r["pname"]}
+                active_by_name: dict[str, str] = {}
+                if names:
+                    active_rows = await pool.fetch(
+                        "SELECT canonical FROM objects WHERE type='SoftwareProject' "
+                        "AND status='active' AND canonical = ANY($1::text[])",
+                        [f"repo:{n}" for n in names])
+                    active_by_name = {
+                        r["canonical"].removeprefix("repo:"): r["canonical"]
+                        for r in active_rows}
+                for r in assertion_rows:
+                    pname = r["pname"]
+                    if pname is not None and pname in active_by_name:
+                        project_name_by_neighbour.setdefault(r["oid"], pname)
+    for oid, name in already_filed.items():
+        project_name_by_neighbour.setdefault(oid, name)
 
-    filed: dict[uuid.UUID, uuid.UUID] = {}
+    filed: dict[uuid.UUID, str] = {}
     filed_votes: dict[uuid.UUID, int] = {}
     ties: list[dict[str, Any]] = []
-    still_unfiled: list[str] = []
+    still_unfiled_count = 0
     for oid in unfiled_ids:
-        tally: Counter[uuid.UUID] = Counter()
+        tally: Counter[str] = Counter()
         for n in neighbours_by_unfiled.get(oid, ()):
-            pid = project_by_neighbour.get(n)
-            if pid is not None:
-                tally[pid] += 1
+            neighbour_project = project_name_by_neighbour.get(n)
+            if neighbour_project is not None:
+                tally[neighbour_project] += 1
         if not tally:
-            still_unfiled.append(str(oid)[:8])
+            still_unfiled_count += 1
             continue
         top_count = tally.most_common(1)[0][1]
-        winners = [pid for pid, c in tally.items() if c == top_count]
+        winners = [name for name, c in tally.items() if c == top_count]
         if len(winners) > 1:
             ties.append({
-                "object": str(oid)[:8],
-                "candidates": sorted(str(w)[:8] for w in winners), "votes": top_count})
-            still_unfiled.append(str(oid)[:8])
+                "object": str(oid)[:8], "candidates": sorted(winners), "votes": top_count})
+            still_unfiled_count += 1
             continue
         filed[oid] = winners[0]
         filed_votes[oid] = top_count
 
-    canon_by_pid: dict[uuid.UUID, str] = {}
-    if filed:
-        rows = await pool.fetch(
-            "SELECT id, canonical FROM objects WHERE id = ANY($1::uuid[])",
-            list(set(filed.values())))
-        canon_by_pid = {r["id"]: r["canonical"] for r in rows}
+    return {
+        "scanned": len(unfiled_ids), "filed": filed, "filed_votes": filed_votes,
+        "ties": ties, "still_unfiled": still_unfiled_count,
+    }
 
+
+async def migrate_file_the_unfiled(
+    actions: Actions, *, actor: str, dry_run: bool = True, because: str | None = None,
+) -> dict[str, Any]:
+    """FILE THE UNFILED (DRAWING THE WHOLE GRAPH, thread 325ef660): ~7,300 active,
+    non-SoftwareProject objects carry neither a `project` assertion nor a live
+    in_repo/works_in link -- the physics layout's own "unfiled fog" (THE LONG EDGES
+    RULING, ruling d9c10467), placed only by neighbour-centroid pull today, never
+    actually filed. Person and Seat objects are EXCLUDED from being filed at all
+    (Thoth mail 11448): a global with heavy structural fan-in (a principal, a seat)
+    is a landmark, not a member of whichever district happens to touch it most --
+    filing one would drag an unrelated fan into a single district.
+
+    MAJORITY PROJECT OVER DIRECT NEIGHBOURS, ANY LINK TYPE: every live edge touching
+    an unfiled object (either direction, any type -- membership is a vote here, not
+    a spring; THE READING LAYER's structural/semantic split governs the LAYOUT, not
+    this tally) contributes one vote for that neighbour's own project -- itself,
+    when the neighbour IS an active SoftwareProject, else the neighbour's own
+    in_repo/works_in target, else (a neighbour this migration itself already filed,
+    this run or an earlier one) its own current `project` assertion. TIE OR EMPTY
+    STAYS UNFILED, AND IS COUNTED, EVERY PASS: a tie between two-or-more top
+    projects, or an unfiled object with no neighbour that resolves to any project
+    at all, is left exactly as it was -- never a guess between equally-supported
+    candidates.
+
+    ITERATES TO A FIXED POINT (Thoth mail 11448): a single hop cannot see a
+    project across a whole cluster of mutually-unfiled objects (messages, sub-
+    agents) that only touch a real project through ANOTHER unfiled object -- each
+    pass files what it can, then re-runs the vote over what is STILL unfiled
+    (now able to see the previous pass's own newly-filed neighbours), capped at
+    `_MAX_FILING_PASSES` (10) and stopping the moment a pass files nothing new.
+    Receipt carries one entry per pass plus the summed totals.
+
+    The winning project asserts as `project` (the bare name, matching every other
+    `project` assertion's own shape in this codebase, e.g. `resolve_and_persist_
+    seated_project`'s), source=`graph_migrations` -- the vote tally itself is the
+    evidence, carried in full in this function's own receipt, not a second copy
+    embedded in the assertion row.
+
+    DRY RUN IS THE DEFAULT. `dry_run=False` REQUIRES a non-blank `because`.
+    Idempotent: a repeat call finds no unfiled objects left that this run actually
+    filed (a still-unfiled tie/empty object stays a legitimate candidate for a
+    LATER run, once more links exist to break the tie)."""
+    if not dry_run and not (because or "").strip():
+        return {"error": "migrating without a because is an un-audited repair — cite "
+                         "the evidence/ruling that authorizes it"}
+    pool = actions.pool
     now = datetime.now(UTC)
+    already_filed: dict[uuid.UUID, str] = {}
+    passes: list[dict[str, Any]] = []
     by_project_tally: Counter[str] = Counter()
-    filed_plan: list[dict[str, Any]] = []
-    for oid, pid in filed.items():
-        name = canon_by_pid.get(pid, str(pid)).removeprefix("repo:")
-        by_project_tally[name] += 1
-        filed_plan.append({
-            "object": str(oid)[:8], "project": name, "votes": filed_votes[oid]})
+    all_ties: list[dict[str, Any]] = []
+
+    for pass_num in range(1, _MAX_FILING_PASSES + 1):
+        result = await _unfiled_pass(pool, already_filed=already_filed)
+        scanned = result["scanned"]
+        filed_this_pass: dict[uuid.UUID, str] = result["filed"]
+        if not filed_this_pass:
+            passes.append({
+                "pass": pass_num, "scanned": scanned, "filed": 0,
+                "ties": len(result["ties"]), "still_unfiled": result["still_unfiled"]})
+            all_ties.extend(result["ties"])
+            break
         if not dry_run:
-            await actions.assert_property(
-                oid, "project", name, _SOURCE, now, _CONF, evidence_class=_EC)
+            for oid, name in filed_this_pass.items():
+                await actions.assert_property(
+                    oid, "project", name, _SOURCE, now, _CONF, evidence_class=_EC)
+        for name in filed_this_pass.values():
+            by_project_tally[name] += 1
+        already_filed.update(filed_this_pass)
+        all_ties.extend(result["ties"])
+        passes.append({
+            "pass": pass_num, "scanned": scanned, "filed": len(filed_this_pass),
+            "ties": len(result["ties"]), "still_unfiled": result["still_unfiled"]})
 
     return {
         "dry_run": dry_run,
-        "scanned": len(unfiled_ids),
-        "filed": len(filed), "by_project": dict(by_project_tally),
-        "ties": len(ties), "ties_plan": ties,
-        "still_unfiled": len(still_unfiled),
-        "plan": filed_plan,
+        "passes": len(passes), "pass_detail": passes,
+        "scanned": passes[0]["scanned"] if passes else 0,
+        "filed": len(already_filed), "by_project": dict(by_project_tally),
+        "ties": len(all_ties), "ties_plan": all_ties,
+        "still_unfiled": passes[-1]["still_unfiled"] if passes else 0,
         "because": because if not dry_run else None,
     }
 
@@ -326,15 +434,17 @@ async def _mint_links_from_property(
     actions: Actions, *, subject_type: str, prop_name: str, link_type: str,
     target_type: str | None = None, dry_run: bool, now: datetime,
 ) -> dict[str, int]:
-    """The shared shape behind four of the seven ASSERTION LINKS sub-migrations
-    (owned_by/closed_by/admitted_by/acknowledges) -- the other three (recorded_by,
-    supersedes, vendor_of) each need a real property VALUE, and this reads exactly
-    that: every `subject_type` object's CURRENT `prop_name` assertion's own VALUE,
-    resolved via `_resolve_ref` (optionally narrowed to `target_type`), mints
-    `(subject) -[link_type]-> (target)` unless that exact live edge already exists.
-    recorded_by is NOT this shape -- it needs the assertion ROW's own `source_id`
-    (who wrote it), never its value (what it says); supersedes needs a custom
-    from/to normalisation across two property names; vendor_of's value is a
+    """The shared shape behind two of the six ASSERTION LINKS sub-migrations
+    (closed_by/admitted_by) -- the other four (recorded_by, supersedes, owned_by,
+    vendor_of) each need something this plain shape can't give them, and this
+    reads exactly what IS plain: every `subject_type` object's CURRENT
+    `prop_name` assertion's own VALUE, resolved via `_resolve_ref` (optionally
+    narrowed to `target_type`), mints `(subject) -[link_type]-> (target)` unless
+    that exact live edge already exists. recorded_by is NOT this shape -- it
+    needs the assertion ROW's own `source_id` (who wrote it), never its value
+    (what it says); supersedes needs a custom from/to normalisation across two
+    property names; owned_by needs a second, project-name fallback resolution
+    pass this helper doesn't have; vendor_of's value is a
     free-text name, not a canonical/uuid `_resolve_ref` can read directly. Three
     buckets, never silently merged: minted, skipped_unresolvable (the value no
     longer resolves to a real object), already_present (idempotent re-run)."""
@@ -394,13 +504,20 @@ async def _mint_recorded_by(
 async def migrate_assertion_links(
     actions: Actions, *, actor: str, dry_run: bool = True, because: str | None = None,
 ) -> dict[str, Any]:
-    """ASSERTION LINKS (DRAWING THE WHOLE GRAPH, thread 325ef660): seven property-
+    """ASSERTION LINKS (DRAWING THE WHOLE GRAPH, thread 325ef660): six property-
     pair-to-real-link mints, each idempotent and independently reported (minted /
     skipped_unresolvable / already_present) so a partial resolve rate in one never
-    hides behind another's. `recorded_by`/`owned_by`/`admitted_by`/`acknowledges`/
-    `vendor_of` are STRUCTURAL, `supersedes` SEMANTIC (link_classes.py, this same
-    migration's own tip) -- attribution/membership edges versus a real content
-    claim, the same split every other type in this codebase already sorts by.
+    hides behind another's. `recorded_by`/`owned_by`/`admitted_by`/`vendor_of` are
+    STRUCTURAL, `supersedes` SEMANTIC (link_classes.py, this same migration's own
+    tip) -- attribution/membership edges versus a real content claim, the same
+    split every other type in this codebase already sorts by.
+
+    NOT acknowledges (Thoth mail 11448, "you read it right"): Decision.prior_art_
+    acknowledged's own confirmation ALREADY mints a real edge -- `mint_cites`, via
+    `acknowledge_prior_art`'s own docstring ("PROMOTED FROM A STRING TO A REAL
+    EDGE") -- so a distinct `acknowledges` link would be redundant with an
+    existing `cites` edge for the same fact, not a real gap. Dropped entirely,
+    live-confirmed by the first dry run's own 0-minted/110-skipped result.
 
     recorded_by: every active Decision/Thread's CURRENT `summary` assertion's own
     `source_id` (the agent that actually wrote it), when that source_id resolves to
@@ -416,16 +533,19 @@ async def migrate_assertion_links(
     (A supersedes B mints A->B once, whichever property named it) so a pair
     asserted from either side is never double-counted.
 
-    owned_by: Thread.owner (a Seat or Agent canonical). closed_by: Thread.
-    resolved_in, WHERE MISSING ONLY -- closed_by is an existing, actively-minted
-    link type (`_mint_closed_by` and friends); this only fills the historical gap
-    where the property exists but the link never landed, never a second edge
-    alongside a real one. admitted_by: Thread.admitted_by. acknowledges: Decision.
-    prior_art_acknowledged. vendor_of: Reference.vendor -- the one genuinely fuzzy
-    resolution here (a free-text vendor NAME, not a canonical/uuid), resolved
-    against an active SoftwareProject's own `repo:<name>` canonical; a vendor
-    string that never names a real project abstains, honestly, rather than
-    minting a link to a guess.
+    owned_by: Thread.owner -- a Seat/Agent canonical first, else (Thoth mail
+    11448, "the owner law's legacy shape") a bare active SoftwareProject NAME,
+    never a canonical/uuid; `minted_as_project` breaks out that second path, and
+    `unresolvable_samples` carries up to 20 raw values still left, so the receipt
+    names what a skip actually looks like rather than a bare count. closed_by:
+    Thread.resolved_in, WHERE MISSING ONLY -- closed_by is an existing, actively-
+    minted link type (`_mint_closed_by` and friends); this only fills the
+    historical gap where the property exists but the link never landed, never a
+    second edge alongside a real one. admitted_by: Thread.admitted_by. vendor_of:
+    Reference.vendor -- the one genuinely fuzzy resolution here (a free-text
+    vendor NAME, not a canonical/uuid), resolved against an active SoftwareProject's
+    own `repo:<name>` canonical; a vendor string that never names a real project
+    abstains, honestly, rather than minting a link to a guess.
 
     DRY RUN IS THE DEFAULT. `dry_run=False` REQUIRES a non-blank `because`."""
     if not dry_run and not (because or "").strip():
@@ -433,7 +553,7 @@ async def migrate_assertion_links(
                          "the evidence/ruling that authorizes it"}
     pool = actions.pool
     now = datetime.now(UTC)
-    receipt: dict[str, dict[str, int]] = {}
+    receipt: dict[str, dict[str, Any]] = {}
 
     recorded_by_d = await _mint_recorded_by(actions, subject_type="Decision", now=now,
                                             dry_run=dry_run)
@@ -471,18 +591,53 @@ async def migrate_assertion_links(
         "minted": supersedes_minted, "skipped_unresolvable": supersedes_unresolvable,
         "already_present": supersedes_already}
 
-    receipt["owned_by"] = await _mint_links_from_property(
-        actions, subject_type="Thread", prop_name="owner", link_type="owned_by",
-        dry_run=dry_run, now=now)
+    # owned_by: Thread.owner -- a Seat/Agent canonical first (the generic
+    # resolver), then (Thoth mail 11448, "the owner law's legacy shape") a bare
+    # active SoftwareProject NAME, never a canonical/uuid -- reported separately
+    # (`minted_as_project`) and with a sample of what's still left unresolved so
+    # the receipt names what those values actually look like, not just a count.
+    owner_rows = await pool.fetch(
+        "SELECT o.id AS subject_id, a.value #>> '{}' AS value "
+        "FROM objects o JOIN current_assertions a ON a.object_id=o.id "
+        "WHERE o.type='Thread' AND o.status='active' AND a.name='owner'")
+    owner_minted = owner_minted_as_project = owner_already = 0
+    owner_unresolvable_samples: list[str] = []
+    for r in owner_rows:
+        value = r["value"]
+        target_id = await _resolve_ref(pool, value)
+        via_project = False
+        if target_id is None and value:
+            target_id = await pool.fetchval(
+                "SELECT id FROM objects WHERE canonical=$1 AND type='SoftwareProject' "
+                "AND status='active'", f"repo:{value.strip()}")
+            via_project = target_id is not None
+        if target_id is None:
+            if len(owner_unresolvable_samples) < 20:
+                owner_unresolvable_samples.append(value or "<empty>")
+            continue
+        if await _link_exists(pool, r["subject_id"], target_id, "owned_by"):
+            owner_already += 1
+            continue
+        owner_minted += 1
+        if via_project:
+            owner_minted_as_project += 1
+        if not dry_run:
+            await actions.create_link(
+                r["subject_id"], target_id, "owned_by", _SOURCE, now, _CONF,
+                evidence_class=_EC)
+    receipt["owned_by"] = {
+        "minted": owner_minted, "minted_as_project": owner_minted_as_project,
+        "skipped_unresolvable": len(owner_rows) - owner_minted - owner_already,
+        "already_present": owner_already,
+        "unresolvable_samples": owner_unresolvable_samples,
+    }
+
     receipt["closed_by"] = await _mint_links_from_property(
         actions, subject_type="Thread", prop_name="resolved_in", link_type="closed_by",
         dry_run=dry_run, now=now)
     receipt["admitted_by"] = await _mint_links_from_property(
         actions, subject_type="Thread", prop_name="admitted_by", link_type="admitted_by",
         target_type="Agent", dry_run=dry_run, now=now)
-    receipt["acknowledges"] = await _mint_links_from_property(
-        actions, subject_type="Decision", prop_name="prior_art_acknowledged",
-        link_type="acknowledges", target_type="Decision", dry_run=dry_run, now=now)
 
     # vendor_of -- the one fuzzy resolution: a free-text vendor NAME against an
     # active SoftwareProject's own repo:<name> canonical, never a raw uuid parse

@@ -82,6 +82,62 @@ async def test_repo_seats_fix_refiles_agents_and_edges_then_retires_repo_seats(
     assert again["edges_scanned"] == 0
 
 
+async def test_repo_seats_fix_scans_edges_regardless_of_container_status(
+    actions: Actions,
+) -> None:
+    """THE STATUS-GATE BUG (Thoth mail 11448, found by cross-checking the first dry
+    run against tree_ledger): a phantom container's own edges must be fixed
+    whatever status the container itself is in -- the original gate silently
+    skipped the whole edge repair the instant repo:seats drifted out of
+    status='active', dropping every one of the 54 agents' own re-filed edges from
+    the receipt with no error."""
+    now = datetime.now(UTC)
+    osiris = await actions.create_or_find_object("SoftwareProject", "repo:osiris", "test")
+    seats = await actions.create_or_find_object("SoftwareProject", "repo:seats", "test")
+    await actions.pool.execute(
+        "UPDATE objects SET status='draft' WHERE id=$1", seats)
+    thread = await actions.create_or_find_object("Thread", "thread:gm-seats-draft", "test")
+    await actions.create_link(thread, seats, "in_repo", "test", now, 1.0)
+
+    out = await migrate_repo_seats_fix(actions, actor="test", dry_run=True)
+    assert out["edges_scanned"] == 1
+    assert out["seats_status_before"] == "draft"
+    assert out["edges_retired_or_refiled_by_type"] == {"in_repo": 1}
+
+    applied = await migrate_repo_seats_fix(
+        actions, actor="test", dry_run=False, because="test cleanup")
+    assert applied["edges_scanned"] == 1
+    now2 = datetime.now(UTC)
+    assert await actions.pool.fetchval(
+        "SELECT 1 FROM links WHERE from_id=$1 AND to_id=$2 AND type='in_repo' "
+        "AND (valid_until IS NULL OR valid_until > $3)", thread, osiris, now2)
+    # retire_project itself refuses a non-'active' status -- draft never became
+    # active here, so the attempt is reported honestly, not silently dropped.
+    assert applied["retired"] is not None
+
+
+async def test_repo_seats_fix_reports_the_unchanged_agent_to_osiris_link_count(
+    actions: Actions,
+) -> None:
+    """Read-only, for the record (Thoth mail 11448): a live link between a
+    seats-stamped agent and an object already in osiris becomes same-district
+    the moment the agent is re-stamped -- it needs no edge rewrite of its own,
+    but the receipt still names how many there are."""
+    now = datetime.now(UTC)
+    await actions.create_or_find_object("SoftwareProject", "repo:osiris", "test")
+    seats = await actions.create_or_find_object("SoftwareProject", "repo:seats", "test")
+    agent = await actions.create_or_find_object("Agent", "agent:gm-seats-osiris-link", "test")
+    await actions.assert_property(agent, "project", "seats", "test", now, 0.9)
+    await actions.create_link(agent, seats, "works_in", "test", now, 1.0)
+    osiris_member = await actions.create_or_find_object(
+        "Thread", "thread:gm-osiris-member", "test")
+    await actions.assert_property(osiris_member, "project", "osiris", "test", now, 0.9)
+    await actions.create_link(agent, osiris_member, "cites", "test", now, 1.0)
+
+    out = await migrate_repo_seats_fix(actions, actor="test", dry_run=True)
+    assert out["agents_to_osiris_links_unchanged"] >= 1
+
+
 # --- file_the_unfiled --------------------------------------------------------------
 
 
@@ -94,7 +150,7 @@ async def test_file_the_unfiled_majority_vote_files_the_object(actions: Actions)
     await actions.create_link(unfiled, filed_member, "cites", "test", now, 1.0)
 
     dry = await migrate_file_the_unfiled(actions, actor="test", dry_run=True)
-    assert any(p["object"] == str(unfiled)[:8] for p in dry["plan"])
+    assert dry["filed"] >= 1
 
     out = await migrate_file_the_unfiled(
         actions, actor="test", dry_run=False, because="test cleanup")
@@ -120,10 +176,56 @@ async def test_file_the_unfiled_tie_stays_unfiled_and_is_counted(actions: Action
 
 
 async def test_file_the_unfiled_no_neighbour_project_stays_unfiled(actions: Actions) -> None:
-    unfiled = await actions.create_or_find_object("Thread", "thread:gm-lonely", "test")
+    await actions.create_or_find_object("Thread", "thread:gm-lonely", "test")
     out = await migrate_file_the_unfiled(actions, actor="test", dry_run=True)
-    assert str(unfiled)[:8] not in [p["object"] for p in out["plan"]]
+    assert out["filed"] == 0
     assert out["still_unfiled"] >= 1
+
+
+async def test_file_the_unfiled_iterates_to_a_fixed_point(actions: Actions) -> None:
+    """THE FIXED-POINT FIX (Thoth mail 11448): a whole cluster of mutually-unfiled
+    objects only touches a real project through ANOTHER unfiled object -- a
+    single pass cannot see across two hops, but a second pass (now able to see
+    the first pass's own newly-filed neighbour) can."""
+    now = datetime.now(UTC)
+    proj = await actions.create_or_find_object("SoftwareProject", "repo:gm-chain", "test")
+    member = await actions.create_or_find_object("Thread", "thread:gm-chain-member", "test")
+    await actions.create_link(member, proj, "in_repo", "test", now, 1.0)
+    hop1 = await actions.create_or_find_object("Thread", "thread:gm-chain-hop1", "test")
+    await actions.create_link(hop1, member, "cites", "test", now, 1.0)
+    hop2 = await actions.create_or_find_object("Thread", "thread:gm-chain-hop2", "test")
+    await actions.create_link(hop2, hop1, "cites", "test", now, 1.0)
+
+    out = await migrate_file_the_unfiled(
+        actions, actor="test", dry_run=False, because="test cleanup")
+    assert out["passes"] >= 2
+    hop2_project = await actions.pool.fetchval(
+        "SELECT value #>> '{}' FROM current_assertions WHERE object_id=$1 AND name='project'",
+        hop2)
+    assert hop2_project == "gm-chain"
+
+
+async def test_file_the_unfiled_excludes_person_and_seat_from_filing(actions: Actions) -> None:
+    """Thoth mail 11448: a global with heavy structural fan-in (a principal, a
+    seat) is a landmark, not a member of whatever district it happens to touch
+    most -- Person/Seat objects are never filed, even when they'd otherwise win
+    a clean majority vote."""
+    now = datetime.now(UTC)
+    proj = await actions.create_or_find_object("SoftwareProject", "repo:gm-landmark", "test")
+    member = await actions.create_or_find_object("Thread", "thread:gm-landmark-member", "test")
+    await actions.create_link(member, proj, "in_repo", "test", now, 1.0)
+    person = await actions.create_or_find_object("Person", "person:gm-landmark-person", "test")
+    await actions.create_link(person, member, "cites", "test", now, 1.0)
+    seat = await actions.create_or_find_object("Seat", "seat:gm-landmark-seat", "test")
+    await actions.create_link(seat, member, "cites", "test", now, 1.0)
+
+    await migrate_file_the_unfiled(actions, actor="test", dry_run=False, because="test cleanup")
+    person_project = await actions.pool.fetchval(
+        "SELECT 1 FROM current_assertions WHERE object_id=$1 AND name='project'", person)
+    seat_project = await actions.pool.fetchval(
+        "SELECT 1 FROM current_assertions WHERE object_id=$1 AND name='project'", seat)
+    assert person_project is None
+    assert seat_project is None
 
 
 # --- assertion_links -----------------------------------------------------------------
@@ -218,3 +320,31 @@ async def test_assertion_links_unresolvable_source_is_skipped_not_guessed(
 
     out = await migrate_assertion_links(actions, actor="test", dry_run=True)
     assert out["receipt"]["owned_by"]["skipped_unresolvable"] >= 1
+    assert "seat:gm-no-such-seat" in out["receipt"]["owned_by"]["unresolvable_samples"]
+
+
+async def test_assertion_links_acknowledges_was_dropped(actions: Actions) -> None:
+    """Thoth mail 11448, "you read it right": the confirmation already mints a
+    real `cites` edge (acknowledge_prior_art's own docstring) -- a distinct
+    acknowledges link would be redundant, dropped from the migration entirely."""
+    out = await migrate_assertion_links(actions, actor="test", dry_run=True)
+    assert "acknowledges" not in out["receipt"]
+
+
+async def test_assertion_links_owned_by_falls_back_to_a_project_name(
+    actions: Actions,
+) -> None:
+    """Thoth mail 11448, "the owner law's legacy shape": a Thread.owner value
+    that never resolves as a Seat/Agent canonical is tried against an active
+    SoftwareProject's own bare name before it's given up as unresolvable."""
+    now = datetime.now(UTC)
+    proj = await actions.create_or_find_object("SoftwareProject", "repo:gm-owner-proj", "test")
+    thread = await actions.create_or_find_object("Thread", "thread:gm-project-owner", "test")
+    await actions.assert_property(thread, "owner", "gm-owner-proj", "test", now, 0.9)
+
+    out = await migrate_assertion_links(
+        actions, actor="test", dry_run=False, because="test cleanup")
+    assert out["receipt"]["owned_by"]["minted_as_project"] >= 1
+    assert await actions.pool.fetchval(
+        "SELECT 1 FROM links WHERE from_id=$1 AND to_id=$2 AND type='owned_by' "
+        "AND (valid_until IS NULL OR valid_until > now())", thread, proj)
