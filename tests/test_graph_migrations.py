@@ -415,6 +415,30 @@ async def test_owned_by_second_pass_resolves_operator_to_the_principal(
     assert again["already_present"] >= 1
 
 
+async def test_owned_by_second_pass_resolves_a_raw_seat_canonical(actions: Actions) -> None:
+    """Thoth mail 11567, the live catch: the first cut's own docstring claimed it
+    re-tried the plain canonical resolve, but the code never did -- a value that is
+    ALREADY a live, active Seat canonical (never a bare handle name) must resolve
+    directly, not fall through to the handle lookup (which would fail: a full
+    canonical is never itself a `handle` assertion's own value)."""
+    now = datetime.now(UTC)
+    seat = await actions.create_or_find_object("Seat", "seat:gm-owner-canonical", "test")
+    thread = await actions.create_or_find_object("Thread", "thread:gm-canonical-owner", "test")
+    await actions.assert_property(
+        thread, "owner", "seat:gm-owner-canonical", "test", now, 0.9)
+
+    dry = await migrate_owned_by_second_pass(actions, actor="test", dry_run=True)
+    assert dry["minted"] >= 1
+    assert dry["minted_as_canonical"] >= 1
+
+    out = await migrate_owned_by_second_pass(
+        actions, actor="test", dry_run=False, because="test cleanup")
+    assert out["minted_as_canonical"] >= 1
+    assert await actions.pool.fetchval(
+        "SELECT 1 FROM links WHERE from_id=$1 AND to_id=$2 AND type='owned_by' "
+        "AND (valid_until IS NULL OR valid_until > now())", thread, seat)
+
+
 async def test_owned_by_second_pass_resolves_a_bare_seat_handle(actions: Actions) -> None:
     now = datetime.now(UTC)
     seat = await actions.create_or_find_object("Seat", "seat:gm-owner-handle", "test")
