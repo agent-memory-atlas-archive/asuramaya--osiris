@@ -175,6 +175,10 @@ _LEADING_ALPHA_RE = re.compile(r"[A-Za-z]+")
 # already-complete generation+ordinal, so nothing is appended twice.
 _PATRONYM_COMPOUND_RE = re.compile(r"^(.+) ([IVXLCDM]+)\.(\d+)$")
 
+# the trailing sidechain-fork marker `_agent_identity_labels` appends (module
+# docstring, " ⌊ sub" marker) -- `_short_label`'s own truncation must never clip it.
+_SUB_SUFFIX_RE = re.compile(r" ⌊ sub$")
+
 
 def _short_label(
     type_name: str, canonical: str, handle: str | None, name: str | None,
@@ -227,7 +231,16 @@ def _short_label(
     else:
         label = f"{type_name} {canonical}"
     if len(label) > _LABEL_MAX_CHARS:
-        label = label[:_LABEL_MAX_CHARS - 1] + "…"
+        # AGENT LABEL COSMETICS (thread 065031d1, Thoth DM 11536): a hard slice at
+        # _LABEL_MAX_CHARS could land inside (or just past) a trailing sidechain
+        # marker (" ⌊ sub"), clipping it into unreadable noise -- truncate the
+        # STEM/MODEL body, never the marker itself. The marker is short and fixed
+        # (6 chars), so this trades a few characters over the nominal ceiling in
+        # the sidechain case for a marker that always reads whole.
+        m = _SUB_SUFFIX_RE.search(label)
+        suffix = m.group(0) if m else ""
+        body = label[:len(label) - len(suffix)] if suffix else label
+        label = body[:_LABEL_MAX_CHARS - len(suffix) - 1] + "…" + suffix
     return label
 
 
@@ -341,6 +354,19 @@ def _model_short(model: str) -> str:
     return model.removeprefix("claude-")
 
 
+def _display_stem(stem: str) -> str:
+    """AGENT LABEL COSMETICS (thread 065031d1, Thoth DM 11536): a seat's own `handle`
+    assertion is stored in whatever casing it was first claimed with -- 'thoth',
+    'sekhmet' -- next to a patronym-derived stem, which is always already correctly
+    cased ('Khnum'), producing a visibly inconsistent header ('thoth CVII' beside
+    'Khnum LXXII'). `str.islower()` is true only when the string has at least one
+    cased character and none of them are uppercase, so a stem with no letters at all
+    (never happens for a real handle, but a defensive case) or one already carrying
+    any capital passes through untouched -- this only ever capitalises the single
+    all-lowercase shape that actually needs it."""
+    return stem[0].upper() + stem[1:] if stem.islower() else stem
+
+
 async def _agent_identity_labels(
     pool: asyncpg.Pool, rows: list[asyncpg.Record],
 ) -> dict[uuid.UUID, str]:
@@ -443,7 +469,8 @@ async def _agent_identity_labels(
             # used to omit the roman suffix entirely, so a first-generation
             # seat-holder read as a bare handle indistinguishable from the old
             # bypass this whole arc exists to kill -- show "I" rather than drop it.
-            out[oid] = f"{seat['handle']} {_roman_display(gen)}{model_suffix}{sub_suffix}"
+            out[oid] = (f"{_display_stem(seat['handle'])} {_roman_display(gen)}"
+                       f"{model_suffix}{sub_suffix}")
             continue
         # STOP PATTERN-MATCHING NAME STRINGS (Thoth mail 11334): the `name`
         # assertion is never read here at all any more -- see the module-level
@@ -472,7 +499,13 @@ async def _agent_identity_labels(
             # as the seat branch above -- "I" for generation 1, never a bare stem.
             gen = _generation(canonical)[1]
             gen_display = _roman_display(gen)
-        out[oid] = f"{stem} {gen_display}{model_suffix}{sub_suffix}"
+        # AGENT LABEL COSMETICS (thread 065031d1, Thoth DM 11536): applied ONCE here,
+        # after both the compound-patronym and the raw_patronym/handle-fallback
+        # branches above have resolved `stem` -- a compound patronym like "alfred
+        # I.1" carries its own inherited casing from a lowercase-handled parent
+        # (patronym_for stamps the PARENT's own display stem verbatim), the same
+        # defect as the seat branch's raw handle, just one hop removed.
+        out[oid] = f"{_display_stem(stem)} {gen_display}{model_suffix}{sub_suffix}"
     return out
 
 

@@ -152,6 +152,35 @@ VENV_BIN = Path(sys.executable).parent
 _PYTEST_FANOUT_CAP = 12
 _PYTEST_TIMEOUT_SECS = 180
 
+# THE gate_hook CORRELATION GAP (thread 01c08600, Thoth DM 11536, WAVE 26 item 3): a
+# repo-wide static-scanner test (an AST/text walk over every file under src/ or tests/,
+# checking a house-wide invariant rather than exercising one module's logic) never
+# `import`s the specific module it might catch a regression in -- resolve_test_files'
+# own import-based correlation can never associate ANY changed file with it, no matter
+# what changed, so a regression one of these exists to catch can land past this gate
+# entirely. LIVE SPECIMEN: w314's cli.py change (a new unmarked subprocess-shaped call,
+# tests/test_unbounded_wait.py's own job to catch) shipped ungated because that file was
+# never in the resolved set for a cli.py-only diff. Always included, unconditionally,
+# regardless of what changed_files names -- correlation-proof by construction, since
+# "the whole repo" is already the file set each one scans; disclosed in the receipt
+# (`run_gates`'s own `always_included` note) rather than silently folded into the normal
+# resolved set, so a reader can tell "ran because it was touched" from "ran because it
+# always does." CHEAP by construction: five of the six are pure/sync with no DB fixture
+# at all (measured: zero `actions: Actions`/`async def` in any of them); the sixth,
+# test_actions.py, is mostly ordinary DB-backed Actions unit tests -- only its own
+# single static-scan function (`test_static_check_only_two_sites_write_the_supersedes_
+# column`) is the repo-wide scanner this belongs here for, so it's named by NODE ID, not
+# by whole file, to avoid dragging in the other 25 tests' own DB fixture cost on every
+# commit regardless of relevance.
+_ALWAYS_INCLUDED_STATIC_SCANNERS: frozenset[str] = frozenset({
+    "tests/test_unbounded_wait.py",
+    "tests/test_link_classes.py",
+    "tests/test_render_hygiene.py",
+    "tests/test_sql_hygiene.py",
+    "tests/test_inbox_catalog.py",
+    "tests/test_actions.py::test_static_check_only_two_sites_write_the_supersedes_column",
+})
+
 # THE INSTRUMENT FIX (Thoth's ruling, mail 9017, after three consecutive TIMED-OUT-TWICE
 # refusals on a genuinely clean commit under a measured 1-minute load of 15-32): a FIXED
 # 180s twice measures the box, not the code, once the host is under real multi-agent
@@ -615,7 +644,29 @@ def run_gates(repo_root: Path, changed_files: list[str]) -> dict[str, tuple[bool
                    f"{_PYTEST_FANOUT_CAP}): [{' '.join(sorted(fixture_only))}]")
     else:
         selected |= fixture_only
+    # THE gate_hook CORRELATION GAP (thread 01c08600, Thoth DM 11536, WAVE 26 item 3):
+    # added unconditionally, regardless of what changed_files resolved to -- see
+    # _ALWAYS_INCLUDED_STATIC_SCANNERS' own module-level docstring. GATED ON THE FILE
+    # ACTUALLY EXISTING under repo_root (not the raw constant): this module's own test
+    # suite calls run_gates against synthetic tmp_path trees that never have these real
+    # files, and this repo's own convention here is "pure, IO-only via tmp_path, no
+    # subprocess" (test_gate_hook.py's own docstring) -- an existence check keeps that
+    # true rather than forcing a real, unmockable pytest subprocess into every isolated
+    # test of this function. The same check also means a future rename/deletion of one
+    # of these files degrades to "silently stops being forced" rather than "gate_hook
+    # crashes on a path that no longer exists." `always_included` names only the ones
+    # NOT already reached by ordinary correlation, so the receipt can distinguish "ran
+    # because it was touched" from "ran because it always does."
+    existing_scanners = {
+        s for s in _ALWAYS_INCLUDED_STATIC_SCANNERS
+        if (repo_root / s.split("::", 1)[0]).is_file()
+    }
+    always_included = sorted(existing_scanners - selected)
+    selected |= existing_scanners
     if not selected:
+        # Unreachable while _ALWAYS_INCLUDED_STATIC_SCANNERS stays non-empty (every commit
+        # now resolves at least those) — kept as the honest fallback message for the one
+        # way it could still fire: that constant emptied out from under this function.
         results["pytest"] = (
             True, f"SKIPPED — nothing ran; omitted {omitted}" if omitted
             else "no resolvable test files touched")
@@ -781,6 +832,17 @@ def run_gates(repo_root: Path, changed_files: list[str]) -> dict[str, tuple[bool
                 f"immediate retry (tolerance exhausted, f1f8ad62) under real ambient fleet "
                 f"load (not a proven code failure -- see the DB-contention negative "
                 f"control) [{' '.join(test_files)}]{tail}")
+    # THE gate_hook CORRELATION GAP (thread 01c08600, Thoth DM 11536): disclosed on
+    # every path through the block above, uniformly, rather than threaded into each
+    # branch's own message individually -- a reader must always be able to tell "ran
+    # because it was touched" from "ran because it always does," on a pass, a skip, a
+    # timeout, or a refusal alike.
+    if always_included and "pytest" in results:
+        ok_prev, msg_prev = results["pytest"]
+        results["pytest"] = (
+            ok_prev,
+            f"{msg_prev}\n[always-included static scanner(s), never correlated by "
+            f"changed_files, thread 01c08600: {' '.join(always_included)}]")
     return results
 
 

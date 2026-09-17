@@ -197,6 +197,19 @@ def test_short_label_hard_truncates_at_40_chars_with_an_ellipsis() -> None:
     assert label.endswith("…")
 
 
+def test_short_label_truncation_never_clips_the_sidechain_marker() -> None:
+    """AGENT LABEL COSMETICS (thread 065031d1, Thoth DM 11536): a hard slice at 40
+    chars used to be able to land inside (or just past) the trailing ' ⌊ sub'
+    marker, producing unreadable noise like ' ⌊ su…' or dropping it outright --
+    the marker must always survive whole, even if that means the label runs a
+    few characters past the nominal ceiling."""
+    long_fallback = "x" * 45 + " ⌊ sub"
+    label = _short_label("Agent", "agent:deadbeef-g1", None, None, None,
+                         agent_fallback=long_fallback)
+    assert label.endswith(" ⌊ sub")
+    assert "…" in label
+
+
 # --- DB-backed: fetch_snapshot ---------------------------------------------------------
 
 
@@ -434,6 +447,44 @@ async def test_fetch_snapshot_seat_holder_label_folds_in_the_model_suffix(
     assert out["labels"][idx] == "Seshat LXV · haiku-4-5"
 
 
+async def test_fetch_snapshot_seat_holder_label_capitalises_a_lowercase_handle(
+    actions: Actions,
+) -> None:
+    """AGENT LABEL COSMETICS (thread 065031d1, Thoth DM 11536): a seat's own `handle`
+    assertion is stored in whatever casing it was first claimed with ('thoth' next
+    to 'Khnum') -- the seat branch must display-case an all-lowercase one so the
+    header never shows 'thoth CVII' beside 'Khnum LXXII'."""
+    now = datetime.now(UTC)
+    seat = await actions.create_or_find_object("Seat", "seat:gs-seat-lowercase", "test")
+    await actions.assert_property(seat, "handle", "thoth", "test", now, 0.9)
+    agent = await actions.create_or_find_object("Agent", "agent:gs-seat-lowercase-holder", "test")
+    await actions.assert_property(agent, "seat_generation", "107", "test", now, 0.9)
+    await actions.create_link(agent, seat, "holds", "test", now, 1.0)
+
+    await layout_batch(actions, limit=1000)
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    idx = out["object_ids"].index(str(agent))
+    assert out["labels"][idx] == "Thoth CVII"
+
+
+async def test_fetch_snapshot_seat_holder_label_leaves_mixed_case_handle_untouched(
+    actions: Actions,
+) -> None:
+    """The capitalisation fix must never touch an already-cased handle ('Khnum') --
+    only the all-lowercase shape."""
+    now = datetime.now(UTC)
+    seat = await actions.create_or_find_object("Seat", "seat:gs-seat-mixed-case", "test")
+    await actions.assert_property(seat, "handle", "Khnum", "test", now, 0.9)
+    agent = await actions.create_or_find_object("Agent", "agent:gs-seat-mixed-case-holder", "test")
+    await actions.assert_property(agent, "seat_generation", "72", "test", now, 0.9)
+    await actions.create_link(agent, seat, "holds", "test", now, 1.0)
+
+    await layout_batch(actions, limit=1000)
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    idx = out["object_ids"].index(str(agent))
+    assert out["labels"][idx] == "Khnum LXXII"
+
+
 async def test_fetch_snapshot_seat_succession_canonical_reads_the_real_generation(
     actions: Actions,
 ) -> None:
@@ -582,7 +633,11 @@ async def test_fetch_snapshot_agent_handle_stripped_to_its_leading_alphabetic_ru
     """Thoth mail 11334, the "thoth G58" specimen: a legacy/malformed `handle`
     assertion carrying trailing noise past the real name must not seed the
     stem verbatim -- only its own leading alphabetic run, the "stripped to
-    letters" rule from the structural label formula."""
+    letters" rule from the structural label formula. AGENT LABEL COSMETICS
+    (thread 065031d1, Thoth DM 11536): that stripped stem is also DISPLAY-CASED
+    now ('thoth' -> 'Thoth') -- a raw handle's own storage casing must never
+    read differently from a patronym-derived stem, which is always correct
+    case already."""
     now = datetime.now(UTC)
     agent = await actions.create_or_find_object("Agent", "agent:gs-handle-noise", "test")
     await actions.assert_property(agent, "handle", "thoth G58", "test", now, 0.9)
@@ -591,7 +646,7 @@ async def test_fetch_snapshot_agent_handle_stripped_to_its_leading_alphabetic_ru
     out = decode_snapshot(await fetch_snapshot(actions.pool))
     idx = out["object_ids"].index(str(agent))
     label = out["labels"][idx]
-    assert re.match(r"^thoth [IVXLCDM]+$", label), label
+    assert re.match(r"^Thoth [IVXLCDM]+$", label), label
 
 
 async def test_fetch_snapshot_compound_patronym_never_gets_a_second_numeral(
@@ -616,6 +671,26 @@ async def test_fetch_snapshot_compound_patronym_never_gets_a_second_numeral(
     out = decode_snapshot(await fetch_snapshot(actions.pool))
     idx = out["object_ids"].index(str(agent))
     assert out["labels"][idx] == "Thoth I.1 · haiku-4-5-20251001 ⌊ sub"
+
+
+async def test_fetch_snapshot_compound_patronym_capitalises_a_lowercase_stem(
+    actions: Actions,
+) -> None:
+    """AGENT LABEL COSMETICS (thread 065031d1, Thoth DM 11536), the live specimen
+    (2,747 agents): `patronym_for` stamps a spawned child's compound patronym with
+    the PARENT's own stem verbatim, so a parent claimed under a lowercase seat
+    handle ('alfred') produces a compound like 'alfred I.1' for every one of its
+    children too -- one hop removed from the seat branch's own casing bug, same
+    fix applies."""
+    now = datetime.now(UTC)
+    agent = await actions.create_or_find_object(
+        "Agent", "agent:gs-compound-patronym-lowercase", "test")
+    await actions.assert_property(agent, "patronym", "alfred I.1", "test", now, 0.9)
+
+    await layout_batch(actions, limit=1000)
+    out = decode_snapshot(await fetch_snapshot(actions.pool))
+    idx = out["object_ids"].index(str(agent))
+    assert out["labels"][idx] == "Alfred I.1"
 
 
 async def test_fetch_snapshot_edge_weight_is_raw_flat_for_now(actions: Actions) -> None:

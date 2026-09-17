@@ -847,7 +847,24 @@ async def test_lifespan_binds_even_when_triggers_is_exclusively_locked(
     Proved at the REAL lifespan protocol, same law test_lifespan_seeds_the_type_
     catalog_on_boot already holds — and against a lock even STRONGER than a pg_dump
     would ever take (ACCESS EXCLUSIVE, held open in a second connection for the whole
-    test), so this can never pass by accident of a lock too weak to matter."""
+    test), so this can never pass by accident of a lock too weak to matter.
+
+    THE TIMING DEPENDENCY (WAVE 26 item 2, thread 01c08600, Thoth DM 11536): this
+    failed a full gate under load and passed alone with a 10s bound. The lock itself
+    was never the risk — project_triggers' own `SET LOCAL lock_timeout = '2s'` bounds
+    THAT wait tightly regardless of ambient load. The lifespan does real work BEFORE
+    ever reaching the locked call, none of it bounded by anything but this test's own
+    outer timeout: a fresh `create_pool` (real connections), `seed_catalog` upserting
+    the whole declared Type catalog (~150+ objects, each its own find-or-create plus
+    several `assert_property` writes), and `create_arq_pool` (a real Redis
+    handshake) — every one of them a real DB/Redis round trip that a quiet box clears
+    in well under a second but that genuine `-n4` full-suite contention (many other
+    workers hammering the SAME shared testcontainer Postgres/Redis) can measurably
+    slow down. A 10s ceiling left those steps almost no margin once the 2s lock wait
+    is added on top. Bounded to 60s instead — a longer wait bound that is still
+    bounded, not a skip: a real infinite hang (the one incident this test exists to
+    catch) still fails it, just with realistic headroom for contention that was never
+    the bug."""
     import asyncio
     import os
     import time
@@ -862,11 +879,11 @@ async def test_lifespan_binds_even_when_triggers_is_exclusively_locked(
     try:
         app = create_app()  # own pool: exercises the exact lifespan a real boot runs
         started = time.monotonic()
-        async with asyncio.timeout(10):
+        async with asyncio.timeout(60):
             async with app.router.lifespan_context(app):
                 pass
         elapsed = time.monotonic() - started
-        assert elapsed < 10  # comfortably inside project_triggers' own 2s lock_timeout
+        assert elapsed < 60  # comfortably inside project_triggers' own 2s lock_timeout
     finally:
         await tr.rollback()
         await actions.pool.release(conn)
