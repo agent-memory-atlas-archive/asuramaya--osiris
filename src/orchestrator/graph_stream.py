@@ -291,6 +291,8 @@ def encode_snapshot(
     type_aggregates: list[dict[str, Any]] | None = None,
     cluster_edges: list[dict[str, Any]] | None = None,
     type_pair_edges: list[dict[str, Any]] | None = None,
+    community_code: list[int] | None = None,
+    communities: list[dict[str, Any]] | None = None,
 ) -> bytes:
     """Pure function, no DB: builds the exact wire bytes from already-resolved
     columns -- the DB-facing half (`fetch_snapshot`) is the only caller that ever
@@ -319,6 +321,10 @@ def encode_snapshot(
             f"{len(edge_types)} (len(edge_types))")
     if len(labels) != count:
         raise ValueError(f"labels has {len(labels)} entries, expected {count} (count)")
+    community_code = community_code if community_code is not None else [0] * count
+    if len(community_code) != count:
+        raise ValueError(
+            f"community_code has {len(community_code)} entries, expected {count} (count)")
     body = bytearray()
     offsets: dict[str, dict[str, int | str]] = {}
     for name, code in _ARRAY_ORDER:
@@ -336,6 +342,8 @@ def encode_snapshot(
         "type_aggregates": type_aggregates or [],
         "cluster_edges": cluster_edges or [],
         "type_pair_edges": type_pair_edges or [],
+        "community_code": community_code,
+        "communities": communities or [],
         "arrays": offsets,
     }
     header_bytes = json.dumps(header).encode()
@@ -353,7 +361,8 @@ def decode_snapshot(data: bytes) -> dict[str, Any]:
         k: header[k] for k in
         ("schema_version", "count", "edge_count", "types", "projects", "edge_types",
          "link_type_class", "object_ids", "labels", "watermark",
-         "project_aggregates", "type_aggregates", "cluster_edges", "type_pair_edges")
+         "project_aggregates", "type_aggregates", "cluster_edges", "type_pair_edges",
+         "community_code", "communities")
     }
     for name, meta in header["arrays"].items():
         code = str(meta["dtype"])
@@ -603,6 +612,8 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
     statuses: list[int] = []
     labels: list[str] = []
     created_ats: list[float] = []
+    project_membership: dict[uuid.UUID, uuid.UUID] = {}
+    project_uuid_to_code: dict[uuid.UUID, int] = {}
 
     for i, r in enumerate(rows):
         oid = r["id"]
@@ -614,18 +625,23 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
         project_obj_id = r["project_obj_id"]
         resolved_id = survivors.get(project_obj_id, project_obj_id) if project_obj_id else None
         project_key = canonical_by_id.get(resolved_id, "unfiled") if resolved_id else "unfiled"
-        project_codes.append(project_index.setdefault(project_key, len(project_index)))
+        pcode = project_index.setdefault(project_key, len(project_index))
+        project_codes.append(pcode)
         weights.append(float(weight_by_id.get(oid, 0)))
         statuses.append(STATUS_CONTESTED if r["contested"] else 0)
         labels.append(_short_label(
             r["type"], r["canonical"], r["handle"], r["name"], r["title"],
             agent_fallback=agent_fallback_by_id.get(oid)))
         created_ats.append(r["created_at"].timestamp() if r["created_at"] else 0.0)
+        if resolved_id is not None:
+            project_membership[oid] = resolved_id
+            project_uuid_to_code.setdefault(resolved_id, pcode)
 
     edge_src: list[int] = []
     edge_dst: list[int] = []
     edge_type_codes: list[int] = []
     edge_type_index: dict[str, int] = {}
+    edge_rows: list[asyncpg.Record] = []
     if id_index:
         edge_rows = await pool.fetch(
             "SELECT from_id, to_id, type FROM links "
@@ -640,6 +656,47 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
             edge_dst.append(id_index[t])
             edge_type_codes.append(
                 edge_type_index.setdefault(r["type"], len(edge_type_index)))
+
+    # COMMUNITY CODE (Thoth mail 11533, operator ruling 40a30905 -- Seshat's own
+    # second lane waits on this): reuses graph_physics._detect_communities
+    # UNCHANGED, the SAME Leiden partition THE COMPACT ARRANGEMENT's own physics
+    # migration computes -- never a second, independently-drifting copy. Scoped
+    # to projects already over `_COMMUNITY_MIN_MEMBERS` (today, effectively just
+    # osiris), so the added cost is one Leiden run over a population this size,
+    # not the whole 51k-object snapshot -- paid on every /graph/stream connect
+    # (this endpoint has no cache layer, matching every other field it computes
+    # from the same in-memory query result). `community_code` is index-aligned
+    # to `object_ids`/`project_code` exactly like the frozen arrays; 0 is the
+    # sentinel for "no real community" (a small project, or a genuinely
+    # noise-sized Leiden cluster) -- `communities` (the header TABLE, not a new
+    # DB table) never carries an entry for it, same convention `project_
+    # aggregates`/`type_aggregates` already use for their own code spaces.
+    from src.orchestrator.graph_physics import _detect_communities
+
+    community_membership = _detect_communities(
+        edge_rows, project_membership, set(id_index.keys()))
+    community_index: dict[tuple[uuid.UUID, int], int] = {}
+    community_codes: list[int] = [0] * len(object_ids)
+    for oid, (pid, local_id) in community_membership.items():
+        obj_idx = id_index.get(oid)
+        if obj_idx is None:
+            continue
+        key = (pid, local_id)
+        code = community_index.setdefault(key, len(community_index) + 1)
+        community_codes[obj_idx] = code
+    community_points: dict[int, list[tuple[float, float]]] = defaultdict(list)
+    for i, code in enumerate(community_codes):
+        if code:
+            community_points[code].append((xs[i], ys[i]))
+    communities = []
+    for (pid, _local_id), code in sorted(community_index.items(), key=lambda kv: kv[1]):
+        pts = community_points.get(code, [])
+        cx, cy, radius = _centroid_and_radius(pts)
+        communities.append({
+            "community": code, "project": project_uuid_to_code.get(pid, 0),
+            "count": len(pts), "cx": round(cx, 2), "cy": round(cy, 2),
+            "radius": round(radius, 2),
+        })
 
     # DENSITY NOT DISCS tip (h), item 8: a flat per-edge weight -- RAW, not a
     # pre-normalised 0-1 curve (Seshat, mail 11016: she already log2-normalises
@@ -725,6 +782,7 @@ async def fetch_snapshot(pool: asyncpg.Pool) -> bytes:
         watermark=watermark,
         project_aggregates=project_aggregates, type_aggregates=type_aggregates,
         cluster_edges=cluster_edges, type_pair_edges=type_pair_edges,
+        community_code=community_codes, communities=communities,
     )
 
 
