@@ -57,7 +57,7 @@ def test_small_buckets_place_directly_large_buckets_page_like_the_container_dril
 
 def test_focus_base_path_reachable_is_the_unchanged_provenance_walk() -> None:
     # the ORIGINAL PATH_EDGE_TYPES walk stays the base set; one-hop groups are additive.
-    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:3700]
+    body = _SPACE_JS.split("async function focusObject(id, opts)", 1)[1][:4300]
     assert "focusBasePathReachable = new Set(pathReachable);" in body
     assert "renderFocusEgoGroups(id, hopsUp, hopsDown);" in body
 
@@ -67,7 +67,7 @@ def test_group_expand_click_never_wipes_its_own_just_set_state() -> None:
     # egoGroupExpandedKey/egoGroupPageCount then re-renders through the SAME shared path a
     # fresh focus uses -- renderFocusEgoGroups itself must never reset that state (only
     # focusObject, on an actual container change, does).
-    body = _SPACE_JS.split("function focusObject(id, opts)", 1)[1][:3400]
+    body = _SPACE_JS.split("function focusObject(id, opts)", 1)[1][:3700]
     assert "if (egoGroupFocusId !== id) { egoGroupExpandedKey = null; " \
         "egoGroupPageCount = 1; }" in body
     render_body = _SPACE_JS.split("function renderFocusEgoGroups(id, hopsUp, hopsDown)", 1)[1][:400]
@@ -99,7 +99,7 @@ def test_focus_label_is_bigger_than_a_merely_lit_label() -> None:
     for html in ("index.html", "space.html"):
         page = (_STATIC / html).read_text()
         assert ".lbl.focus-label { font-size: 13px" in page
-    body = _SPACE_JS.split("function positionLabels()", 1)[1][:2800]
+    body = _SPACE_JS.split("function positionLabels()", 1)[1][:3800]
     assert '(nd.id === pathFocusId ? " focus-label" : "")' in body
     assert "positionFocusRing();" in body
 
@@ -256,12 +256,15 @@ def test_chain_labels_declutter_past_generation_1_not_every_single_one() -> None
     # live-verified: "lit labels always win their spot" flooded the view once a real
     # succession chain (up to 50+ pinned members, ALL lit since they're all in
     # pathReachable) tried to show every single one at once. A chain member keeps the
-    # always-shown guarantee only at generation 1 or a multiple of 5.
-    body = _SPACE_JS.split("function positionLabels()", 1)[1][:2200]
+    # always-shown guarantee only at generation 1 or a multiple of 5. WAVE 26's own
+    # storyline fix (test_storyline.py) narrowed the "always shown" bypass itself from
+    # bare `lit` to `alwaysShown` (lit AND NOT storylineActive) -- the chain-generation
+    # exception below is unchanged, still keyed off the same `lit`/`generation` values.
+    body = _SPACE_JS.split("function positionLabels()", 1)[1][:3300]
     assert "const generation = lit ? computeGeneration(nd) : null;" in body
     assert "const chainDeclutters = generation != null && generation !== 1 " \
         "&& generation % 5 !== 0;" in body
-    assert "if ((!lit || chainDeclutters) && overlapsPlaced(x, y, w))" in body
+    assert "if ((!alwaysShown || chainDeclutters) && overlapsPlaced(x, y, w))" in body
 
 
 def test_group_expansion_notifies_the_table_not_just_the_initial_focus() -> None:

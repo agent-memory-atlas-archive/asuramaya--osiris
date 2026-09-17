@@ -50,7 +50,7 @@ def test_header_container_class_normalizes_to_structural() -> None:
     # "container" (membership/containment, distinct from ordinary structural) hides at
     # rest exactly like "structural" -- every existing check in this file only ever
     # distinguishes "structural" from everything else.
-    body = _SPACE_JS.split("async function fetchStreamSnapshot()", 1)[1][:2600]
+    body = _SPACE_JS.split("async function fetchStreamSnapshot()", 1)[1][:2900]
     assert 'if (cls === "container") cls = "structural";' in body
 
 
@@ -58,7 +58,7 @@ def test_a_header_class_overrides_the_client_fallback_table() -> None:
     # live-verified regression (mail 11291): the browser marked authored_by "semantic"
     # (STRUCTURAL_EDGE_TYPES doesn't list it) while the header's own link_type_class says
     # authored_by is structural -- edgeClassByType must prefer the header's own value.
-    body = _SPACE_JS.split("async function fetchStreamSnapshot()", 1)[1][:2600]
+    body = _SPACE_JS.split("async function fetchStreamSnapshot()", 1)[1][:2900]
     assert "let cls = snap.link_type_class && snap.link_type_class[i];" in body
     assert "edgeClassByType[t] = cls || classOfEdgeType(t);" in body
 
@@ -141,8 +141,9 @@ def test_legend_checkboxes_rebuild_edge_lines_on_change() -> None:
     # seven. THE DRILL (Thoth mail 11048) added two more of its own: renderContainerDrill
     # (a container-scale focus rebuilds the base layer same as an ordinary focus) and
     # revealProjectStub (a stub reveal changes nodeVisible for the revealed ids, so the base
-    # layer must rebuild too) — nine call sites total now. This slice runs unbounded to
-    # end-of-file (no closing boundary in the split above), so it catches every function
-    # defined after renderLegend, not just renderLegend's own body — noted rather than
-    # silently re-scoping an existing test's own slicing choice.
-    assert body.count("buildEdgeLines(idToNode, edges);") == 9
+    # layer must rebuild too) — nine call sites. WAVE 26, THE STORYLINE (mail 11534) added a
+    # tenth: renderStoryline rebuilds the base layer same as an ordinary focus or the drill.
+    # This slice runs unbounded to end-of-file (no closing boundary in the split above), so
+    # it catches every function defined after renderLegend, not just renderLegend's own body
+    # — noted rather than silently re-scoping an existing test's own slicing choice.
+    assert body.count("buildEdgeLines(idToNode, edges);") == 10

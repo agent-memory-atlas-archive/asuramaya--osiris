@@ -172,7 +172,7 @@ def test_labels_are_top_n_by_degree_within_the_viewport_no_tier_gating() -> None
 
 
 def test_position_labels_has_no_tier_branch_left() -> None:
-    body = _SPACE_JS.split("function positionLabels()", 1)[1][:3100]
+    body = _SPACE_JS.split("function positionLabels()", 1)[1][:4000]
     # no more tier GATE -- the loop over labeledNodes runs unconditionally, no branch on any
     # zoom tier (a lingering explanatory comment mentioning "tier" in prose is fine; a real
     # tier conditional, e.g. `if (tier ===`, is not).
