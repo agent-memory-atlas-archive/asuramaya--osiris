@@ -822,7 +822,7 @@ export async function initSpace(container) {
   // TIP's own operator ruling (4a51cab1/1178e7d9) retires that rule outright -- "nothing
   // hidden ... caps and hides are escape hatches" -- structural edges that aren't already
   // folded into a district fill or a landmark badge (the five new types Sekhmet minted:
-  // recorded_by, owned_by [also a fill type], admitted_by, acknowledges, vendor_of) now draw
+  // recorded_by, owned_by [also a fill type], admitted_by, vendor_of) now draw
   // at rest same as anything else; the legend remains how a reader opts back OUT.
   const hiddenEdgeClasses = new Set();
   const hiddenEdgeTypes = new Set();

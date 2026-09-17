@@ -128,7 +128,7 @@ def test_a_district_below_the_label_gate_stays_an_unlabeled_fill() -> None:
 # tip, mail 11291) ---------------------------------------------------------------------------
 
 def test_one_hop_grouping_never_filters_by_edge_type_or_class() -> None:
-    # recorded_by/owned_by/admitted_by/acknowledges/vendor_of need no special-casing here --
+    # recorded_by/owned_by/admitted_by/vendor_of need no special-casing here --
     # oneHopByTypeDirection already walks every edge touching the focus id regardless of
     # type/class, pulling out only container-SCALE neighbours (isContainerFocus), never by
     # type. Confirms that stays true under this tip.
