@@ -183,6 +183,7 @@ from src.orchestrator.graph_layout import (
     _release_layout_lock,
     _sunflower_point,
     _try_acquire_layout_lock,
+    positions_for,
 )
 from src.orchestrator.project_identity import resolve_merge_survivors
 
@@ -205,7 +206,7 @@ _DEFAULT_SEMANTIC_WEIGHT = 1.0  # every semantic type shares this today -- "weig
                                 # type" is a real mechanism (the dict above), just
                                 # empty pending real per-type importance data; degree
                                 # normalisation is the only differentiating signal now.
-_PHYSICS_LAYOUT_VERSION = 8  # graph_layout._LAYOUT_VERSION must match this -- bumped
+_PHYSICS_LAYOUT_VERSION = 9  # graph_layout._LAYOUT_VERSION must match this -- bumped
                              # together so the incremental heartbeat and this one-shot
                              # migration always agree on what "current" means.
 _DEFAULT_PHYSICS_MAX_BYTES = 2_000_000_000  # layout.physics_max_bytes' own default
@@ -686,37 +687,281 @@ def _separate_extents(
     return pos
 
 
+# THE COMPACT ARRANGEMENT (Thoth mail 11533, thread 7c9adebb, wave 26) ----------------
+# Replaces the FR-then-separate-extents combine `_separate_extents`/the old
+# `_level1_layout` body used with SEED (a stress layout) + ANCHOR (Procrustes to the
+# previous run) + PACK (front-chain circle packing) -- see `_level1_layout`'s own
+# docstring below for the full shape and why this is what actually shrinks the bbox
+# rather than pushing an already-sprawled FR result further apart. `_separate_extents`
+# itself is left in place, still directly unit-tested, as a reusable primitive -- not
+# deleted, just no longer this function's own compaction step.
+
+
+def _tangent_candidates(
+    ax: float, ay: float, ar: float, bx: float, by: float, br: float, r: float,
+) -> list[tuple[float, float]]:
+    """Both points where a circle of radius `r` sits externally tangent to circle
+    a=(ax,ay,ar) AND circle b=(bx,by,br) -- the two-circle intersection of radii
+    (ar+r) and (br+r) centred at a and b. Empty when the two required circles don't
+    intersect (a and b too far apart, or too close, for any tangent-to-both circle
+    of this radius to exist) -- the caller tries every adjacent frontier pair, so an
+    empty result here just means this particular pair isn't a valid placement."""
+    dx, dy = bx - ax, by - ay
+    d2 = dx * dx + dy * dy
+    if d2 < 1e-12:
+        return []
+    d = math.sqrt(d2)
+    ra2, rb2 = ar + r, br + r
+    along = (d2 + ra2 * ra2 - rb2 * rb2) / (2 * d)
+    h2 = ra2 * ra2 - along * along
+    if h2 < 0:
+        return []
+    h = math.sqrt(h2)
+    ex, ey = dx / d, dy / d
+    mx, my = ax + ex * along, ay + ey * along
+    if h < 1e-9:
+        return [(mx, my)]
+    return [(mx - ey * h, my + ex * h), (mx + ey * h, my - ex * h)]
+
+
+def _overlaps_any(
+    cx: float, cy: float, r: float, pos: dict[Any, np.ndarray], radii: dict[Any, float],
+    *, exclude: set[Any],
+) -> bool:
+    for k, p in pos.items():
+        if k in exclude:
+            continue
+        dx, dy = p[0] - cx, p[1] - cy
+        min_d = radii[k] + r
+        if dx * dx + dy * dy < min_d * min_d - 1e-6:
+            return True
+    return False
+
+
+def _pack_siblings(
+    order: list[Any], radii: dict[Any, float], *, gutter: float = 0.0,
+) -> dict[Any, np.ndarray]:
+    """PACK: front-chain circle packing (Wang et al. CHI 2006; d3-hierarchy's own
+    `pack.siblings`) -- DISCLOSED SIMPLIFICATION, Thoth's own explicitly authorized
+    fallback (mail 11533 item 3, "d3-style packSiblings with a fixed insertion
+    order") for when full PRISM proximity-preserving overlap removal is too much
+    for one tip. d3's own algorithm prunes circles from the frontier as later ones
+    enclose them, for O(n log n) total; this version keeps every placed circle on
+    the frontier and tries EVERY consecutive frontier pair for each new circle,
+    O(n) candidates per insertion x O(n) overlap check each = O(n^2) per insertion,
+    O(n^3) total -- comfortably fast at this function's own scale (a project or
+    community population, never the 51k-object graph itself; see the module's own
+    acceptance receipt for the measured wall-clock this run).
+
+    `order` fixes insertion order -- packSiblings has no notion of a target
+    position, only order, so `_pack_order` (giant first, then a nearest-neighbour
+    walk over the SEED+ANCHOR positions) is what lets "related districts sit near
+    each other" survive into a from-scratch pack. `gutter` inflates every radius by
+    half its own value before packing (so two tangent circles land `gutter` apart,
+    not touching); returned positions are keyed on the TRUE (uninflated) radii the
+    caller already has -- only the packing math ever sees the inflated ones.
+
+    Deterministic: candidate selection ties break on `str(id)` via `_pack_order`'s
+    own tie-break, never on dict/set iteration order."""
+    if not order:
+        return {}
+    inflated = {k: radii[k] + gutter / 2 for k in order}
+    if len(order) == 1:
+        return {order[0]: np.zeros(2)}
+    a, b = order[0], order[1]
+    pos: dict[Any, np.ndarray] = {a: np.array([0.0, 0.0]),
+                                   b: np.array([inflated[a] + inflated[b], 0.0])}
+    frontier = [a, b]
+    if len(order) == 2:
+        return pos
+    for k in order[2:]:
+        rk = inflated[k]
+        best: tuple[int, tuple[float, float]] | None = None
+        best_d: float | None = None
+        n = len(frontier)
+        for i in range(n):
+            fa, fb = frontier[i], frontier[(i + 1) % n]
+            ax, ay = pos[fa]
+            bx, by = pos[fb]
+            for cx, cy in _tangent_candidates(
+                    ax, ay, inflated[fa], bx, by, inflated[fb], rk):
+                if _overlaps_any(cx, cy, rk, pos, inflated, exclude={fa, fb}):
+                    continue
+                d = cx * cx + cy * cy
+                if best_d is None or d < best_d:
+                    best_d = d
+                    best = (i, (cx, cy))
+        if best is None:
+            # DEGENERATE FALLBACK (should not occur for well-formed positive
+            # radii -- no live population has hit this): place tangent to the
+            # single frontier circle farthest from the origin, along its own
+            # outward ray, rather than raise mid-migration.
+            far = max(frontier, key=lambda f: float(np.linalg.norm(pos[f])) + inflated[f])
+            fx, fy = pos[far]
+            ang = math.atan2(fy, fx) if (fx or fy) else 0.0
+            pos[k] = np.array([fx + math.cos(ang) * (inflated[far] + rk),
+                                fy + math.sin(ang) * (inflated[far] + rk)])
+            frontier.append(k)
+            continue
+        i, (cx, cy) = best
+        pos[k] = np.array([cx, cy])
+        frontier.insert(i + 1, k)
+    return pos
+
+
+def _procrustes_transform(
+    new_pts: np.ndarray, old_pts: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """ANCHOR's own alignment step: Kabsch rotation (no scale, no reflection) that
+    best-fits `new_pts` onto `old_pts` (same row order, both (n,2), n>=2) --
+    returns (R, new_centroid, old_centroid) rather than the aligned points
+    themselves, so `_apply_procrustes` can apply the SAME transform to vertices
+    that were never part of the fit (a project new since the last run rides along
+    under its own neighbours' alignment). Reflection is explicitly excluded (the
+    det-sign correction below) -- a mirrored map would be as stable numerically
+    but would flip every reader's mental map, which is exactly what ANCHOR exists
+    to prevent."""
+    if len(new_pts) < 2:
+        return np.eye(2), np.zeros(2), np.zeros(2)
+    new_c = new_pts.mean(axis=0)
+    old_c = old_pts.mean(axis=0)
+    a = new_pts - new_c
+    b = old_pts - old_c
+    h = a.T @ b
+    u, _, vt = np.linalg.svd(h)
+    det = np.linalg.det(vt.T @ u.T)
+    d = 1.0 if det >= 0 else -1.0
+    correction = np.diag([1.0, d])
+    r = vt.T @ correction @ u.T
+    return r, new_c, old_c
+
+
+def _apply_procrustes(
+    pts: np.ndarray, r: np.ndarray, new_c: np.ndarray, old_c: np.ndarray,
+) -> np.ndarray:
+    return np.asarray((r @ (pts - new_c).T).T + old_c)
+
+
+def _stress_seed_layout(
+    ids: list[uuid.UUID], cross_edges: dict[tuple[uuid.UUID, uuid.UUID], float],
+) -> dict[uuid.UUID, np.ndarray]:
+    """SEED: Kamada-Kawai stress majorization (igraph's own `layout_kamada_kawai`,
+    no new dependency) over the small project-or-community contracted graph --
+    replaces the v8 FR seed. Stress layout minimises |geometric distance - graph
+    distance| directly, so cross-linked vertices land near each other with no
+    separate "separation" pass fighting an already-sprawled result (see
+    `_level1_layout`'s own docstring for why this is the actual compactness fix,
+    not `_pack_siblings` alone -- PACK only ever removes overlap; SEED is what
+    decides who ends up ADJACENT once it's removed). An edgeless population (no
+    cross edges at all) has nothing for stress majorization to minimise; the
+    deterministic sunflower seed IS the layout in that case, same degenerate
+    handling FR always had."""
+    idx = {pid: i for i, pid in enumerate(ids)}
+    g = ig.Graph()
+    g.add_vertices(len(ids))
+    edges: list[tuple[int, int]] = []
+    weights: list[float] = []
+    for (a, b), w in cross_edges.items():
+        if a in idx and b in idx:
+            edges.append((idx[a], idx[b]))
+            weights.append(w)
+    g.add_edges(edges)
+    seed_pts = np.array([_sunflower_point(i, _LEVEL1_SEED_SPACING) for i in range(len(ids))])
+    if g.ecount() == 0:
+        return {pid: seed_pts[i] for i, pid in enumerate(ids)}
+    coords = g.layout_kamada_kawai(
+        weights=weights, seed=seed_pts.tolist(), maxiter=_LEVEL1_FR_ITERATIONS)
+    pos = np.array(coords.coords)
+    return {pid: pos[i] for i, pid in enumerate(ids)}
+
+
+def _pack_order(
+    ids: list[uuid.UUID], radii: dict[uuid.UUID, float], seed: dict[uuid.UUID, np.ndarray],
+    cross_edges: dict[tuple[uuid.UUID, uuid.UUID], float] | None = None,
+) -> list[uuid.UUID]:
+    """GIANT FIRST (Thoth's own authorized fallback wording, mail 11533), then a
+    greedy walk: from the current vertex, prefer its STRONGEST still-unplaced
+    graph neighbour (`cross_edges`, descending weight) when one exists, else
+    fall back to the nearest still-unplaced vertex by SEED(+ANCHOR) position.
+    `_pack_siblings` itself has no notion of a target position, only order, so
+    this walk is the ENTIRE mechanism by which "related districts sit near each
+    other" survives into a from-scratch pack -- direct graph adjacency first,
+    since it is a stronger, unambiguous signal than SEED's own geometry (a
+    disconnected or near-degenerate component -- e.g. an isolated singleton
+    project with no cross-links at all -- gives kamada_kawai nothing to
+    optimise, and two such isolated vertices can land at a coincidentally
+    similar SEED distance from a genuinely linked pair; a real graph edge never
+    has that ambiguity). Deterministic: every tie breaks on `str(id)`, never on
+    set/dict iteration order."""
+    neighbours: dict[uuid.UUID, list[tuple[float, uuid.UUID]]] = defaultdict(list)
+    if cross_edges:
+        for (x, y), w in cross_edges.items():
+            if x in radii and y in radii:
+                neighbours[x].append((w, y))
+                neighbours[y].append((w, x))
+        for lst in neighbours.values():
+            lst.sort(key=lambda wv: (-wv[0], str(wv[1])))
+
+    remaining = set(ids)
+    giant = max(ids, key=lambda i: (radii[i], str(i)))
+    order = [giant]
+    remaining.discard(giant)
+    cur = giant
+    while remaining:
+        nxt = next((v for _, v in neighbours.get(cur, ()) if v in remaining), None)
+        if nxt is None:
+            nxt = min(remaining, key=lambda i: (
+                float(np.linalg.norm(seed[i] - seed[cur])), str(i)))
+        order.append(nxt)
+        remaining.discard(nxt)
+        cur = nxt
+    return order
+
+
 def _level1_layout(
     project_ids: list[uuid.UUID], radii: dict[uuid.UUID, float],
     cross_edges: dict[tuple[uuid.UUID, uuid.UUID], float], *,
     gutter: float = _LEVEL1_GUTTER,
+    anchor: dict[uuid.UUID, np.ndarray] | None = None,
 ) -> dict[uuid.UUID, np.ndarray]:
-    """One vertex per project, FR over the cross-project semantic aggregate, then
-    `_separate_extents` so no two project discs ever overlap -- see the module
-    docstring's HIERARCHICAL PHYSICS section for the full shape. `gutter` defaults
-    to the whole-graph project-vs-project clearance but is overridden much smaller
-    (THE INTRA-PROJECT GUTTER FIX) when this same function is reused one level
-    deeper for a project's own communities -- see
-    `_level2_raw_layout_for_project`'s own docstring for why."""
+    """THE COMPACT ARRANGEMENT (v9, Thoth mail 11533, thread 7c9adebb): one vertex
+    per project (or, one level deeper, per community), SEED+ANCHOR+PACK -- see
+    `_stress_seed_layout`/`_procrustes_transform`+`_apply_procrustes`/
+    `_pack_order`+`_pack_siblings`'s own docstrings for each step. Replaces v8's
+    FR-then-`_separate_extents` combine (module docstring's HIERARCHICAL PHYSICS
+    section, now superseded by this one): FR sprawls with no compactness target of
+    its own, and pushing an already-sprawled result apart only ever grows the
+    sprawl further -- measured live, a 65-90k bbox against a ~25k target. SEED
+    (stress majorization) picks who's adjacent; PACK (circle packing) removes
+    overlap WITHOUT re-sprawling, since packing is compaction by construction
+    (circles nest, they never get pushed further apart than tangent).
+
+    `gutter` defaults to the whole-graph project-vs-project clearance but is
+    overridden much smaller (THE INTRA-PROJECT GUTTER FIX) when this same
+    function is reused one level deeper for a project's own communities -- see
+    `_level2_raw_layout_for_project`'s own docstring for why. `anchor`, when
+    given, names a PREVIOUS run's own position for zero or more of these
+    vertices (read from `graph_x`/`graph_y` for real project objects; `None` at
+    the community level today -- no synthetic community vertex position is
+    persisted yet, a disclosed limitation, see run_physics_migrate's own
+    docstring) -- with two or more anchored vertices, the whole SEED layout is
+    Procrustes-aligned onto the anchor's own frame before packing, so a rerun
+    moves as little as the data allows (stability, not just compactness)."""
     if not project_ids:
         return {}
-    idx = {pid: i for i, pid in enumerate(project_ids)}
-    g = ig.Graph()
-    g.add_vertices(len(project_ids))
-    edges: list[tuple[int, int]] = []
-    weights: list[float] = []
-    for (a, b), w in cross_edges.items():
-        edges.append((idx[a], idx[b]))
-        weights.append(w)
-    g.add_edges(edges)
-    seed = np.array([_sunflower_point(i, _LEVEL1_SEED_SPACING) for i in range(len(project_ids))])
-    coords = g.layout_fruchterman_reingold(
-        weights=weights if weights else None, niter=_LEVEL1_FR_ITERATIONS,
-        seed=seed.tolist(), grid=True)
-    pos = np.array(coords.coords)
-    radii_arr = np.array([radii[pid] for pid in project_ids])
-    pos = _separate_extents(pos, radii_arr, gutter=gutter)
-    return {pid: pos[i] for i, pid in enumerate(project_ids)}
+    if len(project_ids) == 1:
+        return {project_ids[0]: np.zeros(2)}
+    seed = _stress_seed_layout(project_ids, cross_edges)
+    if anchor:
+        common = [pid for pid in project_ids if pid in anchor]
+        if len(common) >= 2:
+            new_pts = np.array([seed[pid] for pid in common])
+            old_pts = np.array([anchor[pid] for pid in common])
+            r, new_c, old_c = _procrustes_transform(new_pts, old_pts)
+            for pid in project_ids:
+                seed[pid] = _apply_procrustes(seed[pid][None, :], r, new_c, old_c)[0]
+    order = _pack_order(project_ids, radii, seed, cross_edges)
+    return _pack_siblings(order, radii, gutter=gutter)
 
 
 _NOISE_COMMUNITY_KEY = -1  # local-community-id sentinel for "no real community for
@@ -1248,7 +1493,16 @@ async def _physics_positions(
         radii[_HUB_ZONE_ID] = _hub_zone_radius(len(hub_order))
         level1_ids.append(_HUB_ZONE_ID)
     cross_edges = _cross_project_edges(link_rows, membership, project_id_set)
-    centroids = _level1_layout(level1_ids, radii, cross_edges)
+    # ANCHOR's own source (THE COMPACT ARRANGEMENT, Thoth mail 11533): each
+    # project's own PREVIOUS run position, read before this run writes anything --
+    # a project object IS a real vertex (`positions[pid] = centroids[pid]` below
+    # persists its own graph_x/graph_y each run), so its current row already holds
+    # exactly the "previous run's own centroid" ANCHOR needs. A first-ever run (or
+    # a genuinely new project) simply has no row here and rides along unanchored,
+    # same as `_level1_layout`'s own docstring describes.
+    prev_project_positions_raw = await positions_for(actions, project_ids)
+    anchor = {pid: np.array(xy) for pid, xy in prev_project_positions_raw.items()}
+    centroids = _level1_layout(level1_ids, radii, cross_edges, anchor=anchor)
 
     # THE LONG EDGES RULING (operator, grounds 9163b1c7): the seat:34f4e5fa/
     # repo:osiris beam was NEVER a level-1 spring-weight problem -- live probe
@@ -1322,6 +1576,13 @@ async def _physics_positions(
         diagnostics.update(_long_edge_counts(link_rows, final_positions))
         diagnostics.update(_layout_acceptance_metrics(
             declumped, object_ids, membership, groups, project_ids, radii))
+        diagnostics.update(_edge_length_percentiles(link_rows, membership, final_positions))
+        osiris_pid = await actions.pool.fetchval(
+            "SELECT id FROM objects WHERE canonical='repo:osiris' "
+            "AND type='SoftwareProject' AND status='active'")
+        diagnostics.update(_compactness_metrics(
+            declumped, project_ids, radii, osiris_pid, object_ids, groups))
+        diagnostics.update(_anchor_displacement(anchor, final_positions))
     _verify_min_separation(worst_residual, min_sep=_MIN_SEPARATION)
 
     return {oid: (float(declumped[i, 0]), float(declumped[i, 1]))
@@ -1334,6 +1595,98 @@ _LONG_EDGE_THRESHOLD = 20_000.0  # THE LONG EDGES RULING's own acceptance line
                                  # across the rendered map -- the live probe that
                                  # found the unfiled-fog root cause used this exact
                                  # figure (47,866 of 136,089 edges longer than it).
+
+
+def _edge_length_percentiles(
+    link_rows: list[asyncpg.Record], membership: dict[uuid.UUID, uuid.UUID],
+    positions: dict[uuid.UUID, np.ndarray],
+) -> dict[str, Any]:
+    """THE COMPACT ARRANGEMENT's own acceptance line (Thoth mail 11533, research
+    note S4/S59): intra- vs cross-district edge length, median and 95th
+    percentile -- this door lacked both until now. Semantic edges only
+    (container/structural edges are gravity, never drawn as lines); an edge with
+    either endpoint unplaced (should not happen for a real link row, defensive
+    only) is skipped rather than crashing the receipt."""
+    intra: list[float] = []
+    cross: list[float] = []
+    for r in link_rows:
+        f, t, lt = r["from_id"], r["to_id"], r["type"]
+        if lt in CONTAINER_LINK_TYPES or lt in STRUCTURAL_LINK_TYPES:
+            continue
+        pf, pt = positions.get(f), positions.get(t)
+        if pf is None or pt is None:
+            continue
+        length = float(np.linalg.norm(pf - pt))
+        mf, mt = membership.get(f), membership.get(t)
+        (intra if mf is not None and mf == mt else cross).append(length)
+
+    def _pct(xs: list[float]) -> dict[str, float | int | None]:
+        if not xs:
+            return {"p50": None, "p95": None, "n": 0}
+        arr = np.array(xs)
+        return {"p50": float(np.percentile(arr, 50)), "p95": float(np.percentile(arr, 95)),
+                "n": len(xs)}
+
+    return {
+        "layout_intra_district_edge_length": _pct(intra),
+        "layout_cross_district_edge_length": _pct(cross),
+    }
+
+
+def _compactness_metrics(
+    pos: np.ndarray, project_ids: list[uuid.UUID], radii: dict[uuid.UUID, float],
+    osiris_pid: uuid.UUID | None, object_ids: list[uuid.UUID],
+    groups: dict[uuid.UUID, list[uuid.UUID]],
+) -> dict[str, Any]:
+    """THE COMPACT ARRANGEMENT's own PRIMARY acceptance number (Thoth mail 11533,
+    research note S4): bbox area / sum(pi * r^2) over every district's own
+    packing radius. 1.0 is unreachable (circles can't tile a plane gaplessly);
+    the research note's own worked examples put a realistic packed target a few
+    times that, against the old FR-then-separate scheme's own tens. osiris' own
+    members' bbox is reported SEPARATELY (Thoth's own explicit ask, mail 11523)
+    since osiris is asserted to span "the whole map" on the live header --  its
+    own footprint, not the global one, is what a compaction fix should actually
+    move."""
+    bbox_min, bbox_max = pos.min(axis=0), pos.max(axis=0)
+    width = bbox_max - bbox_min
+    bbox_area = float(width[0] * width[1])
+    district_area = sum(math.pi * radii.get(pid, _MIN_SEPARATION) ** 2 for pid in project_ids)
+    out: dict[str, Any] = {
+        "layout_compactness_ratio": bbox_area / district_area if district_area > 1e-9 else None,
+        "layout_bbox_area": bbox_area,
+        "layout_district_area_sum": district_area,
+        "layout_osiris_bbox_width": None,
+    }
+    if osiris_pid is not None and osiris_pid in groups:
+        idx = {oid: i for i, oid in enumerate(object_ids)}
+        member_idx = [idx[m] for m in groups[osiris_pid] if m in idx]
+        if member_idx:
+            opts = pos[member_idx]
+            owidth = opts.max(axis=0) - opts.min(axis=0)
+            out["layout_osiris_bbox_width"] = owidth.tolist()
+    return out
+
+
+def _anchor_displacement(
+    anchor: dict[uuid.UUID, np.ndarray], final_positions: dict[uuid.UUID, np.ndarray],
+) -> dict[str, Any]:
+    """STABILITY (Thoth mail 11533, research note S4/S59): how far each anchored
+    project actually moved between the previous run's own written position and
+    this run's final (post-pack, post-declump) one -- mean and max, over
+    whichever projects `anchor` names (an empty/absent anchor, e.g. a first-ever
+    run, reports n=0 rather than a fabricated zero)."""
+    deltas = [
+        float(np.linalg.norm(final_positions[pid] - old))
+        for pid, old in anchor.items() if pid in final_positions
+    ]
+    if not deltas:
+        return {"layout_anchor_displacement_mean": None,
+                "layout_anchor_displacement_max": None, "layout_anchor_displacement_n": 0}
+    return {
+        "layout_anchor_displacement_mean": float(np.mean(deltas)),
+        "layout_anchor_displacement_max": float(np.max(deltas)),
+        "layout_anchor_displacement_n": len(deltas),
+    }
 
 
 def _long_edge_counts(

@@ -519,6 +519,113 @@ async def test_cross_project_edges_aggregates_by_unordered_project_pair(
     assert edges.get(key) == 2.0
 
 
+# --- THE COMPACT ARRANGEMENT (v9, Thoth mail 11533, thread 7c9adebb) ---------------
+
+
+def test_pack_siblings_no_pair_overlaps_for_varied_radii() -> None:
+    ids = [uuid.uuid4() for _ in range(12)]
+    radii = {oid: float(10 + 7 * i) for i, oid in enumerate(ids)}
+    out = graph_physics._pack_siblings(ids, radii, gutter=5.0)
+    assert set(out) == set(ids)
+    for i, a in enumerate(ids):
+        for b in ids[i + 1:]:
+            dist = float(np.linalg.norm(out[a] - out[b]))
+            assert dist >= radii[a] + radii[b] + 5.0 - 1e-6, (a, b, dist)
+
+
+def test_pack_siblings_single_circle_at_origin() -> None:
+    oid = uuid.uuid4()
+    out = graph_physics._pack_siblings([oid], {oid: 42.0})
+    assert np.allclose(out[oid], [0.0, 0.0])
+
+
+def test_pack_siblings_two_circles_are_exactly_tangent_plus_gutter() -> None:
+    a, b = uuid.uuid4(), uuid.uuid4()
+    radii = {a: 30.0, b: 70.0}
+    out = graph_physics._pack_siblings([a, b], radii, gutter=8.0)
+    dist = float(np.linalg.norm(out[a] - out[b]))
+    assert dist == pytest.approx(30.0 + 70.0 + 8.0, abs=1e-6)
+
+
+def test_pack_siblings_empty_order_returns_empty() -> None:
+    assert graph_physics._pack_siblings([], {}) == {}
+
+
+def test_procrustes_transform_recovers_a_known_rotation_and_translation() -> None:
+    """Rotate+translate a known point set by a fixed 90-degree rotation and a
+    (5,-3) shift, then confirm `_procrustes_transform`/`_apply_procrustes`
+    recovers it (up to floating-point tolerance) -- ANCHOR's own correctness
+    guarantee."""
+    rng = np.random.default_rng(7)
+    old_pts = rng.uniform(-50, 50, size=(6, 2))
+    theta = math.pi / 2
+    rot = np.array([[math.cos(theta), -math.sin(theta)],
+                     [math.sin(theta), math.cos(theta)]])
+    shift = np.array([5.0, -3.0])
+    new_pts = (rot.T @ old_pts.T).T + shift  # the INVERSE of the transform under test
+
+    r, new_c, old_c = graph_physics._procrustes_transform(new_pts, old_pts)
+    aligned = graph_physics._apply_procrustes(new_pts, r, new_c, old_c)
+    assert np.allclose(aligned, old_pts, atol=1e-6)
+
+
+def test_procrustes_transform_is_near_identity_when_already_aligned() -> None:
+    rng = np.random.default_rng(11)
+    pts = rng.uniform(-50, 50, size=(5, 2))
+    r, new_c, old_c = graph_physics._procrustes_transform(pts, pts)
+    aligned = graph_physics._apply_procrustes(pts, r, new_c, old_c)
+    assert np.allclose(aligned, pts, atol=1e-6)
+
+
+def test_procrustes_transform_never_reflects() -> None:
+    """Reflection is excluded on purpose (a mirrored map would flip every
+    reader's mental map) -- confirm the recovered rotation matrix has
+    determinant +1, never -1, even for a point set whose best UNCONSTRAINED
+    Procrustes fit would be a reflection."""
+    old_pts = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    new_pts = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, -1.0]])  # mirrored
+    r, _, _ = graph_physics._procrustes_transform(new_pts, old_pts)
+    assert np.linalg.det(r) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_pack_order_places_a_linked_pair_consecutively() -> None:
+    a, b, c, d = uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    radii = {a: 10.0, b: 10.0, c: 10.0, d: 10.0}
+    seed = {a: np.array([0.0, 0.0]), b: np.array([100.0, 100.0]),
+            c: np.array([1.0, 1.0]), d: np.array([2.0, 2.0])}
+    cross_edges = {(a, b): 5.0}
+    order = graph_physics._pack_order([a, b, c, d], radii, seed, cross_edges)
+    ia, ib = order.index(a), order.index(b)
+    assert abs(ia - ib) == 1, order
+
+
+def test_pack_order_falls_back_to_seed_distance_with_no_edges() -> None:
+    a, b = uuid.uuid4(), uuid.uuid4()
+    radii = {a: 10.0, b: 10.0}
+    seed = {a: np.array([0.0, 0.0]), b: np.array([1.0, 1.0])}
+    order = graph_physics._pack_order([a, b], radii, seed, None)
+    assert set(order) == {a, b}
+
+
+def test_level1_layout_anchors_onto_a_previous_run_when_given() -> None:
+    """ANCHOR (Thoth mail 11533): with a previous position for every vertex, the
+    new layout should land CLOSE to those previous positions (small displacement
+    relative to the population's own scale), not at some arbitrary
+    Procrustes-unrelated spot -- the whole point of anchoring."""
+    a, b, c = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    radii = {a: 50.0, b: 50.0, c: 50.0}
+    cross_edges = {(a, b): 3.0, (b, c): 2.0}
+    anchor = {a: np.array([0.0, 0.0]), b: np.array([300.0, 0.0]), c: np.array([600.0, 0.0])}
+    out = graph_physics._level1_layout([a, b, c], radii, cross_edges, anchor=anchor)
+    # every anchored vertex should land within a small multiple of the anchor's
+    # own spread (600 units) of its previous position -- loose bound, this is a
+    # sanity check against "landed somewhere totally unrelated", not a tight
+    # displacement budget (packing still has to remove overlap, which moves
+    # things some amount).
+    for oid in (a, b, c):
+        assert float(np.linalg.norm(out[oid] - anchor[oid])) < 1200.0
+
+
 def test_level1_layout_places_a_single_project_at_the_origin_ish() -> None:
     pid = uuid.uuid4()
     out = _level1_layout([pid], {pid: 20.0}, {})
@@ -529,16 +636,26 @@ def test_level1_layout_places_a_single_project_at_the_origin_ish() -> None:
 def test_level1_layout_a_semantically_linked_pair_ends_up_closer_than_an_unlinked_one() -> None:
     """THE LONG EDGES RULING (operator, grounds 9163b1c7): the actual beam turned
     out to be unfiled fog, not a level-1 spring-weight problem -- level-1 weight
-    stays the raw semantic cross-link count, unchanged. Regression coverage for
-    the mechanism that ruling confirmed already works: a linked pair still ends
-    up closer than an unlinked one of the same size."""
+    stays the raw semantic cross-link count, unchanged. Regression coverage,
+    UPDATED for THE COMPACT ARRANGEMENT (v9, Thoth mail 11533): under pure circle
+    packing a linked pair is GUARANTEED to reach the minimum possible distance
+    (exactly tangent, r_a+r_b+gutter -- `_pack_order`'s own graph-adjacency-first
+    walk, see its docstring), but with four EQUAL-sized circles the pack's own
+    geometry can coincidentally make an UNLINKED pair also end up tangent (the
+    "flower" a 4-equal-circle pack forms has more than one tangent pair by
+    necessity) -- so the acceptance property that survives compaction is "never
+    farther apart", not "always strictly closer": a linked pair always reaches
+    minimum (tangent) distance, an unlinked pair is never guaranteed to."""
     a, b, c, d = uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     radii = {a: 500.0, b: 500.0, c: 500.0, d: 500.0}
     cross_edges = {(a, b): 50.0}
     out = _level1_layout([a, b, c, d], radii, cross_edges)
     dist_ab = float(np.linalg.norm(out[a] - out[b]))
     dist_cd = float(np.linalg.norm(out[c] - out[d]))
-    assert dist_ab < dist_cd
+    tangent = radii[a] + radii[b] + graph_physics._LEVEL1_GUTTER
+    assert dist_ab == pytest.approx(tangent, abs=0.1), (
+        "a linked pair must always reach the minimum (tangent) packed distance")
+    assert dist_ab <= dist_cd + 1e-6
 
 
 def test_apply_bridge_nudges_moves_a_bridging_member_toward_the_other_centroid() -> None:

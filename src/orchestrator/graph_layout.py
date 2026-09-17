@@ -188,7 +188,7 @@ _MAX_STEP = 10.0
 
 # NAVIGABLE SPACE, piece A additions ---------------------------------------------------
 _LAYOUT_VERSION_PROP = "graph_layout_v"
-_LAYOUT_VERSION = 8  # bump this to force one migration pass over every already-placed object
+_LAYOUT_VERSION = 9  # bump this to force one migration pass over every already-placed object
 _RELAX_ITERATIONS = 6  # "a FEW iterations" -- a nudge on top of the deterministic base,
                        # never enough to erase the sunflower structure
 _GOLDEN_ANGLE = math.pi * (3.0 - math.sqrt(5.0))
