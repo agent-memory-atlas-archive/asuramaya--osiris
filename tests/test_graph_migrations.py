@@ -116,6 +116,36 @@ async def test_repo_seats_fix_scans_edges_regardless_of_container_status(
     assert applied["retired"] is not None
 
 
+async def test_repo_seats_fix_supersedes_cross_source_project_assertion(
+    actions: Actions,
+) -> None:
+    """THE w316 LIVE FINDING (Thoth mail 11469): the original cut wrote the re-stamp
+    via plain `assert_property`, whose own supersession is same-source-only -- when
+    the prior "seats" assertion's source (the agent's own self-declaration) differs
+    from the migration's `actor` (the console/migration actor), the new "osiris" row
+    landed BESIDE the old one instead of retiring it, leaving two simultaneously
+    `is_current` rows and the stream header still filing the agent under repo:seats.
+    Regression: seed the prior assertion from a DIFFERENT source than the migration's
+    own actor (mirrors the live agent-self-declared-vs-console split) and confirm
+    exactly ONE current `project` row survives the apply, reading "osiris"."""
+    now = datetime.now(UTC)
+    await actions.create_or_find_object("SoftwareProject", "repo:osiris", "test")
+    await actions.create_or_find_object("SoftwareProject", "repo:seats", "test")
+    agent = await actions.create_or_find_object("Agent", "agent:gm-cross-source", "test")
+    await actions.assert_property(agent, "project", "seats", "agent:gm-cross-source", now, 0.9)
+
+    out = await migrate_repo_seats_fix(
+        actions, actor="console", dry_run=False, because="test cleanup")
+    assert out["agents_plan"][0]["superseded"] == 1
+    assert out["superseded_total"] == 1
+
+    rows = await actions.pool.fetch(
+        "SELECT value #>> '{}' AS v FROM current_assertions "
+        "WHERE object_id=$1 AND name='project'", agent)
+    assert len(rows) == 1
+    assert rows[0]["v"] == "osiris"
+
+
 async def test_repo_seats_fix_reports_the_unchanged_agent_to_osiris_link_count(
     actions: Actions,
 ) -> None:
