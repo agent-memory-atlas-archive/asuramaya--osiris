@@ -719,20 +719,24 @@ async def migrate_owned_by_second_pass(
 ) -> dict[str, Any]:
     """OWNED_BY SECOND PASS (WAVE 26, PROVENANCE RESIDUE, Thoth mail 11535): the 847
     Thread.owner values `migrate_assertion_links`'s own owned_by sub-migration left
-    unresolvable are two shapes neither of its two resolution paths (a Seat/Agent
+    unresolvable are shapes neither of its two resolution paths (a Seat/Agent
     canonical, or a bare active SoftwareProject name) can reach -- the literal word
     "operator" (the human desk, minted as a Person under `principal:analyst:operator`
-    by every `register_agent` call, never a canonical the generic resolver would try)
-    and a BARE seat handle ("seshat", no `seat:` prefix, never resolved by a plain
-    canonical/uuid lookup) -- resolved here via `seats.seat_by_handle`, the house's own
-    name->Seat lookup (the same shape `team`'s own `--seat` argument already resolves
-    through), then the ordinary canonical resolve on the Seat it names.
+    by every `register_agent` call, never a canonical the generic resolver would try),
+    a raw SEAT CANONICAL ("seat:34f4e5fa" -- live, active, Thoth's own catch on the
+    first apply's `unresolvable_samples`, mail 11567: this function's OWN first cut
+    never actually re-tried the plain canonical resolve its own docstring claimed it
+    did, only "operator" and a bare handle -- a real gap between the doc and the
+    code, not a data problem), and a BARE seat handle ("seshat", no `seat:` prefix,
+    never resolved by a plain canonical/uuid lookup) -- the last resolved via
+    `seats.seat_by_handle`, the house's own name->Seat lookup (the same shape `team`'s
+    own `--seat` argument already resolves through), then the ordinary canonical
+    resolve on the Seat it names.
 
     ITS OWN MIGRATION TARGET, not folded back into `migrate_assertion_links`'s owned_by
     sub-migration: the first pass's own two resolution paths are unchanged and still
-    correct for what they cover; this only adds the two fallback paths the live
-    `unresolvable_samples` actually showed, tried after the SAME canonical/uuid
-    resolution the first pass already tries -- so a value that already resolved under
+    correct for what they cover; this only adds the fallback paths the live
+    `unresolvable_samples` actually showed -- so a value that already resolved under
     the first pass is simply `already_present` here (owned_by is idempotent,
     `_link_exists` checked before every mint, same as every other sub-migration in
     this module).
@@ -747,16 +751,20 @@ async def migrate_owned_by_second_pass(
         "SELECT o.id AS subject_id, a.value #>> '{}' AS value "
         "FROM objects o JOIN current_assertions a ON a.object_id=o.id "
         "WHERE o.type='Thread' AND o.status='active' AND a.name='owner'")
-    minted = minted_as_operator = minted_as_handle = already_present = 0
+    minted = minted_as_operator = minted_as_canonical = minted_as_handle = 0
+    already_present = 0
     unresolvable_samples: list[str] = []
     for r in owner_rows:
         value = (r["value"] or "").strip()
         target_id = None
-        via_operator = via_handle = False
+        via_operator = via_canonical = via_handle = False
         if value == "operator":
             target_id = await _resolve_ref(
                 pool, "principal:analyst:operator", object_type="Person")
             via_operator = target_id is not None
+        if target_id is None and value:
+            target_id = await _resolve_ref(pool, value, object_type="Seat")
+            via_canonical = target_id is not None
         if target_id is None and value:
             seat = await seat_by_handle(pool, value)
             if seat is not None:
@@ -772,6 +780,8 @@ async def migrate_owned_by_second_pass(
         minted += 1
         if via_operator:
             minted_as_operator += 1
+        if via_canonical:
+            minted_as_canonical += 1
         if via_handle:
             minted_as_handle += 1
         if not dry_run:
@@ -782,7 +792,7 @@ async def migrate_owned_by_second_pass(
         "dry_run": dry_run,
         "scanned": len(owner_rows),
         "minted": minted, "minted_as_operator": minted_as_operator,
-        "minted_as_handle": minted_as_handle,
+        "minted_as_canonical": minted_as_canonical, "minted_as_handle": minted_as_handle,
         "skipped_unresolvable": len(owner_rows) - minted - already_present,
         "already_present": already_present,
         "unresolvable_samples": unresolvable_samples,
