@@ -284,6 +284,54 @@ def test_run_gates_pytest_invocation_passes_the_xdist_cap(
     assert cmd[cmd.index("-n") + 1] == str(gate_hook._PYTEST_XDIST_CAP)
 
 
+def test_run_gates_always_includes_a_static_scanner_that_exists(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    """THE gate_hook CORRELATION GAP (thread 01c08600, Thoth DM 11536, WAVE 26 item 3):
+    a repo-wide static scanner never gets pulled in by ordinary import-based
+    correlation no matter what changed — it must run on every commit regardless."""
+    monkeypatch.setattr(gate_hook, "_run", lambda cmd, cwd: (True, ""))
+    monkeypatch.setattr(
+        gate_hook, "_ALWAYS_INCLUDED_STATIC_SCANNERS", frozenset({"tests/test_scanner.py"}))
+    _write(tmp_path, "tests/test_scanner.py")
+    _write(tmp_path, "docs/DEPLOY.md")  # correlates to nothing at all
+    captured: dict[str, Any] = {}
+
+    class _FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_subprocess_run(cmd: list[str], **kwargs: Any) -> _FakeProc:
+        captured["cmd"] = cmd
+        return _FakeProc()
+
+    monkeypatch.setattr(gate_hook.subprocess, "run", _fake_subprocess_run)
+    results = run_gates(tmp_path, ["docs/DEPLOY.md"])
+    ok, msg = results["pytest"]
+    assert ok is True
+    assert "tests/test_scanner.py" in captured["cmd"]
+    assert "always-included static scanner" in msg
+    assert "tests/test_scanner.py" in msg
+
+
+def test_run_gates_never_forces_a_scanner_path_that_does_not_exist(
+    tmp_path: Path, monkeypatch: Any,
+) -> None:
+    """The existence gate keeps this function's own test suite pure/IO-only via
+    tmp_path (this file's own module docstring): a bogus or renamed-away entry in
+    _ALWAYS_INCLUDED_STATIC_SCANNERS degrades to silently not-forced, never a crash
+    or a phantom pytest argument naming a path that isn't there."""
+    monkeypatch.setattr(gate_hook, "_run", lambda cmd, cwd: (True, ""))
+    monkeypatch.setattr(
+        gate_hook, "_ALWAYS_INCLUDED_STATIC_SCANNERS",
+        frozenset({"tests/test_does_not_exist.py"}))
+    results = run_gates(tmp_path, ["docs/DEPLOY.md"])
+    ok, msg = results["pytest"]
+    assert ok is True
+    assert msg == "no resolvable test files touched"
+
+
 # --- cmd_precommit: the enforce/dry-run branches ----------------------------------------------
 
 def test_precommit_passes_clean_regardless_of_enforce(monkeypatch: Any) -> None:
