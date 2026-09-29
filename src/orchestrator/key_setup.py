@@ -56,6 +56,17 @@ def ensure_key_setup(*, path: str | None = None, restic_path: str | None = None)
         report.update(key="minted", minted=True, backend=out.get("backend"),
                       tss_hint=out.get("tss_hint"))
 
+    # An existing host-cred key moves onto the TPM the moment this session can use it
+    # (same key, sealed a stronger way); a no-op on every other box and every other run.
+    try:
+        resealed = soul_crypto.soul_key_reseal_tpm(path=path)
+    except Exception as exc:  # noqa: BLE001 - an upgrade attempt must never block setup
+        report["tpm_note"] = f"{type(exc).__name__}: {exc}"
+    else:
+        report["tpm_resealed"] = bool(resealed.get("resealed"))
+        if resealed.get("error"):
+            report["tpm_note"] = resealed["error"]
+
     try:
         pw = restic_credential.restic_key_ensure(path=restic_path)
     except Exception as exc:  # noqa: BLE001 - a backup-password hiccup must never block the key

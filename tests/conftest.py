@@ -641,12 +641,38 @@ def _no_real_key_setup(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest
     # the off-box recovery copies and the scheduled restore drill (run from the offload tick)
     # write receipts and would run a real restic restore: redirected and stubbed the same way
     monkeypatch.setenv("OSIRIS_RECOVERY_COPIES_FILE", str(state / "recovery_copies.json"))
+    # the user-level Claude config that deploy/onboard read (and deploy writes): never the
+    # developer's own ~/.claude.json or ~/.claude/settings.json
+    claude_home = tmp_path_factory.mktemp("claude_home")
+    monkeypatch.setenv("OSIRIS_CLAUDE_HOME", str(claude_home))
     monkeypatch.setenv("OSIRIS_RESTORE_DRILL_RECEIPTS_FILE", str(state / "drill_receipts.json"))
 
     def _no_real_drill(repo_url: str) -> str | None:
         return "restore drills do not run inside tests unless a test injects its own"
 
     monkeypatch.setattr("src.orchestrator.scheduled_drill._real_run_drill", _no_real_drill)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_home_state(monkeypatch: pytest.MonkeyPatch,
+                        tmp_path_factory: pytest.TempPathFactory) -> None:
+    """NO TEST MAY RESOLVE A CREDENTIAL OR STATE FILE UNDER THE REAL HOME: a deploy on a
+    developer's machine mints a real encryption key and backup password into its own
+    credential store, and a test that merely READS the default location then sees them
+    (the "no backup password" tests failed on any box that had ever deployed). Every
+    location those readers resolve is pointed at scratch, for every test: the XDG config and
+    state roots (the credential store, the state files), and the explicit file overrides for
+    the encryption key, the backup password, the offload receipts and the lease key. A test
+    that needs a specific layout still sets its own values on top of these. The guard test
+    in test_no_real_home_state.py proves the redirect is complete."""
+    home = tmp_path_factory.mktemp("scratch_home")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "config"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(home / "state"))
+    monkeypatch.setenv("OSIRIS_SOUL_KEY_FILE", str(home / "config" / "osiris" / "soul.key"))
+    monkeypatch.setenv("OSIRIS_RESTIC_PASSWORD_FILE",
+                       str(home / "config" / "osiris" / "restic.password"))
+    monkeypatch.setenv("OSIRIS_OFFLOAD_RECEIPTS_FILE", str(home / "state" / "offload.json"))
+    monkeypatch.setenv("OSIRIS_LEASE_KEY_FILE", str(home / "config" / "osiris" / "lease.key"))
 
 
 @pytest.fixture(autouse=True)

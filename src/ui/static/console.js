@@ -1747,10 +1747,13 @@ var READINESS_STEP_ACTIONS = {
   configure_offload: { kind: 'jump', target: 'settings-sec-offload', label: 'Set destination' },
   // needs a physical touch, so it runs from a terminal: no button, the tooltip names it
   verify_recovery: { kind: 'hint' },
+  // needs sudo, so it can never be automatic: a button that copies the command
+  tpm_setup: { kind: 'copy', label: 'Copy command' },
 };
 var READINESS_STEP_TIPS = {
   recovery_enrolled: 'Touch your security key when it blinks. Or run osiris soul-key enroll-recovery in a terminal.',
   recovery_verified: 'Run osiris soul-key verify-recovery in a terminal, then enter your PIN and touch your security key. Nothing is changed.',
+  key_tpm_sealed: 'Run sudo usermod -aG tss $USER, then log out and back in. Osiris seals the key to the TPM by itself afterwards, or run osiris soul-key reseal.',
   offload_target_present: 'Plug in a drive, or name a network location, under Backup & Offload.',
 };
 async function renderSettingsSectionBox() {
@@ -1780,7 +1783,9 @@ function readinessStepRow(s) {
   var act = s.action ? READINESS_STEP_ACTIONS[s.action.kind] : null;
   var btn = act && act.kind === 'jump'
     ? '<button class="iconbtn" onclick="readinessJump(' + JSON.stringify(act.target) + ')">' + esc(act.label) + '</button>'
-    : '';
+    : (act && act.kind === 'copy' && s.action.commands
+      ? '<button class="iconbtn" data-cmd="' + esc(s.action.commands[0]) + '" onclick="readinessCopy(this)">' + esc(act.label) + '</button>'
+      : '');
   var p = s.progress;
   var pct = p && p.total ? Math.max(0, Math.min(100, Math.round(100 * p.done / p.total))) : null;
   var pctText = pct === null ? '' : ' (' + (p.estimate ? 'about ' : '') + pct + '%)';
@@ -1820,6 +1825,11 @@ function renderReadinessStepperHtml(readiness, deployStatus) {
 // DOM at all).
 function refreshReadinessIfShown() {
   if ($('settings-sec-box')) renderSettingsSectionBox();
+}
+function readinessCopy(btn) {
+  var cmd = btn.getAttribute('data-cmd');
+  try { navigator.clipboard.writeText(cmd); setStatus('Copied: ' + cmd); }
+  catch (e) { setStatus('Copy failed. Run: ' + cmd); }
 }
 function readinessJump(targetId) {
   var el = $(targetId);

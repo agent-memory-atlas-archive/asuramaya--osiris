@@ -1032,7 +1032,7 @@ async def cmd_seed(*, compositions_only: bool, pool: asyncpg.Pool | None = None)
 _SOUL_KEY_POOL_FREE_ACTIONS = ("init",)
 _SOUL_KEY_ACTIONS = (
     "status", "init", "rotate", "restore-drill", "enroll-recovery", "verify-recovery",
-    "recover")
+    "recover", "reseal")
 
 
 _SOUL_KEY_RESTART_UNITS = ["osiris-mcp.service", "osiris-worker.service"]
@@ -1045,7 +1045,8 @@ async def cmd_soul_key(
     exact: bool = False, recovery_file: str | None = None,
     pool: asyncpg.Pool | None = None,
 ) -> int:
-    """osiris soul-key <status|init|rotate|restore-drill|enroll-recovery|verify-recovery|recover>:
+    """osiris soul-key <status|init|rotate|restore-drill|enroll-recovery|verify-recovery|
+    recover|reseal>:
     THE KEY ENTRY POINT, so that key and backup setup are configurable from the UI or the
     CLI without needing an agent. A thin console-script entry point, matching `osiris
     composition <action>`'s own shape.
@@ -1076,6 +1077,16 @@ async def cmd_soul_key(
     action (only `init` ever needs a restart to take effect)."""
     from src import cli_render as render
     from src.ingest import soul_crypto
+
+    if action == "reseal":
+        # pool-free, like init: it only re-seals the same key on this machine's TPM
+        out = soul_crypto.soul_key_reseal_tpm(path=path)
+        if "error" in out:
+            print(f"osiris soul-key reseal: refused: {out['error']}", file=sys.stderr)
+            render.emit(out, as_json=as_json, title="soul-key reseal")
+            return 1
+        render.emit(out, as_json=as_json, title="soul-key reseal")
+        return 0
 
     if action in _SOUL_KEY_POOL_FREE_ACTIONS:
         out = soul_crypto.soul_key_init(
@@ -3799,6 +3810,18 @@ async def _real_check_whisper_probe() -> tuple[bool, str]:
         return await _synthetic_automount_probe(client)
 
 
+def _ensure_mcp_approval_line() -> str:
+    """`src.orchestrator.mcp_approval.approval_line`: merges `osiris` into the user-level
+    `enabledMcpjsonServers` and returns the line deploy prints. Never raises past its own
+    boundary; a settings file it cannot merge is reported and left untouched."""
+    from src.orchestrator.mcp_approval import approval_line
+
+    try:
+        return approval_line()
+    except Exception as exc:  # noqa: BLE001 - a settings hiccup must never crash deploy's report
+        return f"mcp approval: skipped ({type(exc).__name__}: {exc})"
+
+
 def _run_install_script(script_rel: str, root: Path) -> str:
     """Run one of this repo's idempotent install-*.sh scripts: deploy is the one
     sanctioned hand that writes machine files, since a read-only status line that can
@@ -4361,6 +4384,11 @@ async def cmd_deploy(
         print(_run_install_script("scripts/install_commands.sh", root))
         from scripts.commands_status import commands_status
         print(commands_status(root))
+
+        # THE MCP PROMPT, ONCE: approve osiris for every directory (worktrees and onboarded
+        # repos included) in the user-level settings, instead of Claude Code asking again
+        # for each new checkout. Resolved by name at call time so tests can replace it.
+        print(await asyncio.to_thread(_ensure_mcp_approval_line))
 
         print(_run_install_script("scripts/install_prune_timers.sh", root))
 
@@ -7938,7 +7966,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_soul_key.add_argument(
         "action",
         choices=["status", "init", "rotate", "restore-drill", "enroll-recovery",
-                 "verify-recovery", "recover"],
+                 "verify-recovery", "recover", "reseal"],
         help="status: show backend, recovery, and encryption-progress facts, never the "
              "key bytes themselves. init: mint the first key by hand, refusing if one "
              "already exists (a deploy does this automatically); a systemd-creds user "
@@ -7950,7 +7978,8 @@ def _build_parser() -> argparse.ArgumentParser:
              "(PIN plus touch) and record a receipt. recover: restore a key from a "
              "security-key recovery enrollment onto a box with no live key yet. "
              "restore-drill: prove that an off-box backup repository actually "
-             "restores")
+             "restores. reseal: move the existing key onto this machine's TPM once "
+             "your user has joined the tss group (the key itself does not change)")
     p_soul_key.add_argument("--owner", default=None,
                             help="init only: change ownership of the key file and "
                                  "directory to this user after writing (useful when "

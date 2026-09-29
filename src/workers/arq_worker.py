@@ -1357,6 +1357,17 @@ async def soul_encrypt_heartbeat(ctx: dict[str, Any]) -> int:
     return int(record.get("rows_done", 0)) - before
 
 
+async def soul_key_tpm_heartbeat(ctx: dict[str, Any]) -> int:
+    """THE TPM UPGRADE, AUTOMATIC: a key sealed to the host alone moves onto the machine's
+    TPM as soon as this process can use the device (the user joined the tss group and the
+    worker restarted since). Same key, sealed a stronger way, so nothing is re-encrypted.
+    A cheap no-op on every other tick and every other machine. Returns 1 when it sealed."""
+    from src.ingest.soul_crypto import soul_key_reseal_tpm
+
+    out = await asyncio.to_thread(soul_key_reseal_tpm)
+    return 1 if out.get("resealed") else 0
+
+
 async def harness_backfill_heartbeat(ctx: dict[str, Any]) -> int:
     """THE HARNESS SIGNAL'S OWN CATCH-UP (wave 13 item 3, thread e7f173a6, Thoth's ruling
     msg 8544): mount() stamps a `harness` property going forward, but every mind mounted
@@ -1711,6 +1722,8 @@ class WorkerSettings:
         # ingest is never starved; a no-op file read once everything is encrypted.
         cron(watched(soul_encrypt_heartbeat, every=30), second={10, 40}, timeout=120,
              run_at_startup=True),
+        cron(watched(soul_key_tpm_heartbeat, every=900), minute={4, 19, 34, 49},
+             second={20}, timeout=60, run_at_startup=True),
         # WAVE B item 1 (thread 8839): positions the whole graph incrementally, one
         # bounded batch (layout.batch_size objects, local relaxation only) every
         # layout.tick_seconds (default 5 min, module-level above) -- a fresh graph

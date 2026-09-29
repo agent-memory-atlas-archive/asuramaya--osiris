@@ -138,6 +138,7 @@ async def soul_key_status(
 
     out = soul_crypto.soul_key_status(path=path)
     out["rp_id"] = (await get_setting(pool, "soul_key.rp_id"))["value"]
+    out["tpm"] = soul_crypto.tpm_facts()
     record = soul_encrypt_progress.read_progress()
     total = None
     if out["present"] and not record.get("rows_total"):

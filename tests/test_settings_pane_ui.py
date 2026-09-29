@@ -189,6 +189,7 @@ def test_stepper_only_hands_steps_have_actions_and_all_of_them_jump() -> None:
     for kind in ("enroll_recovery", "configure_offload", "verify_recovery"):
         assert kind + ":" in body, f"{kind} missing from READINESS_STEP_ACTIONS"
     assert body.count("kind: 'jump'") == 2
+    assert "tpm_setup: { kind: 'copy'" in body  # sudo step: copy the command, never inline prose
     assert "kind: 'hint'" in body  # verify-recovery needs a touch: a tooltip, no button
     assert "perform" not in body
 
@@ -231,3 +232,10 @@ def test_every_key_and_offload_action_refreshes_the_stepper_on_success() -> None
         body = _CONSOLE_JS.split("async function " + fn + "(", 1)[1].split(
             "\nasync function ", 1)[0]
         assert "refreshReadinessIfShown();" in body, f"{fn} never refreshes the stepper"
+
+
+def test_tpm_step_copies_its_command_and_carries_the_full_sequence_in_a_tooltip() -> None:
+    row = _CONSOLE_JS.split("function readinessStepRow(s) {", 1)[1][:1500]
+    assert "readinessCopy(this)" in row
+    tip = _CONSOLE_JS.split("var READINESS_STEP_TIPS = {", 1)[1].split("};", 1)[0]
+    assert "sudo usermod -aG tss $USER" in tip and "osiris soul-key reseal" in tip
