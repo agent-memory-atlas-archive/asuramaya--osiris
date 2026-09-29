@@ -638,6 +638,15 @@ def _no_real_key_setup(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest
     state = tmp_path_factory.mktemp("key_state")
     monkeypatch.setenv("OSIRIS_SOUL_ENCRYPT_PROGRESS_FILE", str(state / "encrypt_progress.json"))
     monkeypatch.setenv("OSIRIS_RECOVERY_VERIFY_RECEIPT_FILE", str(state / "verify_receipt.json"))
+    # the off-box recovery copies and the scheduled restore drill (run from the offload tick)
+    # write receipts and would run a real restic restore: redirected and stubbed the same way
+    monkeypatch.setenv("OSIRIS_RECOVERY_COPIES_FILE", str(state / "recovery_copies.json"))
+    monkeypatch.setenv("OSIRIS_RESTORE_DRILL_RECEIPTS_FILE", str(state / "drill_receipts.json"))
+
+    def _no_real_drill(repo_url: str) -> str | None:
+        return "restore drills do not run inside tests unless a test injects its own"
+
+    monkeypatch.setattr("src.orchestrator.scheduled_drill._real_run_drill", _no_real_drill)
 
 
 @pytest.fixture(autouse=True)

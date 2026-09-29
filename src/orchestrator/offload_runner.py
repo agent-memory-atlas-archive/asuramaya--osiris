@@ -117,21 +117,23 @@ async def run_offload_tick(pool: asyncpg.Pool, *, vault: Path | None = None) -> 
     Absent/disabled targets are reported, never treated as an error. A missing
     restic password (`ResticPasswordMissing`) degrades the WHOLE tick with one
     `error` key (nothing to back up onto without it) rather than a confusing
-    per-target failure repeated N times."""
+    per-target failure repeated N times.
+
+    BEFORE any backup, the security-key recovery file is copied to the vault and, as a plain
+    file, beside every present target (`recovery_copies`, reported under `recovery_copies`,
+    never an error for the tick). AFTER the backups, a restore drill runs for any target that
+    now holds a successful offload and is due one (`scheduled_drill`, reported under `drills`)."""
+    from src.orchestrator import recovery_copies, scheduled_drill
     from src.orchestrator.backup_settings import get_backup_settings
     from src.orchestrator.backup_validation import check_local_target_presence
     from src.orchestrator.restic_credential import ResticPasswordMissing, get_restic_password
-
-    try:
-        password = get_restic_password()
-    except ResticPasswordMissing as exc:
-        return {"error": str(exc), "targets": []}
 
     settings = await get_backup_settings(pool)
     targets = settings.get("offload_targets") or []
     source = vault or Path(os.environ.get("OSIRIS_VAULT", str(Path.home() / "osiris-vault")))
     now = datetime.now(UTC).isoformat()
 
+    present: list[dict[str, Any]] = []
     results: list[dict[str, Any]] = []
     for target in targets:
         if not isinstance(target, dict):
@@ -140,13 +142,26 @@ async def run_offload_tick(pool: asyncpg.Pool, *, vault: Path | None = None) -> 
         if not target.get("enabled"):
             results.append({"name": name, "skipped": "disabled"})
             continue
-        kind = target.get("kind")
-        if kind == "local":
+        if target.get("kind") == "local":
             mountpoint = target.get("expected_mountpoint") or ""
             presence = await asyncio.to_thread(check_local_target_presence, mountpoint)
             if not presence.get("present"):
                 results.append({"name": name, "skipped": "not present (mountpoint absent)"})
                 continue
+        present.append(target)
+
+    extra: dict[str, Any] = {}
+    copies = await recovery_copies.sync_recovery_copies(present, source)
+    if copies:
+        extra["recovery_copies"] = copies
+
+    try:
+        password = get_restic_password()
+    except ResticPasswordMissing as exc:
+        return {"error": str(exc), "targets": [], **extra}
+
+    for target in present:
+        name = target.get("name", "<unnamed>")
         repository = target.get("path_or_url", "")
         fail = await asyncio.to_thread(
             _run_restic_backup, repository=repository, password=password, source=source)
@@ -162,4 +177,8 @@ async def run_offload_tick(pool: asyncpg.Pool, *, vault: Path | None = None) -> 
             # so "tried and failed" is the only signal a sftp/NAS target ever gets.
             _write_receipt(name, {"last_attempt_at": now, "last_error": fail})
             results.append({"name": name, "ok": False, "error": fail})
-    return {"as_of": now, "targets": results}
+
+    drills = await scheduled_drill.run_due_drills(present, _read_receipts())
+    if drills:
+        extra["drills"] = drills
+    return {"as_of": now, "targets": results, **extra}

@@ -478,6 +478,7 @@ osiris soul-key verify-recovery
 osiris soul-key rotate
 osiris soul-key rotate --finish
 osiris soul-key recover
+osiris soul-key recover --recovery-file ./soul.key.recovery.json
 osiris soul-key restore-drill
 ```
 

@@ -104,6 +104,25 @@ enabled target:
   presence check first), gets a real restic backup run. If the repository looks
   uninitialized, it is set up first, then the backup itself runs.
 
+Around those backups, every tick also does two things by itself:
+
+- **Copies the recovery file off the machine.** Before any backup runs, the security-key
+  recovery file (which also carries the backup password, wrapped so only your security key
+  can open it) is copied into the vault (`osiris-recovery/`) and, as a PLAIN file, beside
+  every present target: `<mountpoint>/osiris-recovery/` on a local drive, or an
+  `osiris-recovery/` folder next to the repository on an `sftp:host:/path` target (over
+  ssh, never prompting). It has to be a plain file because a copy inside a restic
+  repository would need the very password it protects. Other restic backends (`rest:`,
+  `s3:`, ...) cannot hold a plain file and are reported as such. A copy that already matches
+  is left alone. Enrolling recovery and deploying copy it immediately, without waiting for
+  a tick. The setup stepper shows "Recovery copy off-box" until a target holds the current
+  file. To use a copy on a new machine: `osiris soul-key recover --recovery-file PATH`.
+- **Runs the restore test.** For a target that is present and already has a successful
+  offload, a restore drill runs straight after the first one, then again every 7 days
+  (retrying no sooner than 6 hours after a failure). It restores the latest snapshot into a
+  scratch directory, so on a large vault it is real work; the tick result lists it under
+  `drills` and the result feeds the setup stepper.
+
 Every attempt, success or failure, writes a small result record keyed by target name to
 `~/.local/state/osiris/offload_receipts.json`:
 
@@ -203,7 +222,9 @@ key. It protects the restic repository's own encryption, nothing about the vault
 
 Two checks exist, and they check different things:
 
-- **Off-box restore drill**: `osiris soul-key restore-drill [--repo-url URL]` (yes, this
+- **Off-box restore drill**: runs by itself from the offload runner (after the first
+  successful offload, then weekly, see above); it can also be run by hand:
+  `osiris soul-key restore-drill [--repo-url URL]` (yes, this
   lives under the `soul-key` command; see [`KEYS.md`](KEYS.md)) actually proves a restic
   repository restores. It runs a full integrity check, then a real restore into a scratch
   directory, then confirms real files landed. A clean integrity check alone is not treated

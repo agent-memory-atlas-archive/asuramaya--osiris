@@ -55,7 +55,10 @@ async def test_soul_key_status_present_is_fast_and_never_runs_the_census(
     assert out["present"] is True
     assert out["encryption"]["state"] == "pending"
     assert out["legacy_plaintext_rows"] is None  # nothing has counted yet, said honestly
-    assert out["recovery"] == {"enrolled": False, "stale": False, "verified": None}
+    assert out["recovery"] == {
+        "enrolled": False, "stale": False, "verified": None,
+        "off_box_copies": {"enrolled": False, "count": 0, "destinations": [],
+                           "current": False, "vault": False}}
 
 
 async def test_soul_key_status_reads_the_progress_record(
@@ -75,7 +78,7 @@ async def test_soul_key_status_reads_the_progress_record(
     assert out["encryption"] == {
         "state": "running", "rows_done": 40, "rows_remaining": 60, "rows_total": 100,
         "rate_per_sec": 8.0, "eta_seconds": 15, "started_at": "t0", "updated_at": "t1",
-        "last_error": None}
+        "last_error": None, "rows_estimated": False}
 
 
 async def test_soul_key_status_with_no_key_reports_no_key_state(

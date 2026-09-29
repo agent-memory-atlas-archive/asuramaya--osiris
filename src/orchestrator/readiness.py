@@ -5,10 +5,11 @@ console, a guided step-by-step with flags when something is missing.
 
 EVERY STEP CARRIES A `mode`: "auto" or "hands". Setup is automatic (operator ruling): the
 key and the backup password are created by the deploy, existing data is encrypted by a
-background worker job, the offload runs on its own timer. An automatic step shows PROGRESS
-(`progress`, or a plain reason) and never has an action button. Only the steps that
-physically need a person (touching the security key, naming a backup destination, running
-the restore test until it is scheduled) carry an `action`.
+background worker job, the offload runs on its own timer, the recovery file is copied beside
+the backups, the restore test runs after the first backup and then weekly. An automatic step
+shows PROGRESS (`progress`, or a plain reason) and never has an action button. Only the steps
+that physically need a person (touching the security key, naming a backup destination) carry
+an `action`.
 
 Deliberately a PURE function, no pool, no live reads of its own: every fact it needs
 (soul-key status, restic-key status, the offload targets with their own live presence
@@ -27,8 +28,8 @@ StepStatus = Literal["done", "missing", "needs_attention"]
 
 STEP_ORDER = (
     "key_set_up", "services_restarted", "recovery_enrolled", "recovery_verified",
-    "data_encrypted", "backup_password_set", "offload_target_present", "offload_run",
-    "restore_test_passed",
+    "recovery_copy_off_box", "data_encrypted", "backup_password_set",
+    "offload_target_present", "offload_run", "restore_test_passed",
 )
 
 
@@ -68,7 +69,8 @@ def _data_encrypted_step(soul_key: dict[str, Any], key_present: bool) -> dict[st
     progress = {
         "done": done, "total": total, "eta_seconds": enc.get("eta_seconds"),
         "rate_per_sec": enc.get("rate_per_sec"),
-        "estimate": state != "running" or remaining is None,
+        "estimate": (bool(enc.get("rows_estimated")) or state != "running"
+                     or remaining is None),
     }
     if state == "error":
         return _step("data_encrypted", label, "needs_attention",
@@ -158,6 +160,18 @@ def compute_readiness_steps(
             "Touch your security key to confirm recovery works. Nothing is changed.",
             {"kind": "verify_recovery"}, mode="hands"))
 
+    copies = recovery.get("off_box_copies") or {}
+    if recovery_count < 1:
+        steps.append(_step(
+            "recovery_copy_off_box", "Recovery copy off-box", "missing",
+            "Waiting for the recovery method.", None))
+    elif copies.get("current"):
+        steps.append(_step("recovery_copy_off_box", "Recovery copy off-box", "done", None, None))
+    else:  # includes a copy of an older enrollment, which the copy status does not count
+        steps.append(_step(
+            "recovery_copy_off_box", "Recovery copy off-box", "missing",
+            "Copied automatically once a backup target is present.", None))
+
     steps.append(_data_encrypted_step(soul_key, key_present))
 
     restic_present = bool(restic_key.get("present"))
@@ -200,12 +214,15 @@ def compute_readiness_steps(
 
     drill_passed = any(r.get("last_passed_at") for r in restore_drill_receipts.values())
     if drill_passed:
-        steps.append(_step("restore_test_passed", "Restore test passed", "done", None, None,
-                           mode="hands"))
+        steps.append(_step("restore_test_passed", "Restore test passed", "done", None, None))
     else:
+        failed = next((r["last_error"] for r in restore_drill_receipts.values()
+                       if r.get("last_error")), None)
         steps.append(_step(
-            "restore_test_passed", "Restore test passed", "missing", "Never tested yet.",
-            {"kind": "restore_drill"}, mode="hands"))
+            "restore_test_passed", "Restore test passed",
+            "needs_attention" if failed else "missing",
+            f"The last restore test failed and will be retried: {failed}" if failed
+            else "Runs automatically after the first backup, then weekly.", None))
 
     for s in steps:
         if s["status"] != "done":

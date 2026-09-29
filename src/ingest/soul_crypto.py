@@ -851,6 +851,12 @@ def unwrap_restic_password(raw_soul_key: bytes, wrapped: str) -> bytes | None:
         return None
 
 
+def recovery_file_path(*, path: str | None = None) -> Path:
+    """Where the recovery file lives (it may not exist yet): for callers that copy it
+    off-box or restore it from a copy."""
+    return _recovery_path(_key_file_path(explicit=path))
+
+
 def soul_key_recovery_facts(*, path: str | None = None) -> dict[str, Any]:
     """Cheap, filesystem-only facts about the recovery enrollment, for status readers:
     `enrolled`, `restic_wrapped` (the backup password rides in the blob), and `stale`

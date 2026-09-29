@@ -46,6 +46,8 @@ TICK_BUDGET_SECS = 20.0      # wall clock one tick may spend before it yields
 BATCH_SIZE = 500             # rows per UPDATE batch; small so a batch is a short lock
 COLD_BATCH_SIZE = 10         # cold-tier rows are whole compressed sessions, far larger
 REPROBE_SECS = 6 * 3600.0    # how often a finished pass double-checks for stragglers
+EXACT_COUNT_BELOW = 100_000  # tables smaller than this are counted exactly; larger ones sampled
+SAMPLE_PERCENT = 0.5         # share of the table's pages read to estimate the plaintext share
 
 States = ("no_key", "pending", "running", "complete", "error")
 
@@ -99,6 +101,7 @@ def shape_encryption(record: dict[str, Any], *, key_present: bool,
         "rows_total": record.get("rows_total", total_estimate),
         "rate_per_sec": record.get("rate_per_sec"),
         "eta_seconds": record.get("eta_seconds") if state == "running" else None,
+        "rows_estimated": bool(record.get("rows_estimated")) and state != "complete",
         "started_at": record.get("started_at"),
         "updated_at": record.get("updated_at"),
         "last_error": record.get("last_error"),
@@ -117,12 +120,31 @@ _PLAINTEXT_HOT = "substring(raw_line from 1 for 5) <> $1"
 _PLAINTEXT_COLD = "substring(content_gzip from 1 for 5) <> $1"
 
 
-async def _count_plaintext(pool: asyncpg.Pool) -> tuple[int, int]:
-    hot = await pool.fetchval(
-        f"SELECT count(*) FROM soul_lines WHERE {_PLAINTEXT_HOT}", FERNET_TOKEN_PREFIX)
-    cold = await pool.fetchval(
-        f"SELECT count(*) FROM soul_lines_cold WHERE {_PLAINTEXT_COLD}", FERNET_TOKEN_PREFIX)
-    return int(hot or 0), int(cold or 0)
+async def _initial_counts(
+    pool: asyncpg.Pool, *, exact_below: int = EXACT_COUNT_BELOW,
+) -> tuple[int, bool]:
+    """(plaintext rows to encrypt, whether that number is an estimate). NEVER a full scan of
+    a big table: counting two million rows takes minutes and would stall the first status
+    after a deploy. Small tables are counted exactly; a big one is estimated from the
+    planner's row count times the plaintext share of a small page sample, and the number
+    corrects itself as the pass runs (the pass ends when it runs out of plaintext rows,
+    whatever the estimate said). The cold tier holds far fewer rows and is counted exactly."""
+    cold = int(await pool.fetchval(
+        f"SELECT count(*) FROM soul_lines_cold WHERE {_PLAINTEXT_COLD}",
+        FERNET_TOKEN_PREFIX) or 0)
+    reltuples = await estimate_total_rows(pool)
+    if reltuples is None or reltuples < exact_below:
+        hot = int(await pool.fetchval(
+            f"SELECT count(*) FROM soul_lines WHERE {_PLAINTEXT_HOT}",
+            FERNET_TOKEN_PREFIX) or 0)
+        return hot + cold, False
+    sample = await pool.fetchrow(
+        "SELECT count(*) AS seen, "
+        f"count(*) FILTER (WHERE {_PLAINTEXT_HOT}) AS plain "
+        f"FROM soul_lines TABLESAMPLE SYSTEM ({SAMPLE_PERCENT})", FERNET_TOKEN_PREFIX)
+    seen, plain = int(sample["seen"]), int(sample["plain"])
+    share = plain / seen if seen else 1.0  # an empty sample: assume the worst, all plaintext
+    return int(reltuples * share) + cold, True
 
 
 async def _any_plaintext(pool: asyncpg.Pool) -> bool:
@@ -208,10 +230,11 @@ async def encrypt_tick(
             return record
         record = {}  # stragglers found: start a fresh pass
     if not record.get("started_at"):
-        hot, cold = await _count_plaintext(pool)
+        total, estimated = await _initial_counts(pool)
         record = {
-            "state": "running", "started_at": _now(), "rows_total": hot + cold,
-            "rows_done": 0, "rows_remaining": hot + cold, "active_secs": 0.0,
+            "state": "running", "started_at": _now(), "rows_total": total,
+            "rows_estimated": estimated,
+            "rows_done": 0, "rows_remaining": total, "active_secs": 0.0,
             "cursor": None, "rate_per_sec": None, "eta_seconds": None, "last_error": None,
         }
     record["state"] = "running"
@@ -234,8 +257,10 @@ async def encrypt_tick(
                     break
             done_this_tick += encrypted
             record["rows_done"] = int(record.get("rows_done", 0)) + encrypted
+            if record["rows_done"] > int(record.get("rows_total", 0)):
+                record["rows_total"] = record["rows_done"]  # an estimate that ran low
             record["rows_remaining"] = max(
-                0, int(record.get("rows_remaining", 0)) - encrypted)
+                0, int(record.get("rows_total", 0)) - record["rows_done"])
             spent = clock() - batch_started
             record["active_secs"] = float(record.get("active_secs", 0.0)) + spent
             if record["active_secs"] > 0 and record["rows_done"]:

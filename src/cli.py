@@ -1042,7 +1042,8 @@ async def cmd_soul_key(
     action: str, *, owner: str | None = None, path: str | None = None,
     backend: str | None = None, finish: bool = False, print_recovery: bool = False,
     repo_url: str | None = None, restart: bool = False, as_json: bool = False,
-    exact: bool = False, pool: asyncpg.Pool | None = None,
+    exact: bool = False, recovery_file: str | None = None,
+    pool: asyncpg.Pool | None = None,
 ) -> int:
     """osiris soul-key <status|init|rotate|restore-drill|enroll-recovery|verify-recovery|recover>:
     THE KEY ENTRY POINT, so that key and backup setup are configurable from the UI or the
@@ -1135,11 +1136,16 @@ async def cmd_soul_key(
             rp_id = (await get_setting(pool, "soul_key.rp_id"))["value"]
             if action == "enroll-recovery":
                 out = soul_key_orchestrator.soul_key_enroll_recovery(path=path, rp_id=rp_id)
+                if "error" not in out and path is None:
+                    # the file leaves the machine now, not at the next offload tick
+                    from src.orchestrator import recovery_copies
+
+                    out["recovery_copies"] = await recovery_copies.sync_now(pool)
             elif action == "verify-recovery":
                 out = soul_key_orchestrator.soul_key_verify_recovery(path=path, rp_id=rp_id)
             else:  # recover
                 out = soul_key_orchestrator.soul_key_recover(
-                    path=path, backend=backend, rp_id=rp_id)
+                    path=path, backend=backend, rp_id=rp_id, recovery_file=recovery_file)
     finally:
         if owns_pool:
             await pool.close()
@@ -4055,6 +4061,12 @@ async def cmd_deploy(
                   f"{key_setup.get('backup_password_error')}")
         if key_setup.get("recovery_note"):
             print(f"NOTE: recovery refresh skipped: {key_setup['recovery_note']}")
+        if key_setup.get("recovery_refreshed"):
+            # the recovery file just changed: get the new one off the machine now
+            from src.orchestrator import recovery_copies
+
+            with contextlib.suppress(Exception):
+                await recovery_copies.sync_now(pool)
 
         tools_before = await list_tools()
 
@@ -7968,6 +7980,10 @@ def _build_parser() -> argparse.ArgumentParser:
                                  "after minting the key (a user-level restart, no "
                                  "sudo needed). Without this flag, init prints the "
                                  "command to run by hand instead")
+    p_soul_key.add_argument("--recovery-file", default=None, dest="recovery_file",
+                            help="recover only: a copy of the recovery file taken from a "
+                                 "backup destination (the osiris-recovery/ folder beside "
+                                 "each target), for a machine that lost everything")
     p_soul_key.add_argument("--exact", action="store_true",
                             help="status only: count the rows still stored in plain "
                                  "text exactly (decrypts every row, can take minutes on a "
@@ -9523,7 +9539,7 @@ def main(argv: list[str] | None = None) -> int:
             args.action, owner=args.owner, path=args.path, backend=args.backend,
             finish=args.finish, print_recovery=args.print_recovery,
             repo_url=args.repo_url, restart=args.restart, as_json=args.as_json,
-            exact=args.exact))
+            exact=args.exact, recovery_file=args.recovery_file))
     if args.command == "restic-key":
         return asyncio.run(cmd_restic_key(
             args.action, path=args.path, backend=args.backend, as_json=args.as_json))

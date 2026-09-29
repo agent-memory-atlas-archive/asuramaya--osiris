@@ -275,3 +275,73 @@ async def test_the_worker_job_waits_quietly_when_there_is_no_key(
     monkeypatch.setattr(soul_crypto, "get_soul_fernet", _missing)
     assert await soul_encrypt_heartbeat({"cascade": SimpleNamespace(actions=actions)}) == 0
     assert prog.read_progress() == {}
+
+
+class _FakePool:
+    """Canned answers for the initial-count queries, so the sampling arithmetic is testable
+    without a two-million-row table."""
+
+    def __init__(self, *, reltuples: int | None, seen: int, plain: int, cold: int = 0) -> None:
+        self.reltuples, self.seen, self.plain, self.cold = reltuples, seen, plain, cold
+        self.fetchval_sql: list[str] = []
+
+    async def fetchval(self, sql: str, *args: Any) -> Any:
+        self.fetchval_sql.append(sql)
+        if "soul_lines_cold" in sql:
+            return self.cold
+        if "reltuples" in sql:
+            return self.reltuples
+        return 12345  # an exact hot count, only reached for a small table
+
+    async def fetchrow(self, sql: str, *args: Any) -> dict[str, int]:
+        assert "TABLESAMPLE" in sql
+        return {"seen": self.seen, "plain": self.plain}
+
+
+async def test_a_big_table_is_estimated_from_a_sample_never_counted_in_full() -> None:
+    pool = _FakePool(reltuples=2_000_000, seen=10_000, plain=9_800, cold=3)
+
+    total, estimated = await prog._initial_counts(pool)  # type: ignore[arg-type]
+
+    assert estimated is True
+    assert total == int(2_000_000 * 0.98) + 3
+    # the only full-table count issued is the small cold-tier one
+    assert not any("count(*) FROM soul_lines WHERE" in q for q in pool.fetchval_sql)
+
+
+async def test_a_small_or_never_analyzed_table_is_counted_exactly() -> None:
+    for reltuples in (None, 500):
+        pool = _FakePool(reltuples=reltuples, seen=0, plain=0, cold=2)
+        total, estimated = await prog._initial_counts(pool)  # type: ignore[arg-type]
+        assert (total, estimated) == (12345 + 2, False)
+
+
+async def test_an_empty_sample_is_read_as_all_plaintext_the_safe_way_round() -> None:
+    pool = _FakePool(reltuples=1_000_000, seen=0, plain=0)
+    total, estimated = await prog._initial_counts(pool)  # type: ignore[arg-type]
+    assert (total, estimated) == (1_000_000, True)
+
+
+async def test_the_first_tick_on_a_big_table_marks_the_totals_as_an_estimate_and_corrects_them(
+    actions: Actions, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _seed_plaintext(actions, tmp_path, "encpass09", 3)
+
+    async def _low_estimate(pool: Any, **_k: Any) -> tuple[int, bool]:
+        return 1, True  # the estimate ran low: 3 rows really need encrypting
+
+    monkeypatch.setattr(prog, "_initial_counts", _low_estimate)
+    first = await prog.encrypt_tick(
+        actions.pool, get_soul_fernet(), batch_size=2, budget_secs=1.5, clock=_Clock(1.0),
+        sleep=_no_sleep)
+    assert first["rows_estimated"] is True
+    assert prog.shape_encryption(first, key_present=True)["rows_estimated"] is True
+
+    final = first
+    for _ in range(5):
+        final = await prog.encrypt_tick(
+            actions.pool, get_soul_fernet(), batch_size=2, budget_secs=1.5,
+            clock=_Clock(1.0), sleep=_no_sleep)
+    assert final["state"] == "complete"
+    assert final["rows_total"] >= final["rows_done"] == 3  # never reads "3 of 1"
+    assert prog.shape_encryption(final, key_present=True)["rows_estimated"] is False

@@ -70,6 +70,12 @@ def _write_restore_drill_receipt(repo_url: str, *, ok: bool, error: str | None) 
     path.write_text(json.dumps(receipts, indent=2))
 
 
+def record_restore_drill(repo_url: str, *, ok: bool, error: str | None) -> None:
+    """Public write entry point for the scheduled drill (`scheduled_drill`), same merge
+    discipline as the manual drill's own receipt."""
+    _write_restore_drill_receipt(repo_url, ok=ok, error=error)
+
+
 def restore_drill_receipts() -> dict[str, Any]:
     """Public read entry point, mirrors offload_runner.offload_receipts() under the
     same name shape. Never writes."""
@@ -121,7 +127,8 @@ async def soul_key_status(
     the EXPLICIT resolved key path, the slow path that decrypts every row.
 
     `recovery`: `enrolled`, `stale` (the enrollment protects an older key generation than
-    the live one), and `verified` (the last `verify-recovery` receipt, or None).
+    the live one), `verified` (the last `verify-recovery` receipt, or None), and
+    `off_box_copies` (how many backup destinations hold the CURRENT recovery file).
 
     `rp_id`: the live `soul_key.rp_id` setting, surfaced here so the console reads it off
     this SAME route instead of hard-coding a second copy."""
@@ -154,10 +161,13 @@ async def soul_key_status(
         fernet = MultiFernet([Fernet(key_bytes)])
         census = await encrypt_existing_soul_lines(pool, dry_run=True, fernet=fernet)
         out["legacy_plaintext_rows"] = census["hot_migrated"] + census["cold_migrated"]
+    from src.orchestrator import recovery_copies
+
     facts = soul_crypto.soul_key_recovery_facts(path=path)
     receipt = recovery_verify_receipt()
     out["recovery"] = {
         "enrolled": facts["enrolled"], "stale": facts["stale"],
+        "off_box_copies": recovery_copies.copy_status(path=path),
         "verified": ({
             "last_verified_at": receipt.get("last_verified_at"),
             "ok": receipt.get("ok"),
@@ -346,12 +356,32 @@ def soul_key_verify_recovery(*, path: str | None = None, rp_id: str) -> dict[str
 
 def soul_key_recover(
     *, path: str | None = None, backend: str | None = None, rp_id: str,
+    recovery_file: str | None = None,
 ) -> dict[str, Any]:
     """Recovers the key onto a box with none, and the backup password with it when the
-    recovery blob carries one (sealed by the same machine-local custody a fresh one gets)."""
+    recovery blob carries one (sealed by the same machine-local custody a fresh one gets).
+
+    `recovery_file`: a copy of the recovery file taken from a backup destination (the
+    plain `osiris-recovery/` copies the offload runner keeps), for a machine that lost
+    everything. It is placed where the recovery file normally lives (never over an
+    existing one) and the ordinary recovery then runs, so a new machine needs the file and
+    the security key, nothing else."""
+    import shutil
+
     from src.ingest import soul_crypto
     from src.orchestrator import restic_credential
 
+    if recovery_file is not None:
+        source = Path(recovery_file).expanduser()
+        target = soul_crypto.recovery_file_path(path=path)
+        if not source.is_file():
+            return {"error": f"recovery file {source} not found"}
+        if target.exists():
+            return {"error": f"a recovery file already exists at {target}; remove it first "
+                             "if you mean to recover from a different copy"}
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+        target.chmod(0o600)
     seal = None if path is not None else (
         lambda pw: restic_credential.seal_recovered_password(pw, backend=backend))
     return soul_crypto.soul_key_recover(

@@ -13,7 +13,9 @@ KEY_READY = {
     "present": True, "recovery_paths_enrolled": ["fido2"], "legacy_plaintext_rows": 0,
     "recovery": {"enrolled": True, "stale": False, "verified": {
         "last_verified_at": "2026-09-29T00:00:00Z", "ok": True, "matches_live_key": True,
-        "last_error": None}},
+        "last_error": None},
+        "off_box_copies": {"enrolled": True, "count": 1, "destinations": ["nas"],
+                           "current": True, "vault": True}},
 }
 NO_RESTIC = {"present": False}
 RESTIC_READY = {"present": True}
@@ -165,8 +167,7 @@ def test_only_the_steps_that_need_a_person_carry_an_action() -> None:
         if s["mode"] == "auto":
             assert s["action"] is None, s["key"]
     assert {s["key"] for s in steps if s["mode"] == "hands"} == {
-        "recovery_enrolled", "recovery_verified", "offload_target_present",
-        "restore_test_passed"}
+        "recovery_enrolled", "recovery_verified", "offload_target_present"}
 
 
 def test_zero_legacy_rows_is_done_never_needs_attention() -> None:
@@ -255,7 +256,50 @@ def test_restore_drill_never_passed_is_missing() -> None:
                                        "last_error": "repository not found"}}
     steps = _steps(soul_key=KEY_READY, restic_key=RESTIC_READY, services_restarted=True,
                    restore_drill_receipts=receipts)
-    assert steps["restore_test_passed"]["status"] == "missing"
+    assert steps["restore_test_passed"]["status"] == "needs_attention"
+    assert "repository not found" in steps["restore_test_passed"]["reason"]
+    assert steps["restore_test_passed"]["action"] is None
+    assert steps["restore_test_passed"]["mode"] == "auto"
+
+
+def test_restore_drill_never_attempted_says_it_runs_by_itself() -> None:
+    step = _steps(soul_key=KEY_READY, restic_key=RESTIC_READY,
+                  services_restarted=True)["restore_test_passed"]
+    assert step["status"] == "missing"
+    assert step["reason"] == "Runs automatically after the first backup, then weekly."
+    assert step["action"] is None
+
+
+def _recovery_with_copies(**copies: object) -> dict[str, object]:
+    return dict(KEY_READY, recovery=dict(KEY_READY["recovery"], off_box_copies=copies))
+
+
+def test_recovery_copy_off_box_is_missing_until_a_target_holds_the_current_file() -> None:
+    step = _steps(soul_key=_recovery_with_copies(count=0, current=False),
+                  services_restarted=True)["recovery_copy_off_box"]
+    assert step["status"] == "missing"
+    assert step["mode"] == "auto"
+    assert step["action"] is None
+    assert step["reason"] == "Copied automatically once a backup target is present."
+    assert step["current"] is True
+
+
+def test_recovery_copy_off_box_is_done_once_a_current_copy_exists() -> None:
+    step = _steps(soul_key=_recovery_with_copies(count=1, current=True),
+                  services_restarted=True)["recovery_copy_off_box"]
+    assert step["status"] == "done"
+
+
+def test_a_copy_of_an_older_enrollment_and_the_vault_alone_are_not_done() -> None:
+    step = _steps(soul_key=_recovery_with_copies(count=0, current=False, vault=True),
+                  services_restarted=True)["recovery_copy_off_box"]
+    assert step["status"] == "missing"
+
+
+def test_recovery_copy_waits_for_the_recovery_method() -> None:
+    step = _steps(soul_key=KEY_NO_RECOVERY, services_restarted=True)["recovery_copy_off_box"]
+    assert step["status"] == "missing"
+    assert step["reason"] == "Waiting for the recovery method."
 
 
 def test_fully_ready_install_has_no_current_step() -> None:

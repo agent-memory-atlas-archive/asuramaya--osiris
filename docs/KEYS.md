@@ -107,6 +107,16 @@ command line through the already-running console, which needs the service up fir
 `osiris soul-key init` and restart both services as soon as you see this warning. Nothing
 about the unencrypted window is silent or hidden.
 
+### The recovery file leaves the machine by itself
+
+Losing the machine must not lose the only copy of the recovery file (and the backup password
+inside it), so the offload runner copies it off-box on every tick: into the vault, and as a
+plain file beside every present backup target (see
+[BACKUP.md](BACKUP.md#the-opportunistic-offload-runner)). Storing it there is safe: only your
+security key and its PIN can open it. `osiris soul-key status` shows how many destinations
+hold the current file (`recovery.off_box_copies`); a copy of an older enrollment does not
+count, and is refreshed on the next run.
+
 ## Rotating the key
 
 Rotation is two steps on purpose, because a live process can keep a key cached in its own
@@ -143,7 +153,9 @@ unwraps the key. Before trusting anything, it checks the recovered key's own fin
 against the one recorded in the recovery file. A mismatch refuses outright, since this is
 treated as a real problem, not a retryable glitch. On success it seals the key under the new
 machine's own host credential, and the backup password with it when the recovery file
-carries one. It refuses if a key already exists at the target path: `recover` is for a
+carries one. On a machine that lost everything, take the plain copy from a backup
+destination and run `osiris soul-key recover --recovery-file PATH`; it places the file
+where the recovery file normally lives and recovers from it. It refuses if a key already exists at the target path: `recover` is for a
 machine with none, and `rotate` is the command once you already have a live key. To check
 that recovery works without replacing anything, use `osiris soul-key verify-recovery`: same
 PIN and touch, same unwrap and fingerprint check, then it stops and records a receipt that
@@ -185,7 +197,7 @@ osiris soul-key <status|init|rotate|restore-drill|enroll-recovery|verify-recover
 | `rotate` | mint a new key and re-encrypt every row onto it. `--finish` once the result is clean |
 | `restore-drill` | prove that an off-box backup repository actually restores. Runs against every configured off-box backup URL, or one named target via `--repo-url` |
 
-Flags: `--path P` overrides the automatically resolved key file location. `--backend
+Flags: `--recovery-file PATH` applies to `recover` only (see below). `--path P` overrides the automatically resolved key file location. `--backend
 host-cred|host+tpm2|file` applies to `init`/`recover` only. `--owner USER` applies to `init`
 only, for a deployment running as a system account with no natural file owner of its own.
 `--restart` applies to `init` only, and restarts both services right after minting.
