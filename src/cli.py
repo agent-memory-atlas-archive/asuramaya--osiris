@@ -3799,6 +3799,18 @@ async def _real_check_whisper_probe() -> tuple[bool, str]:
         return await _synthetic_automount_probe(client)
 
 
+def _ensure_mcp_approval_line() -> str:
+    """`src.orchestrator.mcp_approval.approval_line`: merges `osiris` into the user-level
+    `enabledMcpjsonServers` and returns the line deploy prints. Never raises past its own
+    boundary; a settings file it cannot merge is reported and left untouched."""
+    from src.orchestrator.mcp_approval import approval_line
+
+    try:
+        return approval_line()
+    except Exception as exc:  # noqa: BLE001 - a settings hiccup must never crash deploy's report
+        return f"mcp approval: skipped ({type(exc).__name__}: {exc})"
+
+
 def _run_install_script(script_rel: str, root: Path) -> str:
     """Run one of this repo's idempotent install-*.sh scripts: deploy is the one
     sanctioned hand that writes machine files, since a read-only status line that can
@@ -4361,6 +4373,11 @@ async def cmd_deploy(
         print(_run_install_script("scripts/install_commands.sh", root))
         from scripts.commands_status import commands_status
         print(commands_status(root))
+
+        # THE MCP PROMPT, ONCE: approve osiris for every directory (worktrees and onboarded
+        # repos included) in the user-level settings, instead of Claude Code asking again
+        # for each new checkout. Resolved by name at call time so tests can replace it.
+        print(await asyncio.to_thread(_ensure_mcp_approval_line))
 
         print(_run_install_script("scripts/install_prune_timers.sh", root))
 

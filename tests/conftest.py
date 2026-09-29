@@ -641,6 +641,10 @@ def _no_real_key_setup(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest
     # the off-box recovery copies and the scheduled restore drill (run from the offload tick)
     # write receipts and would run a real restic restore: redirected and stubbed the same way
     monkeypatch.setenv("OSIRIS_RECOVERY_COPIES_FILE", str(state / "recovery_copies.json"))
+    # the user-level Claude config that deploy/onboard read (and deploy writes): never the
+    # developer's own ~/.claude.json or ~/.claude/settings.json
+    claude_home = tmp_path_factory.mktemp("claude_home")
+    monkeypatch.setenv("OSIRIS_CLAUDE_HOME", str(claude_home))
     monkeypatch.setenv("OSIRIS_RESTORE_DRILL_RECEIPTS_FILE", str(state / "drill_receipts.json"))
 
     def _no_real_drill(repo_url: str) -> str | None:
