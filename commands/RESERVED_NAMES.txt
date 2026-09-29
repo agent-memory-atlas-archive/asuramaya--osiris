@@ -27,6 +27,7 @@ brief
 btw
 bug
 cd
+checkpoint
 checkup
 chrome
 claude-api
@@ -42,6 +43,7 @@ computer
 config
 confirm
 context
+continue
 copy
 cost
 count
@@ -100,6 +102,7 @@ mobile
 model
 name
 navigate
+new
 nohup
 output-style
 passes
@@ -128,12 +131,15 @@ remote
 remote-control
 remote-env
 rename
+reset
 responsive-mode
 restart
 resume
+rewind
 routines
 run
 run-skill-generator
+sandbox
 schedule
 scroll-speed
 security-review
@@ -143,6 +149,7 @@ setup-bedrock
 setup-claude
 setup-cowork
 setup-vertex
+share
 skill-doctor
 skills
 sleep
@@ -166,6 +173,7 @@ tp
 tui
 ultraplan
 ultrareview
+undo
 update
 update-config
 upgrade

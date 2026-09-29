@@ -1,9 +1,10 @@
 """osiris's slash commands never share a name with a Claude Code built-in.
 
 commands/*.md (and deploy/commands/*.md) install into ~/.claude/commands/, the same
-namespace Claude Code's own built-ins and aliases live in. /resume, /status and /stop
-collided with Claude Code 2.1.284; they were retired (resume/stop fold into `/seat`,
-status became `/osiris`). commands/RESERVED_NAMES.txt is the vendored built-in list
+namespace Claude Code's own built-ins and aliases live in. /resume, /settings, /status and
+/stop collided with Claude Code 2.1.284; they were retired (resume/stop fold into `/seat`,
+status became `/osiris`, settings became `/osiris-settings`). No exceptions are tolerated.
+commands/RESERVED_NAMES.txt is the vendored built-in list
 (scripts/refresh_reserved_names.py regenerates it from the installed binary); this file
 is the gate that keeps a new collision from shipping.
 """
@@ -22,11 +23,7 @@ from scripts.refresh_reserved_names import extract_names, read_reserved
 ROOT = Path(__file__).resolve().parent.parent
 COMMAND_DIRS = [ROOT / "commands", ROOT / "deploy" / "commands"]
 INSTALLER = ROOT / "scripts" / "install_commands.sh"
-RETIRED_NAMES = ("resume", "status", "stop")
-
-
-def _known_collisions() -> set[str]:
-    return read_reserved(ROOT / "commands" / "KNOWN_COLLISIONS.txt")
+RETIRED_NAMES = ("resume", "settings", "status", "stop")
 
 
 def _stems() -> dict[str, Path]:
@@ -40,7 +37,7 @@ def _stems() -> dict[str, Path]:
 def test_reserved_list_is_loaded_and_holds_the_known_built_ins() -> None:
     reserved = read_reserved()
     assert len(reserved) > 100, "commands/RESERVED_NAMES.txt looks truncated"
-    # the three that actually collided, plus aliases the original sweep called out
+    # the four that actually collided, plus aliases the original sweep called out
     for name in (*RETIRED_NAMES, "cost", "stats", "restart", "remote", "name", "peers",
                  "help", "clear", "config", "settings"):
         assert name in reserved, f"{name!r} missing from RESERVED_NAMES.txt"
@@ -49,21 +46,11 @@ def test_reserved_list_is_loaded_and_holds_the_known_built_ins() -> None:
 def test_no_slash_command_name_is_a_claude_code_built_in() -> None:
     reserved = read_reserved()
     stems = _stems()
-    collisions = {s for s in stems if s in reserved}
-    new = sorted(collisions - _known_collisions())
+    new = sorted(s for s in stems if s in reserved)
     assert not new, (
         "these slash commands share a name with a Claude Code built-in command or alias "
         "(commands/RESERVED_NAMES.txt) and would shadow it or be shadowed by it: "
         + ", ".join(f"/{s} ({stems[s].relative_to(ROOT)})" for s in new))
-
-
-def test_known_collisions_only_shrink() -> None:
-    """KNOWN_COLLISIONS.txt must name exactly the live collisions: an entry whose
-    command was renamed (or whose name Claude Code dropped) comes out in the same commit."""
-    reserved = read_reserved()
-    live = {s for s in _stems() if s in reserved}
-    stale = sorted(_known_collisions() - live)
-    assert not stale, f"KNOWN_COLLISIONS.txt lists names that no longer collide: {stale}"
 
 
 def test_retired_names_stay_retired() -> None:
@@ -109,8 +96,7 @@ def _synthetic_repo(tmp_path: Path, commands: dict[str, str]) -> Path:
     (repo / "scripts").mkdir()
     for name, body in commands.items():
         (repo / "commands" / name).write_text(body)
-    for extra in ("RESERVED_NAMES.txt", "KNOWN_COLLISIONS.txt"):
-        shutil.copy(ROOT / "commands" / extra, repo / "commands" / extra)
+    shutil.copy(ROOT / "commands" / "RESERVED_NAMES.txt", repo / "commands")
     shutil.copy(INSTALLER, repo / "scripts" / "install_commands.sh")
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True, capture_output=True,
                    timeout=60)
@@ -164,13 +150,21 @@ def test_installer_retires_only_osiris_authored_copies(tmp_path: Path) -> None:
     assert (target / "status.md").read_text() == "somebody's own /status command\n"
 
 
-def test_extraction_patterns_catch_every_command_object_shape() -> None:
+def test_extraction_reads_aliases_wherever_they_sit_in_the_object() -> None:
+    """Each object below puts `aliases` somewhere else relative to `name`/`type`; the
+    /config shape (aliases after the type, then a getter) is the one that shipped
+    `settings` past an order-bound regex. An untyped object is not a command."""
     blob = (
-        'name:"alpha",aliases:["al"],description:"x"'
-        'type:"local-jsx",name:"beta",aliases:["be"],get description(){}'
-        'name:"gamma",type:"local",description:"x"'
-        'aliases:["de"],name:"delta",progressMessage:"x"'
-        'ps({name:"epsilon",aliases:["ep"],isEnabled:()=>!0})'
+        'var a={name:"alpha",aliases:["al"],description:"x"};'
+        'var b={type:"local-jsx",name:"beta",get description(){return"y"},aliases:["be"]};'
+        'var c={aliases:["settings"],type:"local-jsx",name:"config",description:"x"};'
+        'var d={type:"local",name:"delta",argumentHint:"[k]",'
+        'load:()=>f({name:"inner-helper"}),aliases:["de","dee"]};'
+        'var e={type:"prompt",contentLength:0,aliases:["ep"],name:"epsilon"};'
+        'ps({name:"zeta",aliases:["ze"],isEnabled:()=>!0});'
+        'var g={name:"not-a-command",value:1};'
     )
-    assert extract_names(blob) == {"alpha", "al", "beta", "be", "gamma", "delta", "de",
-                                   "epsilon", "ep"}
+    names = extract_names(blob)
+    assert {"alpha", "al", "beta", "be", "config", "settings", "delta", "de", "dee",
+            "epsilon", "ep", "zeta", "ze"} <= names
+    assert "not-a-command" not in names

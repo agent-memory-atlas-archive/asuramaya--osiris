@@ -21,11 +21,10 @@
 # NO NAME COLLISIONS WITH CLAUDE CODE: a command whose name is in
 # commands/RESERVED_NAMES.txt (Claude Code's built-in commands and aliases, refreshed by
 # scripts/refresh_reserved_names.py) is REFUSED, named on stderr, and the run exits 1.
-# The one escape is commands/KNOWN_COLLISIONS.txt, a shrink-only list of collisions still
-# awaiting a rename: those install with a WARNING.
+# There is no exception list: a colliding command gets renamed, never tolerated.
 #
-# RETIRED NAMES: /resume, /status and /stop used to ship here and shadowed Claude Code's
-# own built-ins. RETIRED below lists every osiris-authored version of each (sha256 of
+# RETIRED NAMES: /resume, /settings, /status and /stop used to ship here and shadowed
+# Claude Code's own built-ins. RETIRED below lists every osiris-authored version of each (sha256 of
 # every revision git ever held for commands/<name>). A retired file in the target is
 # removed ONLY when its bytes hash to one of those versions; anything else under that
 # name is somebody's own command and is left alone, with a line saying so.
@@ -37,6 +36,7 @@ resume.md fe8787669183e5757c7ee1c1153d5266249cac91f7a0789925567010ffbe041a
 status.md 3e22068bb7d014c9892df49ee8c90f318141a72837385710bafc0a8ac0fa00d1
 status.md f28372f40b7a4bfa77f9d7526f5d240291c5a8352a908c7be4d5774c113b4466
 stop.md b4a094d8eb2bb1f345491c808e803976ca53355da56ce7aa0ff9e45a6ff8a2af
+settings.md be6a1ba293444243eb3dfde72ca574b1ca15f04b89cce86e681981c02bc996ed
 '
 
 sha256_of() {
@@ -65,7 +65,6 @@ fi
 mkdir -p "$TARGET_DIR"
 
 RESERVED_NAMES="$(names_in "$SOURCE_DIR/RESERVED_NAMES.txt")"
-KNOWN_COLLISIONS="$(names_in "$SOURCE_DIR/KNOWN_COLLISIONS.txt")"
 
 installed=0
 current=0
@@ -76,15 +75,10 @@ for src in "$SOURCE_DIR"/*.md; do
     target="$TARGET_DIR/$name"
     stem="${name%.md}"
     if printf '%s\n' "$RESERVED_NAMES" | grep -qxF "$stem"; then
-        if printf '%s\n' "$KNOWN_COLLISIONS" | grep -qxF "$stem"; then
-            echo "install_commands: WARNING: /$stem collides with a Claude Code built-in" \
-                 "(commands/KNOWN_COLLISIONS.txt: pending rename); installed anyway" >&2
-        else
-            echo "install_commands: REFUSED $name: /$stem is a Claude Code built-in command" \
-                 "or alias (commands/RESERVED_NAMES.txt); rename it" >&2
-            refused=$((refused + 1))
-            continue
-        fi
+        echo "install_commands: REFUSED $name: /$stem is a Claude Code built-in command" \
+             "or alias (commands/RESERVED_NAMES.txt); rename it" >&2
+        refused=$((refused + 1))
+        continue
     fi
     if [ -f "$target" ] && cmp -s "$src" "$target"; then
         current=$((current + 1))

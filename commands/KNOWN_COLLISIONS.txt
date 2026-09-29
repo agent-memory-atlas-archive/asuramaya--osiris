@@ -1,5 +1,0 @@
-# Reserved names (commands/RESERVED_NAMES.txt) osiris still ships, each pending a rename
-# nobody has ruled on yet. scripts/install_commands.sh installs these with a WARNING
-# instead of refusing them; tests/test_command_names.py requires this list to equal the
-# live collision set exactly, so it can only shrink. Never add a name to dodge the gate.
-settings  collides with Claude Code's `/config` alias `settings` (2.1.284)
