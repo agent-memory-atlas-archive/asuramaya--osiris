@@ -1662,9 +1662,13 @@ def create_app(pool: asyncpg.Pool | None = None) -> FastAPI:
         """Return the status of the backup encryption credential used by the
         backup tool: whether a credential exists and which backend holds it.
         Never returns the credential itself."""
+        from src.ingest.soul_crypto import soul_key_recovery_facts
         from src.orchestrator.restic_credential import restic_key_status
 
-        return restic_key_status()
+        out = restic_key_status()
+        # the backup password also rides inside the security-key recovery enrollment
+        out["recovery_wrapped"] = soul_key_recovery_facts()["restic_wrapped"]
+        return out
 
     # THE RESTIC-KEY INIT ROUTE: matches the console's own GUI parity goal of doing
     # every key/backup operation from the browser, not just the CLI. Mirrors `osiris

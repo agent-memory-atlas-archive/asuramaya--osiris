@@ -110,6 +110,103 @@ async def test_run_offload_tick_degrades_the_whole_tick_on_a_missing_password(
     assert out["targets"] == []
 
 
+async def test_the_tick_copies_the_recovery_file_before_any_backup_runs(
+    actions: Actions, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The vault copy must exist BEFORE the restic backup, so the backup carries it; and the
+    plain copy beside a present target happens even when that target's backup then fails."""
+    from src.orchestrator import recovery_copies
+
+    order: list[str] = []
+
+    async def _sync(targets: list[dict[str, object]], vault: Path) -> list[dict[str, object]]:
+        order.append("copies:" + ",".join(str(t["name"]) for t in targets))
+        return [{"dest": "(vault)", "ok": True}, {"dest": "nas", "ok": True}]
+
+    def _backup(**kw: object) -> str | None:
+        order.append("backup")
+        return "restic backup failed: boom"
+
+    monkeypatch.setattr(recovery_copies, "sync_recovery_copies", _sync)
+    monkeypatch.setattr(offload_runner, "_run_restic_backup", _backup)
+    await write_backup_settings(
+        actions.pool, actor="operator", because="x",
+        offload_targets=[{"name": "nas", "kind": "restic", "path_or_url": "sftp:nas:/r",
+                          "schedule": "*-*-* 03:00:00", "enabled": True}])
+
+    out = await offload_runner.run_offload_tick(actions.pool, vault=tmp_path)
+
+    assert order == ["copies:nas", "backup"]
+    assert out["recovery_copies"] == [{"dest": "(vault)", "ok": True},
+                                      {"dest": "nas", "ok": True}]
+
+
+async def test_the_recovery_copies_still_happen_when_the_backup_password_is_missing(
+    actions: Actions, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from src.orchestrator import recovery_copies
+
+    async def _sync(targets: list[dict[str, object]], vault: Path) -> list[dict[str, object]]:
+        return [{"dest": "(vault)", "ok": True}]
+
+    monkeypatch.setattr(recovery_copies, "sync_recovery_copies", _sync)
+    monkeypatch.delenv("OSIRIS_RESTIC_PASSWORD", raising=False)
+    monkeypatch.delenv("CREDENTIALS_DIRECTORY", raising=False)
+
+    out = await offload_runner.run_offload_tick(actions.pool, vault=tmp_path)
+
+    assert "error" in out
+    assert out["targets"] == []
+    assert out["recovery_copies"] == [{"dest": "(vault)", "ok": True}]
+
+
+async def test_the_first_successful_offload_is_followed_by_a_restore_drill_then_not_again(
+    actions: Actions, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.orchestrator import scheduled_drill, soul_key
+
+    drilled: list[str] = []
+
+    def _drill(url: str) -> str | None:
+        drilled.append(url)
+        return None
+
+    monkeypatch.setattr(scheduled_drill, "_real_run_drill", _drill)
+    monkeypatch.setattr(offload_runner, "_run_restic_backup", lambda **kw: None)
+    await write_backup_settings(
+        actions.pool, actor="operator", because="x",
+        offload_targets=[{"name": "nas", "kind": "restic", "path_or_url": "sftp:nas:/r",
+                          "schedule": "*-*-* 03:00:00", "enabled": True}])
+
+    first = await offload_runner.run_offload_tick(actions.pool)
+    second = await offload_runner.run_offload_tick(actions.pool)
+
+    assert first["drills"] == [{"name": "nas", "ok": True}]
+    assert "drills" not in second
+    assert drilled == ["sftp:nas:/r"]
+    assert soul_key.restore_drill_receipts()["sftp:nas:/r"]["last_passed_at"]
+
+
+async def test_no_drill_runs_when_the_backup_itself_failed(
+    actions: Actions, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.orchestrator import scheduled_drill
+
+    def _drill(url: str) -> str | None:
+        raise AssertionError("must not drill a target that never had a good offload")
+
+    monkeypatch.setattr(scheduled_drill, "_real_run_drill", _drill)
+    monkeypatch.setattr(offload_runner, "_run_restic_backup", lambda **kw: "boom")
+    await write_backup_settings(
+        actions.pool, actor="operator", because="x",
+        offload_targets=[{"name": "nas", "kind": "restic", "path_or_url": "sftp:nas:/r",
+                          "schedule": "*-*-* 03:00:00", "enabled": True}])
+
+    out = await offload_runner.run_offload_tick(actions.pool)
+
+    assert "drills" not in out
+
+
 @pytest.mark.skipif(shutil.which("restic") is None, reason="restic not installed on this box")
 def test_run_restic_backup_real_round_trip_against_a_local_repository(tmp_path: Path) -> None:
     """The ONE real subprocess exercise of the actual restic boundary — a genuine

@@ -2524,6 +2524,111 @@ async def test_cmd_deploy_refuses_before_the_whisper_probe_when_the_mcp_socket_n
     assert "waiting 60s (ceiling)" in buf.getvalue()
 
 
+async def test_cmd_deploy_mints_the_key_before_the_restart_and_says_so(
+    actions: Actions, tmp_path: Path,
+) -> None:
+    """A fresh box needs no command: the deploy creates the key (and the backup password)
+    BEFORE the restart, so the services boot with it and no separate restart is needed."""
+    order: list[str] = []
+
+    async def _setup() -> dict[str, Any]:
+        order.append("setup")
+        return {"ok": True, "minted": True, "key": "minted", "backup_password": "minted",
+                "tss_hint": "join the tss group for a stronger key"}
+
+    async def _restart(units: list[str]) -> tuple[int, str]:
+        order.append("restart")
+        return 0, "done"
+
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        await cmd_deploy(repo_root=tmp_path, git_status=lambda root: [], restart=_restart,
+                         pool=actions.pool, ensure_key_setup=_setup,
+                         wait_for_health=_fake_wait_for_health,
+                         wait_for_smoke=_fake_wait_for_smoke,
+                         wait_for_mcp_socket=_fake_wait_for_mcp_socket,
+                         check_whisper_probe=_fake_check_whisper_ok)
+    assert order[:2] == ["setup", "restart"]
+    assert "key: created" in buf.getvalue()
+    assert "backup password: created" in buf.getvalue()
+    assert "join the tss group" in buf.getvalue()
+
+
+async def test_cmd_deploy_stays_quiet_when_the_key_and_password_already_exist(
+    actions: Actions, tmp_path: Path,
+) -> None:
+    async def _setup() -> dict[str, Any]:
+        return {"ok": True, "minted": False, "key": "present", "backup_password": "present"}
+
+    async def _restart(units: list[str]) -> tuple[int, str]:
+        return 0, "done"
+
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        await cmd_deploy(repo_root=tmp_path, git_status=lambda root: [], restart=_restart,
+                         pool=actions.pool, ensure_key_setup=_setup,
+                         wait_for_health=_fake_wait_for_health,
+                         wait_for_smoke=_fake_wait_for_smoke,
+                         wait_for_mcp_socket=_fake_wait_for_mcp_socket,
+                         check_whisper_probe=_fake_check_whisper_ok)
+    assert "key: created" not in buf.getvalue()
+    assert "backup password" not in buf.getvalue()
+
+
+async def test_cmd_deploy_refuses_without_restarting_when_no_key_can_be_created(
+    actions: Actions, tmp_path: Path,
+) -> None:
+    """The services cannot boot without a key, so a deploy that cannot make one must stop
+    BEFORE the restart, never restart onto a box that will crash-loop."""
+    async def _setup() -> dict[str, Any]:
+        return {"ok": False, "key": "failed", "error": "credstore is read-only"}
+
+    async def _restart(units: list[str]) -> tuple[int, str]:
+        raise AssertionError("must never restart when the key could not be created")
+
+    import io
+    from contextlib import redirect_stderr
+
+    err = io.StringIO()
+    with redirect_stderr(err):
+        out = await cmd_deploy(repo_root=tmp_path, git_status=lambda root: [], restart=_restart,
+                               pool=actions.pool, ensure_key_setup=_setup)
+    assert out == 1
+    assert "refused" in err.getvalue()
+    assert "credstore is read-only" in err.getvalue()
+    assert "Nothing was restarted" in err.getvalue()
+
+
+async def test_cmd_deploy_names_a_backup_password_problem_but_carries_on(
+    actions: Actions, tmp_path: Path,
+) -> None:
+    async def _setup() -> dict[str, Any]:
+        return {"ok": True, "minted": False, "key": "present", "backup_password": "failed",
+                "backup_password_error": "OSError: read-only"}
+
+    async def _restart(units: list[str]) -> tuple[int, str]:
+        return 0, "done"
+
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        await cmd_deploy(repo_root=tmp_path, git_status=lambda root: [], restart=_restart,
+                         pool=actions.pool, ensure_key_setup=_setup,
+                         wait_for_health=_fake_wait_for_health,
+                         wait_for_smoke=_fake_wait_for_smoke,
+                         wait_for_mcp_socket=_fake_wait_for_mcp_socket,
+                         check_whisper_probe=_fake_check_whisper_ok)
+    assert "backup password not set up: OSError: read-only" in buf.getvalue()
+
+
 async def test_cmd_deploy_records_normally_when_the_whisper_probe_succeeds(
     actions: Actions, tmp_path: Path,
 ) -> None:

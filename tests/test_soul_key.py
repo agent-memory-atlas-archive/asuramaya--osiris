@@ -36,10 +36,63 @@ async def test_soul_key_status_absent(tmp_path, actions: Actions) -> None:
     assert out["rp_id"] == "localhost"
 
 
-async def test_soul_key_status_present_runs_the_live_census(tmp_path, actions: Actions) -> None:
+async def test_soul_key_status_present_is_fast_and_never_runs_the_census(
+    tmp_path, actions: Actions, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default status reads the background pass's progress record, never the
+    decrypt-every-row census that took over a minute on a large store."""
+    from src.ingest import soul_store
+
+    async def _never(*_a: object, **_k: object) -> dict[str, int]:
+        raise AssertionError("the default status must not run the whole-table census")
+
+    monkeypatch.setattr(soul_store, "encrypt_existing_soul_lines", _never)
     key_file = tmp_path / "soul.key"
     key_file.write_bytes(Fernet.generate_key())
+
     out = await soul_key.soul_key_status(actions.pool, path=str(key_file))
+
+    assert out["present"] is True
+    assert out["encryption"]["state"] == "pending"
+    assert out["legacy_plaintext_rows"] is None  # nothing has counted yet, said honestly
+    assert out["recovery"] == {
+        "enrolled": False, "stale": False, "verified": None,
+        "off_box_copies": {"enrolled": False, "count": 0, "destinations": [],
+                           "current": False, "vault": False}}
+
+
+async def test_soul_key_status_reads_the_progress_record(
+    tmp_path, actions: Actions,
+) -> None:
+    from src.orchestrator import soul_encrypt_progress
+
+    soul_encrypt_progress._write_progress({
+        "state": "running", "rows_done": 40, "rows_remaining": 60, "rows_total": 100,
+        "rate_per_sec": 8.0, "eta_seconds": 15, "started_at": "t0", "updated_at": "t1"})
+    key_file = tmp_path / "soul.key"
+    key_file.write_bytes(Fernet.generate_key())
+
+    out = await soul_key.soul_key_status(actions.pool, path=str(key_file))
+
+    assert out["legacy_plaintext_rows"] == 60
+    assert out["encryption"] == {
+        "state": "running", "rows_done": 40, "rows_remaining": 60, "rows_total": 100,
+        "rate_per_sec": 8.0, "eta_seconds": 15, "started_at": "t0", "updated_at": "t1",
+        "last_error": None, "rows_estimated": False}
+
+
+async def test_soul_key_status_with_no_key_reports_no_key_state(
+    tmp_path, actions: Actions,
+) -> None:
+    out = await soul_key.soul_key_status(actions.pool, path=str(tmp_path / "absent"))
+    assert out["encryption"]["state"] == "no_key"
+    assert out["legacy_plaintext_rows"] is None
+
+
+async def test_soul_key_status_exact_runs_the_live_census(tmp_path, actions: Actions) -> None:
+    key_file = tmp_path / "soul.key"
+    key_file.write_bytes(Fernet.generate_key())
+    out = await soul_key.soul_key_status(actions.pool, path=str(key_file), exact=True)
     assert out["present"] is True
     assert isinstance(out["legacy_plaintext_rows"], int)
 

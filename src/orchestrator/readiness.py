@@ -1,7 +1,15 @@
-"""THE FIRST-RUN STEPPER: one ordered list of the eight things a fresh install walks
-through, replacing the Settings pane's old Readiness checklist (a flat, unordered
-table of yes/no/unknown facts with no sense of "what's next"). Operator ruling: no
-paragraphs in the console, a guided step-by-step with flags when something is missing.
+"""THE FIRST-RUN STEPPER: one ordered list of the things a fresh install walks through,
+replacing the Settings pane's old Readiness checklist (a flat, unordered table of yes/no/
+unknown facts with no sense of "what's next"). Operator ruling: no paragraphs in the
+console, a guided step-by-step with flags when something is missing.
+
+EVERY STEP CARRIES A `mode`: "auto" or "hands". Setup is automatic (operator ruling): the
+key and the backup password are created by the deploy, existing data is encrypted by a
+background worker job, the offload runs on its own timer, the recovery file is copied beside
+the backups, the restore test runs after the first backup and then weekly. An automatic step
+shows PROGRESS (`progress`, or a plain reason) and never has an action button. Only the steps
+that physically need a person (touching the security key, naming a backup destination) carry
+an `action`.
 
 Deliberately a PURE function, no pool, no live reads of its own: every fact it needs
 (soul-key status, restic-key status, the offload targets with their own live presence
@@ -19,15 +27,62 @@ from typing import Any, Literal
 StepStatus = Literal["done", "missing", "needs_attention"]
 
 STEP_ORDER = (
-    "key_set_up", "services_restarted", "recovery_enrolled", "data_encrypted",
-    "backup_password_set", "offload_target_present", "offload_run", "restore_test_passed",
+    "key_set_up", "services_restarted", "recovery_enrolled", "recovery_verified",
+    "recovery_copy_off_box", "data_encrypted", "backup_password_set",
+    "offload_target_present", "offload_run", "restore_test_passed",
 )
 
 
 def _step(key: str, label: str, status: StepStatus, reason: str | None,
-          action: dict[str, Any] | None) -> dict[str, Any]:
+          action: dict[str, Any] | None, *, mode: Literal["auto", "hands"] = "auto",
+          progress: dict[str, Any] | None = None) -> dict[str, Any]:
     return {"key": key, "label": label, "status": status, "reason": reason,
-            "action": action, "current": False}
+            "action": action, "current": False, "mode": mode, "progress": progress}
+
+
+def _eta_text(eta_seconds: int | None) -> str:
+    if not eta_seconds:
+        return ""
+    if eta_seconds < 90:
+        return ", almost done"
+    if eta_seconds < 5400:
+        return f", about {round(eta_seconds / 60)} min left"
+    return f", about {round(eta_seconds / 3600)} h left"
+
+
+def _data_encrypted_step(soul_key: dict[str, Any], key_present: bool) -> dict[str, Any]:
+    label = "Existing data encrypted"
+    if not key_present:
+        return _step("data_encrypted", label, "missing", "Waiting for the key.", None)
+    enc = soul_key.get("encryption")
+    if enc is None:  # an older status shape: only a bare remaining count
+        legacy_rows = soul_key.get("legacy_plaintext_rows")
+        if not legacy_rows:
+            return _step("data_encrypted", label, "done", None, None)
+        return _step("data_encrypted", label, "missing",
+                     f"{legacy_rows} item(s) still stored in plain text.", None)
+    state = enc.get("state")
+    if state == "complete":
+        return _step("data_encrypted", label, "done", None, None)
+    done, remaining = enc.get("rows_done") or 0, enc.get("rows_remaining")
+    total = enc.get("rows_total")
+    progress = {
+        "done": done, "total": total, "eta_seconds": enc.get("eta_seconds"),
+        "rate_per_sec": enc.get("rate_per_sec"),
+        "estimate": (bool(enc.get("rows_estimated")) or state != "running"
+                     or remaining is None),
+    }
+    if state == "error":
+        return _step("data_encrypted", label, "needs_attention",
+                     f"Encryption hit a problem and will retry: {enc.get('last_error')}",
+                     None, progress=progress)
+    if state == "running" and remaining is not None:
+        return _step("data_encrypted", label, "missing",
+                     f"Encrypting in the background: {remaining} item(s) left"
+                     f"{_eta_text(enc.get('eta_seconds'))}.", None, progress=progress)
+    return _step("data_encrypted", label, "missing",
+                 "Encryption starts automatically in the background.", None,
+                 progress=progress)
 
 
 def compute_readiness_steps(
@@ -48,59 +103,83 @@ def compute_readiness_steps(
     steps.append(_step(
         "key_set_up", "Encryption key set up",
         "done" if key_present else "missing",
-        None if key_present else "Not set up yet.",
-        None if key_present else {"kind": "init_key"},
+        None if key_present else "Created automatically when osiris is installed or updated.",
+        None,
     ))
 
     if not key_present:
         steps.append(_step(
             "services_restarted", "Services restarted with the key", "missing",
-            "Set up the key first.", {"kind": "jump", "target": "key_set_up"}))
+            "Waiting for the key.", None))
     elif services_restarted is True:
         steps.append(_step(
             "services_restarted", "Services restarted with the key", "done", None, None))
-    elif services_restarted is False:
-        steps.append(_step(
-            "services_restarted", "Services restarted with the key", "needs_attention",
-            "Restart osiris-mcp and osiris-worker to pick up the key.",
-            {"kind": "restart_services"}))
     else:
         steps.append(_step(
             "services_restarted", "Services restarted with the key", "needs_attention",
-            "Could not confirm; restart the services by hand if you haven't.",
-            {"kind": "restart_services"}))
+            "Waiting for the services to restart with the key." if services_restarted is False
+            else "Could not confirm the services restarted with the key.", None))
 
+    recovery = soul_key.get("recovery") or {}
     recovery_count = len(soul_key.get("recovery_paths_enrolled") or [])
     if not key_present:
         steps.append(_step(
             "recovery_enrolled", "Recovery method enrolled", "missing",
-            "Set up the key first.", {"kind": "jump", "target": "key_set_up"}))
+            "Waiting for the key.", None, mode="hands"))
     elif recovery_count >= 1:
-        steps.append(_step("recovery_enrolled", "Recovery method enrolled", "done", None, None))
+        steps.append(_step(
+            "recovery_enrolled", "Recovery method enrolled", "done", None, None,
+            mode="hands"))
     else:
         steps.append(_step(
             "recovery_enrolled", "Recovery method enrolled", "missing",
-            "No recovery method enrolled yet.", {"kind": "enroll_recovery"}))
+            "Touch your security key to enroll it.", {"kind": "enroll_recovery"},
+            mode="hands"))
 
-    legacy_rows = soul_key.get("legacy_plaintext_rows")
-    if not key_present:
+    verified = recovery.get("verified") or {}
+    if recovery_count < 1:
         steps.append(_step(
-            "data_encrypted", "Existing data encrypted", "missing",
-            "Set up the key first.", {"kind": "jump", "target": "key_set_up"}))
-    elif not legacy_rows:
-        steps.append(_step("data_encrypted", "Existing data encrypted", "done", None, None))
+            "recovery_verified", "Recovery checked", "missing",
+            "Enroll the recovery method first.", None, mode="hands"))
+    elif recovery.get("stale"):
+        steps.append(_step(
+            "recovery_verified", "Recovery checked", "needs_attention",
+            "The key changed since recovery was enrolled. Enroll it again.",
+            {"kind": "enroll_recovery"}, mode="hands"))
+    elif verified.get("last_verified_at") and verified.get("ok") is not False:
+        steps.append(_step("recovery_verified", "Recovery checked", "done", None, None,
+                           mode="hands"))
+    elif verified.get("last_error"):
+        steps.append(_step(
+            "recovery_verified", "Recovery checked", "needs_attention",
+            f"The last check failed: {verified['last_error']}",
+            {"kind": "verify_recovery"}, mode="hands"))
     else:
         steps.append(_step(
-            "data_encrypted", "Existing data encrypted", "needs_attention",
-            f"{legacy_rows} item(s) still stored in plain text.",
-            {"kind": "encrypt_existing"}))
+            "recovery_verified", "Recovery checked", "missing",
+            "Touch your security key to confirm recovery works. Nothing is changed.",
+            {"kind": "verify_recovery"}, mode="hands"))
+
+    copies = recovery.get("off_box_copies") or {}
+    if recovery_count < 1:
+        steps.append(_step(
+            "recovery_copy_off_box", "Recovery copy off-box", "missing",
+            "Waiting for the recovery method.", None))
+    elif copies.get("current"):
+        steps.append(_step("recovery_copy_off_box", "Recovery copy off-box", "done", None, None))
+    else:  # includes a copy of an older enrollment, which the copy status does not count
+        steps.append(_step(
+            "recovery_copy_off_box", "Recovery copy off-box", "missing",
+            "Copied automatically once a backup target is present.", None))
+
+    steps.append(_data_encrypted_step(soul_key, key_present))
 
     restic_present = bool(restic_key.get("present"))
     steps.append(_step(
         "backup_password_set", "Backup password set",
         "done" if restic_present else "missing",
-        None if restic_present else "Not set up yet.",
-        None if restic_present else {"kind": "init_restic"},
+        None if restic_present else "Created automatically when osiris is installed or updated.",
+        None,
     ))
 
     enabled_targets = [t for t in offload_targets if t.get("enabled")]
@@ -108,17 +187,18 @@ def compute_readiness_steps(
     if not enabled_targets:
         steps.append(_step(
             "offload_target_present", "First offload target configured and present",
-            "missing", "No offload targets configured yet.", {"kind": "configure_offload"}))
+            "missing", "Choose where backups go.", {"kind": "configure_offload"},
+            mode="hands"))
     elif primary and primary.get("kind") == "local" and not (
             (primary.get("presence") or {}).get("present")):
         steps.append(_step(
             "offload_target_present", "First offload target configured and present",
             "needs_attention", f"'{primary.get('name')}' mount point not found.",
-            {"kind": "configure_offload"}))
+            {"kind": "configure_offload"}, mode="hands"))
     else:
         steps.append(_step(
             "offload_target_present", "First offload target configured and present",
-            "done", None, None))
+            "done", None, None, mode="hands"))
 
     ever_succeeded = any(t.get("last_successful_offload") for t in offload_targets)
     if ever_succeeded:
@@ -126,19 +206,23 @@ def compute_readiness_steps(
     elif primary and primary.get("last_error"):
         steps.append(_step(
             "offload_run", "First offload run", "needs_attention",
-            f"Last attempt failed: {primary['last_error']}", {"kind": "run_offload"}))
+            f"Last attempt failed: {primary['last_error']}", None))
     else:
         steps.append(_step(
-            "offload_run", "First offload run", "missing", "Never run yet.",
-            {"kind": "run_offload"}))
+            "offload_run", "First offload run", "missing",
+            "Runs automatically once a backup target is present.", None))
 
     drill_passed = any(r.get("last_passed_at") for r in restore_drill_receipts.values())
     if drill_passed:
         steps.append(_step("restore_test_passed", "Restore test passed", "done", None, None))
     else:
+        failed = next((r["last_error"] for r in restore_drill_receipts.values()
+                       if r.get("last_error")), None)
         steps.append(_step(
-            "restore_test_passed", "Restore test passed", "missing", "Never tested yet.",
-            {"kind": "restore_drill"}))
+            "restore_test_passed", "Restore test passed",
+            "needs_attention" if failed else "missing",
+            f"The last restore test failed and will be retried: {failed}" if failed
+            else "Runs automatically after the first backup, then weekly.", None))
 
     for s in steps:
         if s["status"] != "done":

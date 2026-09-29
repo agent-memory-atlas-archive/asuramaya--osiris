@@ -1,6 +1,7 @@
 """THE FIRST-RUN ACCEPTANCE TEST: the
 operator runs one sequence by hand on a fresh box. `osiris soul-key init --restart`
--> `soul-key enroll-recovery` -> `osiris restic-key init` -> `osiris backup-settings
+-> `soul-key enroll-recovery` (which now also creates the backup password and wraps it
+into the recovery file) -> `osiris backup-settings
 write --offload-add` for the NAS (restic, off-box) and the docked drive (local, an
 `expected_mountpoint`) -> `osiris offload-runner tick` -> a restore drill proving the
 backup is actually recoverable. This test walks that EXACT sequence through the real
@@ -196,16 +197,21 @@ async def test_first_run_acceptance_sequence(
     enroll_out = _last_json_line(capsys.readouterr().out)
     assert "error" not in enroll_out
 
-    # ── 3. `osiris restic-key init` ─────────────────────────────────────────────────
-    rc = await cmd_restic_key("init", as_json=True)
+    # ── 3. the backup password ──────────────────────────────────────────────────────
+    # No `restic-key init` step any more: enrolling recovery created the backup password
+    # and wrapped it into the same recovery file (setup is automatic, the manual door only
+    # remains for debugging).
+    rc = await cmd_restic_key("status", as_json=True)
     assert rc == 0
-    restic_init_out = _last_json_line(capsys.readouterr().out)
+    restic_status_out = _last_json_line(capsys.readouterr().out)
+    assert restic_status_out["present"] is True
     if shutil.which("systemd-creds"):
-        assert restic_init_out["backend"] in ("host-cred", "host+tpm2")
+        assert restic_status_out["backend"] in ("host-cred", "host+tpm2")
     else:
-        assert restic_init_out["backend"] == "file"
+        assert restic_status_out["backend"] == "file"
+    assert soul_crypto.soul_key_recovery_facts()["restic_wrapped"] is True
 
-    # THE NAMED REFUSAL: restic-key init twice never overwrites the live credential.
+    # THE NAMED REFUSAL: the manual door never overwrites the live credential.
     rc_twice = await cmd_restic_key("init", as_json=True)
     assert rc_twice == 1
     restic_twice_out = _last_json_line(capsys.readouterr().out)

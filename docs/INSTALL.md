@@ -195,33 +195,31 @@ systemctl --user status osiris-mcp osiris-worker osiris-manager
 
 ---
 
-## 8. Initialize the soul key and backup targets (first run only)
+## 8. Recovery method and backup targets (first run only)
 
-Both services already start fine without a key (see [`KEYS.md`](KEYS.md): a missing key
-degrades to unencrypted writes, it never blocks startup), but do this before any real
-transcript data accumulates, so nothing is ever written unencrypted in the meantime. Run
-each step in your own terminal, as the same user the services run as (your own login user,
-for the deployment shape used above). This order matters:
+The encryption key and the backup password need no command: `osiris deploy` (step 7) creates
+both when they are missing, before it restarts the services, and a background job in the
+worker encrypts any older plain-text rows and shows its progress in `osiris soul-key
+status`. Only the steps that need you are left. Run each in your own terminal, as the same
+user the services run as (your own login user, for the deployment shape used above):
 
 ```bash
-# 1. Mint the soul-store encryption key and restart both services to pick it up
-osiris soul-key init --restart
-
-# 2. Enroll a FIDO2 Security Key as your recovery path (plug it in first)
+# 1. Enroll a FIDO2 Security Key as your recovery path (plug it in first). The same
+#    enrollment also protects the backup password
 osiris soul-key enroll-recovery
 
-# 3. Mint the restic repository password (a separate credential, see KEYS.md)
-osiris restic-key init
+# 2. Optional: prove the recovery works. Same PIN and touch, changes nothing
+osiris soul-key verify-recovery
 
-# 4. Add your offload targets: a local drive, a network drive, or both (see BACKUP.md)
+# 3. Add your offload targets: a local drive, a network drive, or both (see BACKUP.md)
 osiris backup-settings write \
   --offload-add nas --offload-kind restic --offload-target "sftp:nas.local:/backups/osiris" \
   --offload-schedule "*:0/15" --because "first-run offload target"
 
-# 5. Run one offload attempt by hand to confirm it actually reaches the target
+# 4. Run one offload attempt by hand to confirm it actually reaches the target
 osiris offload-runner tick
 
-# 6. Prove the offload target genuinely restores, not just that it accepted a backup
+# 5. Prove the offload target genuinely restores, not just that it accepted a backup
 osiris soul-key restore-drill
 ```
 

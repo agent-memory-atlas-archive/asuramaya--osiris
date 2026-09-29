@@ -456,13 +456,15 @@ directly rather than through the generic composition command, since no other pat
 passes through its own `--vault`/`--backups` path overrides. `--vault`/`--backups`
 override the production paths, for a test or a non-standard setup.
 
-## `osiris soul-key <status|init|rotate|restore-drill|enroll-recovery|recover> [flags]`
+## `osiris soul-key <status|init|rotate|restore-drill|enroll-recovery|verify-recovery|recover> [flags]`
 
-Mint, inspect, rotate, or recover the soul-store encryption key, and drill an off-box
-backup's own restorability. Full mechanism, custody ladder, every flag, and exact
+Inspect, rotate, or recover the soul-store encryption key, check that recovery works, and
+drill an off-box backup's own restorability. The key itself is created by `osiris deploy`
+when missing; `init` is the manual door. `status` is instant (it reads the background
+encryption job's progress; `--exact` does the slow full count). Full mechanism, custody ladder, every flag, and exact
 terminal output for each action: [`KEYS.md`](KEYS.md#everyday-operation).
 `status`/`init`/`rotate`/`restore-drill` are also exposed over the console's own
-network routes (reachable only from the local machine). `enroll-recovery`/`recover`
+network routes (reachable only from the local machine). `enroll-recovery`/`verify-recovery`/`recover`
 stay command-line only by design: no action here is ever exposed to an automated
 agent.
 
@@ -470,10 +472,13 @@ agent.
 osiris soul-key init
 osiris soul-key init --restart
 osiris soul-key status
+osiris soul-key status --exact
 osiris soul-key enroll-recovery
+osiris soul-key verify-recovery
 osiris soul-key rotate
 osiris soul-key rotate --finish
 osiris soul-key recover
+osiris soul-key recover --recovery-file ./soul.key.recovery.json
 osiris soul-key restore-drill
 ```
 
@@ -481,9 +486,10 @@ osiris soul-key restore-drill
 
 The offload runner's own credential command: a separate secret from the soul key,
 protecting the restic repository's own encryption rather than the soul store.
-`status`/`init` only; no `rotate`/`enroll-recovery`/`recover` yet. Rotating a restic
-password additionally needs a live pass against the repository itself, a deliberate
-scope cut for now. See [`KEYS.md`](KEYS.md#the-restic-password).
+`status`/`init` only; `osiris deploy` creates the password automatically when missing, and
+`soul-key enroll-recovery` wraps it into the same recovery file so `soul-key recover` brings
+it back. No `rotate` yet: rotating a restic password additionally needs a live pass against
+the repository itself, a deliberate scope cut for now. See [`KEYS.md`](KEYS.md#the-restic-password).
 
 ```
 osiris restic-key init
@@ -499,7 +505,7 @@ a present `local` target or any `restic` target gets a real backup attempt
 result (`last_successful_offload`/`last_attempt_at`/`last_error`) that `osiris
 backup-status` reads back. Meant to run automatically every 15 minutes, but safe to
 run by hand any time. Refuses with one clear error, doing nothing per-target, if
-`osiris restic-key init` was never run. See
+the backup password does not exist (a deploy creates it). See
 [`BACKUP.md`](BACKUP.md#the-opportunistic-offload-runner).
 
 ## `scripts/osiris_prune_ladder.py [--manifest | --apply-if-clear | --apply]`: the retention schedule

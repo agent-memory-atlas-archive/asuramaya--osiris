@@ -1738,26 +1738,38 @@ async function rejectMergeCandidate(btn) {
 // (the Key or Backup & Offload section above, both still on this same pane) or
 // performs the one-shot action directly (encrypt existing data, run an offload,
 // test a restore) with its own result line underneath. ---------------------------
+// Setup is automatic: only the hands-steps -- security-key
+// enrollment, the backup destination, the optional TPM upgrade -- carry an action, each a
+// jump to where the real control already lives. Every automatic step shows state and
+// live progress, never a button. Help lives only in the tooltips below.
 var READINESS_STEP_ACTIONS = {
-  init_key: { kind: 'jump', target: 'settings-sec-key' },
-  restart_services: { kind: 'jump', target: 'settings-sec-key' },
-  enroll_recovery: { kind: 'jump', target: 'settings-sec-key' },
-  encrypt_existing: { kind: 'perform', run: 'readinessEncryptExisting', label: 'Encrypt now' },
-  init_restic: { kind: 'jump', target: 'settings-sec-offload' },
-  configure_offload: { kind: 'jump', target: 'settings-sec-offload' },
-  run_offload: { kind: 'perform', run: 'readinessRunOffload', label: 'Run offload now' },
-  restore_drill: { kind: 'perform', run: 'readinessRestoreDrill', label: 'Test restore' },
+  enroll_recovery: { kind: 'jump', target: 'settings-sec-key', label: 'Enroll' },
+  configure_offload: { kind: 'jump', target: 'settings-sec-offload', label: 'Set destination' },
+  // needs a physical touch, so it runs from a terminal: no button, the tooltip names it
+  verify_recovery: { kind: 'hint' },
+};
+var READINESS_STEP_TIPS = {
+  recovery_enrolled: 'Touch your security key when it blinks. Or run osiris soul-key enroll-recovery in a terminal.',
+  recovery_verified: 'Run osiris soul-key verify-recovery in a terminal, then enter your PIN and touch your security key. Nothing is changed.',
+  offload_target_present: 'Plug in a drive, or name a network location, under Backup & Offload.',
 };
 async function renderSettingsSectionBox() {
   var container = $('settings-sec-box');
   if (!container) return;
-  container.innerHTML = 'Loading…';
+  if (!container.innerHTML.trim()) container.innerHTML = 'Loading…';
   var readiness, deployStatus;
   try { readiness = await fetch('/readiness').then(function(r){ return r.json(); }); }
   catch (e) { readiness = { error: 'Could not check.' }; }
   try { deployStatus = await fetch('/deploy-status').then(function(r){ return r.json(); }); }
   catch (e) { deployStatus = { error: 'Could not check.' }; }
   container.innerHTML = renderReadinessStepperHtml(readiness, deployStatus);
+  // Live progress: while an automatic step is still working, re-read (every 10s with live progress, else every minute); the
+  // timer dies on its own once the stepper leaves the DOM or nothing is in flight.
+  clearTimeout(window._readinessTimer);
+  var steps = (readiness && readiness.steps) || [];
+  var working = steps.some(function(s) { return s.mode === 'auto' && s.status !== 'done'; });
+  var live = steps.some(function(s) { return s.progress && s.status !== 'done'; });
+  if (working) window._readinessTimer = setTimeout(refreshReadinessIfShown, live ? 10000 : 60000);
 }
 function readinessStepDot(status) {
   if (status === 'done') return '<span style="color:#2ea043">●</span>';
@@ -1765,23 +1777,22 @@ function readinessStepDot(status) {
   return '<span class="o-faint">○</span>';
 }
 function readinessStepRow(s) {
-  // s.action.kind is either 'jump' (a blocked step, server-side: do an earlier step
-  // first -- every such case in this stepper's own order blocks on the key, so it
-  // always jumps to the Key section) or one of the named actions the table above
-  // maps to its own jump target or one-shot perform function.
-  var act = (s.action && s.action.kind === 'jump')
-    ? { kind: 'jump', target: 'settings-sec-key' }
-    : (s.action ? READINESS_STEP_ACTIONS[s.action.kind] : null);
-  var btn = '';
-  if (act && act.kind === 'jump') {
-    btn = '<button class="iconbtn" onclick="readinessJump(' + JSON.stringify(act.target) + ')">Go to it</button>';
-  } else if (act && act.kind === 'perform') {
-    btn = '<button class="iconbtn" onclick="' + act.run + '(this)">' + esc(act.label) + '</button>';
-  }
-  return '<tr class="' + (s.current ? 'readiness-current' : '') + '">' +
+  var act = s.action ? READINESS_STEP_ACTIONS[s.action.kind] : null;
+  var btn = act && act.kind === 'jump'
+    ? '<button class="iconbtn" onclick="readinessJump(' + JSON.stringify(act.target) + ')">' + esc(act.label) + '</button>'
+    : '';
+  var p = s.progress;
+  var pct = p && p.total ? Math.max(0, Math.min(100, Math.round(100 * p.done / p.total))) : null;
+  var pctText = pct === null ? '' : ' (' + (p.estimate ? 'about ' : '') + pct + '%)';
+  var bar = pct === null ? '' :
+    '<div style="height:3px;margin-top:3px;background:var(--panel2)"><div style="height:3px;width:' +
+    pct + '%;background:var(--border-focus, #58a6ff)"></div></div>';
+  var reason = s.reason ? esc(s.reason) + (s.progress && s.status !== 'done' ? esc(pctText) : '') : '';
+  var tip = READINESS_STEP_TIPS[s.key] ? ' title="' + esc(READINESS_STEP_TIPS[s.key]) + '"' : '';
+  return '<tr class="' + (s.current ? 'readiness-current' : '') + '"' + tip + '>' +
     '<td style="white-space:nowrap">' + readinessStepDot(s.status) + ' ' + esc(s.label) + '</td>' +
-    '<td class="o-faint">' + (s.reason ? esc(s.reason) : '') + '</td>' +
-    '<td>' + btn + '<div class="readiness-out o-faint" style="white-space:pre-wrap"></div></td>' +
+    '<td class="o-faint">' + reason + bar + '</td>' +
+    '<td>' + btn + '</td>' +
     '</tr>';
 }
 function renderReadinessStepperHtml(readiness, deployStatus) {
@@ -1817,35 +1828,6 @@ function readinessJump(targetId) {
   el.style.transition = 'background-color 0.3s';
   el.style.backgroundColor = 'var(--accent-bg, #1f2937)';
   setTimeout(function() { el.style.backgroundColor = ''; }, 900);
-}
-function readinessRowOut(btn) {
-  return btn.parentElement.querySelector('.readiness-out');
-}
-async function readinessEncryptExisting(btn) {
-  var out = readinessRowOut(btn); if (out) out.textContent = 'Encrypting…';
-  var res = await fetch('/soul-key/encrypt-existing', { method: 'POST' }).then(function(r){ return r.json(); });
-  if (res.error) { if (out) out.textContent = res.error; return; }
-  if (out) out.textContent = res.hot_migrated + ' encrypted, ' + res.hot_already_encrypted + ' already were.';
-  renderSettingsSectionBox();
-}
-async function readinessRunOffload(btn) {
-  var out = readinessRowOut(btn); if (out) out.textContent = 'Running…';
-  var res = await fetch('/offload-runner/tick', {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
-  }).then(function(r){ return r.json(); });
-  if (res.error) { if (out) out.textContent = res.error; return; }
-  var ok = (res.targets || []).filter(function(t) { return t.ok; }).length;
-  if (out) out.textContent = ok + ' of ' + (res.targets || []).length + ' target(s) offloaded.';
-  renderSettingsSectionBox();
-}
-async function readinessRestoreDrill(btn) {
-  var out = readinessRowOut(btn); if (out) out.textContent = 'Testing…';
-  var res = await fetch('/soul-key/restore-drill', {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
-  }).then(function(r){ return r.json(); });
-  if (res.error) { if (out) out.textContent = res.error; return; }
-  if (out) out.textContent = res.all_ok ? 'Every copy is readable.' : 'At least one copy failed.';
-  renderSettingsSectionBox();
 }
 
 // ── Projects ────────────────────────────────────────────────────────────────

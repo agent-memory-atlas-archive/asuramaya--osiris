@@ -153,11 +153,12 @@ encrypted at rest by Osiris itself, one tier above host-disk trust, using a key 
 systemd user credential by default (never a plaintext file unless you explicitly choose
 `--backend file`). The full custody mechanism, every `osiris soul-key`/`osiris restic-key`
 action, the Security Key recovery flow, and what happens with no key at all: see
-[`KEYS.md`](KEYS.md). First install, in your own terminal as whichever user the services run
-as:
+[`KEYS.md`](KEYS.md). First install: `osiris deploy` creates the key and the backup password when they are
+missing, before it restarts the services, so there is no key command to run. The one step
+that needs you, in your own terminal as whichever user the services run as, is enrolling
+your security key:
 
 ```bash
-osiris soul-key init
 osiris soul-key enroll-recovery
 ```
 
