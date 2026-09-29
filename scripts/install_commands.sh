@@ -17,7 +17,41 @@
 # no-op (exit 0, one confirming line per file). A file present on the machine but not
 # in commands/ (a local, un-tracked slash command) is left alone: this only ever
 # copies FROM the repo, never deletes anything it doesn't own.
+#
+# NO NAME COLLISIONS WITH CLAUDE CODE: a command whose name is in
+# commands/RESERVED_NAMES.txt (Claude Code's built-in commands and aliases, refreshed by
+# scripts/refresh_reserved_names.py) is REFUSED, named on stderr, and the run exits 1.
+# The one escape is commands/KNOWN_COLLISIONS.txt, a shrink-only list of collisions still
+# awaiting a rename: those install with a WARNING.
+#
+# RETIRED NAMES: /resume, /status and /stop used to ship here and shadowed Claude Code's
+# own built-ins. RETIRED below lists every osiris-authored version of each (sha256 of
+# every revision git ever held for commands/<name>). A retired file in the target is
+# removed ONLY when its bytes hash to one of those versions; anything else under that
+# name is somebody's own command and is left alone, with a line saying so.
 set -eu
+
+# name sha256, one per line: every version of the file osiris ever shipped.
+RETIRED='
+resume.md fe8787669183e5757c7ee1c1153d5266249cac91f7a0789925567010ffbe041a
+status.md 3e22068bb7d014c9892df49ee8c90f318141a72837385710bafc0a8ac0fa00d1
+status.md f28372f40b7a4bfa77f9d7526f5d240291c5a8352a908c7be4d5774c113b4466
+stop.md b4a094d8eb2bb1f345491c808e803976ca53355da56ce7aa0ff9e45a6ff8a2af
+'
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum < "$1" | cut -d' ' -f1
+    else
+        shasum -a 256 < "$1" | cut -d' ' -f1
+    fi
+}
+
+# first word of every non-blank, non-comment line
+names_in() {
+    [ -f "$1" ] || return 0
+    grep -v '^[[:space:]]*#' "$1" | awk 'NF { print $1 }'
+}
 
 TOPLEVEL="$(git rev-parse --show-toplevel)"
 SOURCE_DIR="$TOPLEVEL/commands"
@@ -30,12 +64,28 @@ fi
 
 mkdir -p "$TARGET_DIR"
 
+RESERVED_NAMES="$(names_in "$SOURCE_DIR/RESERVED_NAMES.txt")"
+KNOWN_COLLISIONS="$(names_in "$SOURCE_DIR/KNOWN_COLLISIONS.txt")"
+
 installed=0
 current=0
+refused=0
 for src in "$SOURCE_DIR"/*.md; do
     [ -e "$src" ] || continue
     name="$(basename "$src")"
     target="$TARGET_DIR/$name"
+    stem="${name%.md}"
+    if printf '%s\n' "$RESERVED_NAMES" | grep -qxF "$stem"; then
+        if printf '%s\n' "$KNOWN_COLLISIONS" | grep -qxF "$stem"; then
+            echo "install_commands: WARNING: /$stem collides with a Claude Code built-in" \
+                 "(commands/KNOWN_COLLISIONS.txt: pending rename); installed anyway" >&2
+        else
+            echo "install_commands: REFUSED $name: /$stem is a Claude Code built-in command" \
+                 "or alias (commands/RESERVED_NAMES.txt); rename it" >&2
+            refused=$((refused + 1))
+            continue
+        fi
+    fi
     if [ -f "$target" ] && cmp -s "$src" "$target"; then
         current=$((current + 1))
         continue
@@ -44,4 +94,24 @@ for src in "$SOURCE_DIR"/*.md; do
     installed=$((installed + 1))
 done
 
-echo "install_commands: $installed installed/updated, $current already current — $TARGET_DIR"
+retired=0
+for name in $(printf '%s\n' "$RETIRED" | awk 'NF { print $1 }' | sort -u); do
+    target="$TARGET_DIR/$name"
+    [ -f "$target" ] || continue
+    # a name brought back into commands/ is live again, never retired
+    [ -e "$SOURCE_DIR/$name" ] && continue
+    sum="$(sha256_of "$target")"
+    if printf '%s\n' "$RETIRED" | grep -qxF "$name $sum"; then
+        rm -f "$target"
+        retired=$((retired + 1))
+        echo "install_commands: retired $name (an osiris-authored version; /${name%.md} is a Claude Code built-in)"
+    else
+        echo "install_commands: left $name alone: not an osiris-authored version, so not ours to remove"
+    fi
+done
+
+echo "install_commands: $installed installed/updated, $current already current, $retired retired — $TARGET_DIR"
+if [ "$refused" -gt 0 ]; then
+    echo "install_commands: $refused refused for a reserved name (see above)" >&2
+    exit 1
+fi

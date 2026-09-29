@@ -2,4 +2,6 @@ Manage seats — one door composing existing verbs (decisions 4a3858e9/87457dc1,
 
 Verbs: new, walk-in, mint, launch, resume, stop, move, bind-tree, heal-anchor, correct-agent-project, retire-agent, heal-seat-transcript, transition, retire, roster.
 
+`resume <handle>`: the MCP tool `resume`. `stop <handle>`: the MCP tool `seat`, action='stop'. Print receipts verbatim.
+
 STANDING LAW (#102): never pick a winner on a disagreement (`pin_charter_agreement=='disagree'`, roster's own `conflict`/`near_misses`) — surface it with the repair verb named, never silently resolved. `'n/a'` is a valid state, never a problem.
