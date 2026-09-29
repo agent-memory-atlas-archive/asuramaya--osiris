@@ -29,6 +29,7 @@ import asyncpg
 
 from src.actions.core import Actions
 from src.config.settings import Settings, get_settings
+from src.db.pool import pin
 from src.ingest.providers import spend_is_metered
 from src.ingest.sessions import locate_current_transcript, resume_verdict
 from src.orchestrator.bodies import BodyProvider, LocalProvider
@@ -5392,16 +5393,19 @@ async def dispatch_broadcast(
         await conn.execute(
             "SELECT pg_advisory_xact_lock(hashtextextended('osiris-bc-' || $1, 7445))",
             str(msg_id))
+        # Reads under the lock ride the lock's own connection, never a second acquire from
+        # `pool` while this one is held (the 2026-09-29 pool-starvation deadlock shape).
+        locked = pin(pool, conn)
         resume = None
         mint_repo_path: str | None = None
-        if await _last_wake_mode(pool, project, msg_id) != "resume":
-            resume = await _resumable_owner(pool, project, st)
+        if await _last_wake_mode(locked, project, msg_id) != "resume":
+            resume = await _resumable_owner(locked, project, st)
         if resume is not None:
             await conn.execute(
                 "INSERT INTO agent_wakes (to_project, from_agent, message_id, mode) "
                 "VALUES ($1,$2,$3,'resume')", project, sender, msg_id)
         else:
-            mint_repo_path = await _repo_path(pool, project)
+            mint_repo_path = await _repo_path(locked, project)
             if mint_repo_path is None:
                 return {"mode": "no-repo",
                         "detail": "no known repo to spawn into: stays pull-only"}

@@ -632,7 +632,10 @@ async def record_bridge_anchor(
     bid = (bridge_session_id or "").strip()
     if not bid:
         return False
-    async with mint_lock(actions.pool, bid):
+    async with mint_lock(actions.pool, bid) as locked:
+        # All of it on the lock's own connection (mint_lock's docstring); the function
+        # returns from inside this block, so the rebinding never outlives the lock.
+        actions = Actions(locked)
         exists = await actions.pool.fetchval(
             "SELECT 1 FROM current_assertions a "
             "JOIN objects o ON o.id=a.object_id AND o.type='Agent' AND o.status='active' "

@@ -22,6 +22,7 @@ from typing import Any, cast
 
 import asyncpg
 
+from src.db.pool import pin
 from src.ontology.catalog import check_link_type, check_object_type
 
 Json = dict[str, Any]
@@ -33,10 +34,20 @@ class ActionError(Exception):
 
 class Actions:
     def __init__(self, pool: asyncpg.Pool, conn: asyncpg.Connection | None = None) -> None:
-        self.pool = pool
         # When bound (via atomic()), every write JOINS this one connection's transaction so a
         # multi-step capture is all-or-nothing — no orphan object husk from a process death
         # between the create and its summary. None = the standalone default (each call its own).
+        #
+        # A bound Actions' `.pool` is that SAME connection, pinned (src/db/pool.py's
+        # PinnedPool), never the shared pool: a body holding this transaction (and the
+        # advisory xact locks assert_property takes on it) that reached `a.pool.fetchval`
+        # or handed `a` to a helper doing so used to draw a SECOND pooled connection while
+        # holding the first. Enough of those in flight at once (record_decision's grounds/
+        # commit checks, a burst of mint-locked heartbeats) is the 2026-09-29
+        # pool-starvation deadlock. Pinned, the body can never ask the pool for another
+        # slot; each pinned call runs in its own savepoint, and reads now see this
+        # transaction's own uncommitted writes (the consistent view, not a stale one).
+        self.pool = pin(pool, conn) if conn is not None else pool
         self._conn = conn
 
     @asynccontextmanager
