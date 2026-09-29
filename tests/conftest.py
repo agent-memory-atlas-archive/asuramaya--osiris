@@ -650,6 +650,28 @@ def _no_real_key_setup(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest
 
 
 @pytest.fixture(autouse=True)
+def _no_real_home_state(monkeypatch: pytest.MonkeyPatch,
+                        tmp_path_factory: pytest.TempPathFactory) -> None:
+    """NO TEST MAY RESOLVE A CREDENTIAL OR STATE FILE UNDER THE REAL HOME: a deploy on a
+    developer's machine mints a real encryption key and backup password into its own
+    credential store, and a test that merely READS the default location then sees them
+    (the "no backup password" tests failed on any box that had ever deployed). Every
+    location those readers resolve is pointed at scratch, for every test: the XDG config and
+    state roots (the credential store, the state files), and the explicit file overrides for
+    the encryption key, the backup password, the offload receipts and the lease key. A test
+    that needs a specific layout still sets its own values on top of these. The guard test
+    in test_no_real_home_state.py proves the redirect is complete."""
+    home = tmp_path_factory.mktemp("scratch_home")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "config"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(home / "state"))
+    monkeypatch.setenv("OSIRIS_SOUL_KEY_FILE", str(home / "config" / "osiris" / "soul.key"))
+    monkeypatch.setenv("OSIRIS_RESTIC_PASSWORD_FILE",
+                       str(home / "config" / "osiris" / "restic.password"))
+    monkeypatch.setenv("OSIRIS_OFFLOAD_RECEIPTS_FILE", str(home / "state" / "offload.json"))
+    monkeypatch.setenv("OSIRIS_LEASE_KEY_FILE", str(home / "config" / "osiris" / "lease.key"))
+
+
+@pytest.fixture(autouse=True)
 def _reset_settings_overlay_cache() -> None:
     """The settings overlay (settings_service.py) caches the whole `settings` table
     in a module-level dict for a 30s TTL: real, load-bearing in production (one
