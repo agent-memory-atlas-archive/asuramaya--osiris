@@ -184,22 +184,29 @@ def test_stepper_highlights_exactly_the_current_step() -> None:
     assert "s.current" in body
 
 
-def test_stepper_every_action_kind_maps_to_a_jump_or_a_perform() -> None:
+def test_stepper_only_hands_steps_have_actions_and_all_of_them_jump() -> None:
     body = _CONSOLE_JS.split("var READINESS_STEP_ACTIONS = {", 1)[1].split("};", 1)[0]
-    for kind in ("init_key", "restart_services", "enroll_recovery", "encrypt_existing",
-                 "init_restic", "configure_offload", "run_offload", "restore_drill"):
+    for kind in ("enroll_recovery", "configure_offload", "verify_recovery"):
         assert kind + ":" in body, f"{kind} missing from READINESS_STEP_ACTIONS"
-    assert body.count("kind: 'jump'") + body.count("kind: 'perform'") == 8
+    assert body.count("kind: 'jump'") == 2
+    assert "kind: 'hint'" in body  # verify-recovery needs a touch: a tooltip, no button
+    assert "perform" not in body
 
 
-def test_stepper_one_shot_actions_post_to_the_real_routes() -> None:
-    for fn, route in (
-        ("readinessEncryptExisting", "/soul-key/encrypt-existing"),
-        ("readinessRunOffload", "/offload-runner/tick"),
-        ("readinessRestoreDrill", "/soul-key/restore-drill"),
-    ):
-        body = _CONSOLE_JS.split("async function " + fn + "(btn) {", 1)[1][:400]
-        assert "fetch('" + route + "'" in body
+def test_stepper_has_no_chore_buttons_or_one_shot_posts() -> None:
+    # encryption, offload runs and restore tests run themselves.
+    for gone in ("readinessEncryptExisting", "readinessRunOffload", "readinessRestoreDrill",
+                 "Encrypt now", "Run offload now", "Test restore"):
+        assert gone not in _CONSOLE_JS.split("READINESS, THE FIRST-RUN STEPPER", 1)[1][:9000], gone
+
+
+def test_stepper_shows_progress_and_refreshes_while_work_is_in_flight() -> None:
+    row = _CONSOLE_JS.split("function readinessStepRow(s) {", 1)[1][:1500]
+    assert "p.done / p.total" in row
+    assert "p.estimate ? 'about '" in row  # approximate until the first pass completes
+    box = _CONSOLE_JS.split("async function renderSettingsSectionBox() {", 1)[1][:1800]
+    assert "s.mode === 'auto'" in box
+    assert "setTimeout(refreshReadinessIfShown" in box
 
 
 # THE STALE-STEPPER CHROME-WALK FINDING: the Key/Backup & Offload panels' own action
