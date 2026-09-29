@@ -76,12 +76,14 @@ For systemd units, Docker Compose, and every option in full, see
 
 ## First run
 
-**Set up the encryption key.** Stored session transcripts are encrypted at rest. A
-missing key doesn't block startup, but set one up before real data accumulates:
+**The encryption key sets itself up.** Stored session transcripts are encrypted at rest.
+`osiris deploy` creates the key and the backup password when they are missing, before it
+restarts the services, and a background job encrypts any older plain-text rows. The one
+step that needs you is enrolling a security key as your recovery path (a touch):
 
 ```bash
-osiris soul-key init --restart      # mint the key, restart the services to pick it up
 osiris soul-key enroll-recovery     # enroll a FIDO2 security key as your recovery path
+osiris soul-key verify-recovery     # optional: prove it works, changes nothing
 ```
 
 **Set up off-box backups.** A separate credential protects the backup repository:

@@ -8,6 +8,14 @@ domain in this house already holds (backup_settings.py, settings_service.py).
 
 status/rotate/restore-drill all need Postgres; init stays pool-free (a thin pass-through
 to `soul_crypto.soul_key_init`, kept here only so callers have one entry point to import from).
+
+`status` is CHEAP by design: it reads the background encryption pass's own progress record
+(`soul_encrypt_progress`) instead of decrypting every row, which took over a minute on a
+multi-million-row store. The exact census stays available with `exact=True`.
+
+enroll-recovery, verify-recovery and recover are the security-key actions (PIN and touch).
+They live here so the backup password rides along automatically and so the verify receipt is
+written in one place; they stay CLI-only, never REST.
 """
 from __future__ import annotations
 
@@ -21,6 +29,8 @@ import asyncpg
 
 _RESTORE_DRILL_RECEIPTS_ENV = "OSIRIS_RESTORE_DRILL_RECEIPTS_FILE"
 _DEFAULT_RESTORE_DRILL_RECEIPTS_FILE = "~/.local/state/osiris/restore_drill_receipts.json"
+_VERIFY_RECEIPT_ENV = "OSIRIS_RECOVERY_VERIFY_RECEIPT_FILE"
+_DEFAULT_VERIFY_RECEIPT_FILE = "~/.local/state/osiris/recovery_verify_receipt.json"
 
 
 def _restore_drill_receipts_path() -> Path:
@@ -66,24 +76,70 @@ def restore_drill_receipts() -> dict[str, Any]:
     return _read_restore_drill_receipts()
 
 
-async def soul_key_status(pool: asyncpg.Pool, *, path: str | None = None) -> dict[str, Any]:
-    """Filesystem facts (`soul_crypto.soul_key_status`) plus the live legacy
-    (still-plaintext) row count off the store itself, built against the EXPLICIT
-    resolved key path rather than whatever the caller process's own env/default
-    would resolve to (`soul_store.encrypt_existing_soul_lines`'s own `fernet=`
-    seam), the exact defect a hand-run `--path` census surfaced during this
-    route's own build. NEVER the key bytes.
+def _verify_receipt_path() -> Path:
+    env = os.environ.get(_VERIFY_RECEIPT_ENV)
+    return Path(env).expanduser() if env else Path(_DEFAULT_VERIFY_RECEIPT_FILE).expanduser()
 
-    `rp_id`: the live `soul_key.rp_id` setting, surfaced here
-    so the console reads it off this SAME route (GET /soul-key/status)
-    instead of hard-coding a second copy, a future browser-based WebAuthn PRF
-    enrollment needs the exact value the CLI's own `enroll-recovery` used."""
+
+def recovery_verify_receipt() -> dict[str, Any]:
+    """The last recovery verification's receipt, or {} when none was ever run. Never
+    writes."""
+    try:
+        return dict(json.loads(_verify_receipt_path().read_text()))
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_verify_receipt(*, ok: bool, matches_live_key: bool | None, error: str | None,
+                          restic_password_matches: bool | None) -> None:
+    """Same merge discipline as the restore-drill receipt: a failed attempt never erases
+    an earlier real `last_verified_at`, it only adds the attempt and its error."""
+    path = _verify_receipt_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    receipt = recovery_verify_receipt()
+    now = datetime.now(UTC).isoformat()
+    receipt["last_attempt_at"] = now
+    receipt["ok"] = ok
+    receipt["last_error"] = error
+    if ok:
+        receipt["last_verified_at"] = now
+        receipt["matches_live_key"] = matches_live_key
+        receipt["restic_password_matches"] = restic_password_matches
+    path.write_text(json.dumps(receipt, indent=2))
+
+
+async def soul_key_status(
+    pool: asyncpg.Pool, *, path: str | None = None, exact: bool = False,
+) -> dict[str, Any]:
+    """Filesystem facts (`soul_crypto.soul_key_status`) plus the state of the background
+    encryption pass and of the recovery enrollment. NEVER the key bytes.
+
+    FAST BY DEFAULT: `encryption` comes from the worker's own progress record and one
+    planner-estimate catalog read, and `legacy_plaintext_rows` (kept under its old name for
+    existing readers) is that record's remaining count, None while nothing has counted yet.
+    `exact=True` (`osiris soul-key status --exact`) runs the old whole-table census against
+    the EXPLICIT resolved key path, the slow path that decrypts every row.
+
+    `recovery`: `enrolled`, `stale` (the enrollment protects an older key generation than
+    the live one), and `verified` (the last `verify-recovery` receipt, or None).
+
+    `rp_id`: the live `soul_key.rp_id` setting, surfaced here so the console reads it off
+    this SAME route instead of hard-coding a second copy."""
     from src.ingest import soul_crypto
+    from src.orchestrator import soul_encrypt_progress
     from src.orchestrator.settings_service import get_setting
 
     out = soul_crypto.soul_key_status(path=path)
     out["rp_id"] = (await get_setting(pool, "soul_key.rp_id"))["value"]
-    if out["present"]:
+    record = soul_encrypt_progress.read_progress()
+    total = None
+    if out["present"] and not record.get("rows_total"):
+        total = await soul_encrypt_progress.estimate_total_rows(pool)
+    out["encryption"] = soul_encrypt_progress.shape_encryption(
+        record, key_present=out["present"], total_estimate=total)
+    out["legacy_plaintext_rows"] = (
+        out["encryption"]["rows_remaining"] if out["present"] else None)
+    if out["present"] and exact:
         from cryptography.fernet import Fernet, MultiFernet
 
         from src.ingest.soul_store import encrypt_existing_soul_lines
@@ -98,8 +154,17 @@ async def soul_key_status(pool: asyncpg.Pool, *, path: str | None = None) -> dic
         fernet = MultiFernet([Fernet(key_bytes)])
         census = await encrypt_existing_soul_lines(pool, dry_run=True, fernet=fernet)
         out["legacy_plaintext_rows"] = census["hot_migrated"] + census["cold_migrated"]
-    else:
-        out["legacy_plaintext_rows"] = None
+    facts = soul_crypto.soul_key_recovery_facts(path=path)
+    receipt = recovery_verify_receipt()
+    out["recovery"] = {
+        "enrolled": facts["enrolled"], "stale": facts["stale"],
+        "verified": ({
+            "last_verified_at": receipt.get("last_verified_at"),
+            "ok": receipt.get("ok"),
+            "matches_live_key": receipt.get("matches_live_key"),
+            "last_error": receipt.get("last_error"),
+        } if receipt else None),
+    }
     return out
 
 
@@ -220,3 +285,74 @@ async def soul_key_encrypt_existing(
     fernet = MultiFernet([Fernet(key_bytes)])
     return await encrypt_existing_soul_lines(
         pool, batch_size=batch_size, dry_run=False, fernet=fernet)
+
+
+def _current_restic_password(path: str | None = None) -> bytes | None:
+    """The backup password for the DEFAULT key layout only: an explicit `--path` is the
+    escape hatch for an unusual layout (a test, a one-off), and the box's real backup
+    credential must never ride along into it."""
+    from src.orchestrator import restic_credential
+
+    if path is not None:
+        return None
+    try:
+        return restic_credential.get_restic_password()
+    except restic_credential.ResticPasswordMissing:
+        return None
+
+
+def soul_key_enroll_recovery(*, path: str | None = None, rp_id: str) -> dict[str, Any]:
+    """Enrolls the security key as the recovery method, first making sure a backup password
+    exists so the same PIN-and-touch enrollment protects both (the wrap needs no second
+    touch, but adding it later to an enrollment that lacks it needs the enrollment's own
+    key to be current, so doing it here keeps the whole story in one step)."""
+    from src.ingest import soul_crypto
+    from src.orchestrator import restic_credential
+
+    if path is None:
+        restic_credential.restic_key_ensure()
+    return soul_crypto.soul_key_enroll_recovery(
+        path=path, rp_id=rp_id, restic_password=_current_restic_password(path))
+
+
+def soul_key_verify_recovery(*, path: str | None = None, rp_id: str) -> dict[str, Any]:
+    """Proves the recovery method works without changing anything (PIN and touch, unwrap,
+    compare fingerprints) and records a receipt the setup stepper shows. A failure is
+    recorded as an attempt without erasing an earlier real verification, and comes back
+    as a top-level `error`, so callers report the right exit code."""
+    from src.ingest import soul_crypto
+
+    out = soul_crypto.soul_key_verify_recovery(
+        path=path, rp_id=rp_id, restic_password=_current_restic_password(path))
+    if "error" in out:
+        _write_verify_receipt(ok=False, matches_live_key=None, error=out["error"],
+                              restic_password_matches=None)
+        return out
+    problems = []
+    if out["matches_live_key"] is False:
+        problems.append("the recovered key is not the live key (the key was rotated after "
+                        "recovery was enrolled: re-enroll recovery)")
+    if out["restic_password_matches"] is False:
+        problems.append("the backup password inside the recovery blob does not match the "
+                        "one this machine uses")
+    error = "; ".join(problems) or None
+    _write_verify_receipt(
+        ok=error is None, matches_live_key=out["matches_live_key"], error=error,
+        restic_password_matches=out["restic_password_matches"])
+    if error:
+        out["error"] = error
+    return out
+
+
+def soul_key_recover(
+    *, path: str | None = None, backend: str | None = None, rp_id: str,
+) -> dict[str, Any]:
+    """Recovers the key onto a box with none, and the backup password with it when the
+    recovery blob carries one (sealed by the same machine-local custody a fresh one gets)."""
+    from src.ingest import soul_crypto
+    from src.orchestrator import restic_credential
+
+    seal = None if path is not None else (
+        lambda pw: restic_credential.seal_recovered_password(pw, backend=backend))
+    return soul_crypto.soul_key_recover(
+        path=path, backend=backend, rp_id=rp_id, seal_restic=seal)

@@ -620,6 +620,27 @@ def _no_ambient_deploy_gate_flags(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_real_key_setup(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory,
+                       ) -> None:
+    """AUTOMATIC KEY SETUP MUST NEVER TOUCH A REAL CREDENTIAL STORE FROM A TEST: `osiris
+    deploy` now mints the encryption key and backup password when they are absent
+    (`src.cli._real_ensure_key_setup`), so every `cmd_deploy` call in this suite that does
+    not inject its own `ensure_key_setup` would otherwise create real credentials on the
+    machine running the tests. Replaced here, unconditionally, with a fake that reports a
+    box already set up; a test of the setup step injects its own. The two state files the
+    status readers use (the encryption progress record and the recovery-check receipt) are
+    pointed at a scratch directory for the same reason: a stray real record on a developer's
+    box must never colour a status assertion."""
+    async def _already_set_up() -> dict[str, object]:
+        return {"ok": True, "minted": False, "key": "present", "backup_password": "present"}
+
+    monkeypatch.setattr("src.cli._real_ensure_key_setup", _already_set_up)
+    state = tmp_path_factory.mktemp("key_state")
+    monkeypatch.setenv("OSIRIS_SOUL_ENCRYPT_PROGRESS_FILE", str(state / "encrypt_progress.json"))
+    monkeypatch.setenv("OSIRIS_RECOVERY_VERIFY_RECEIPT_FILE", str(state / "verify_receipt.json"))
+
+
+@pytest.fixture(autouse=True)
 def _reset_settings_overlay_cache() -> None:
     """The settings overlay (settings_service.py) caches the whole `settings` table
     in a module-level dict for a 30s TTL: real, load-bearing in production (one

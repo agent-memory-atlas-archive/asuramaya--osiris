@@ -63,22 +63,26 @@ sealed under `credstore.encrypted/`.
 
 ## First install
 
-Run once, before either service's first start, in your own terminal, as whichever user the
-services actually run as. For the standard per-user deployment shape this project ships,
-that is simply your own login user, no elevated privileges needed:
+Nothing to run for the key itself. `osiris deploy` creates the encryption key and the backup
+password whenever they are missing, before it restarts the services (so the restart picks the
+key up), and does nothing on a box that already has them. Deploy as the user the services
+run as, not as root. A background job in the worker then encrypts any rows that were written
+before the key existed, in small throttled batches, resuming after any restart;
+`osiris soul-key status` shows its progress. The only step that needs a person is enrolling
+your security key (PIN and a touch):
 
 ```bash
-osiris soul-key init
 osiris soul-key enroll-recovery
+osiris soul-key verify-recovery     # optional, proves it works and changes nothing
 ```
 
-`init` mints a fresh key, seals it under the automatically chosen method, and prints a
+`osiris soul-key init` stays as the manual and debugging door. It mints a fresh key, seals it under the automatically chosen method, and prints a
 reminder that the MCP server and worker won't see the new key until they restart. Pass
 `--restart` to have it restart them for you. It refuses outright if a key already exists at
 the resolved path (`osiris soul-key rotate` is the command for replacing a live one, never
 `init` again).
 
-`enroll-recovery` links a discoverable credential on your plugged-in FIDO2 Security Key:
+`enroll-recovery` (the same enrollment also protects the backup password, see below) links a discoverable credential on your plugged-in FIDO2 Security Key:
 plug it in, run the command, and it prompts for your PIN and a physical touch. It writes the
 recovery file listed above and refuses if one already exists already (re-enrolling is an
 explicit remove-then-redo, never a silent overwrite). `osiris soul-key status` warns
@@ -138,9 +142,13 @@ This reads the recovery file, prompts for the same Security Key's PIN and a touc
 unwraps the key. Before trusting anything, it checks the recovered key's own fingerprint
 against the one recorded in the recovery file. A mismatch refuses outright, since this is
 treated as a real problem, not a retryable glitch. On success it seals the key under the new
-machine's own host credential. It refuses if a key already exists at the target path:
-`recover` is for a machine with none, and `rotate` is the command once you already have a
-live key.
+machine's own host credential, and the backup password with it when the recovery file
+carries one. It refuses if a key already exists at the target path: `recover` is for a
+machine with none, and `rotate` is the command once you already have a live key. To check
+that recovery works without replacing anything, use `osiris soul-key verify-recovery`: same
+PIN and touch, same unwrap and fingerprint check, then it stops and records a receipt that
+the setup stepper shows. It also tells you whether the recovered key still matches the live
+one (it will not after a rotation until you enroll again).
 
 There is also a browser-based enrollment and recovery path, reached from the console's
 Settings pane, in the Key section (see below). Both the command-line and browser paths are
@@ -164,13 +172,14 @@ server, same port. Only the hostname in the address bar changes.
 ## Everyday operation
 
 ```
-osiris soul-key <status|init|rotate|restore-drill|enroll-recovery|recover> [flags]
+osiris soul-key <status|init|rotate|restore-drill|enroll-recovery|verify-recovery|recover> [flags]
 ```
 
 | Action | Does |
 |--------|------|
-| `status` | storage method, key age, whether a rotation is in progress, enrolled recovery paths, and the number of legacy unencrypted rows. Never the key bytes |
-| `init` | mint the first key (refuses if one already exists) |
+| `status` | storage method, key age, whether a rotation is in progress, enrolled recovery paths and whether they are stale, the last recovery check, and the background encryption progress (rows done and remaining, rate, time left). Instant. `--exact` counts the still-plain rows exactly instead (decrypts every row; can take minutes). Never the key bytes |
+| `init` | mint the first key by hand (refuses if one already exists). A deploy does this automatically |
+| `verify-recovery` | prove the Security Key recovery works (PIN and touch) without changing anything, and record a receipt. Command-line only |
 | `enroll-recovery` | link the live key to a FIDO2 Security Key (PIN and touch). Command-line only, never over the network API |
 | `recover` | restore a key from a Security Key enrollment onto a machine with no live key yet. Command-line only, never over the network API |
 | `rotate` | mint a new key and re-encrypt every row onto it. `--finish` once the result is clean |
@@ -193,17 +202,21 @@ routes, since the console only ever listens on the local machine.
 
 ### Migrating old plaintext rows
 
-If you are upgrading a machine that already has soul-store data from before encryption was
-added, `osiris soul-key status` reports the number of legacy unencrypted rows. Run the
-migration itself with:
+This is automatic. Whenever a key exists and plain-text rows remain, the worker encrypts them
+in the background: bounded slices every 30 seconds, at most half of the time spent on the
+database so live ingest is never starved, resuming from a saved position after a restart.
+`osiris soul-key status` reports the progress (`encryption`: state, rows done and remaining,
+rate, estimated time left) from a small record the job keeps, so it answers instantly.
+
+The manual door still exists for a one-off census or an immediate run:
 
 ```bash
 uv run python scripts/osiris_encrypt_soul_lines.py         # dry run
 uv run python scripts/osiris_encrypt_soul_lines.py --apply  # actually re-write the rows
 ```
 
-This runs in small batches and is safe to re-run in the middle of a deploy against a process
-that is still actively writing new rows.
+Both are safe to run at any time, including in the middle of a deploy against a process that
+is still actively writing new rows.
 
 ## The restic password
 
@@ -214,13 +227,21 @@ different: the restic repository's own encryption for off-box backup targets (se
 [BACKUP.md](BACKUP.md)), not the soul store. It is a completely separate secret. Losing or
 rotating one never touches the other.
 
+The password is created automatically by `osiris deploy` when it is missing (an existing
+one is adopted, never replaced, so existing repositories keep working). It is a random
+passphrase, never derived from the soul key, so rotating the soul key never changes it.
+
+It is recovered with the soul key: `enroll-recovery` also wraps the backup password into the
+same recovery file, under the soul key that file protects, so one PIN-and-touch recovery
+brings back both, with no second touch. If you rotate the soul key, enroll recovery again
+afterwards to refresh that wrap (`verify-recovery` tells you when it is out of date).
+
 This is a deliberately smaller command than `soul-key`: only `status` and `init` exist
-today. There is no `rotate`/`enroll-recovery`/`recover` yet. Rotating a restic password also
-needs a separate pass against the live repository itself, which is future work and not yet
-built.
+today, and there is no `rotate` for the password itself. Rotating a restic password needs a
+separate pass against the live repository, which is future work and not yet built.
 
 ```bash
-osiris restic-key init      # mint the password (refuses if one already exists)
+osiris restic-key init      # mint the password by hand (refuses if one already exists)
 osiris restic-key status    # storage method and presence facts, never the password itself
 ```
 

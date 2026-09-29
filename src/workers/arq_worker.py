@@ -1333,6 +1333,30 @@ async def soul_cold_tier_heartbeat(ctx: dict[str, Any]) -> int:
     return len(folded)
 
 
+async def soul_encrypt_heartbeat(ctx: dict[str, Any]) -> int:
+    """THE BACKGROUND ENCRYPTION PASS: whenever a soul key exists and plaintext rows
+    remain, encrypt a bounded, throttled slice of them and save the progress record the
+    status route and the setup stepper read (`soul_encrypt_progress.encrypt_tick`, which
+    holds all the logic; nothing is duplicated here). Once a pass has finished this is a
+    cheap file read until the periodic re-check. Returns rows encrypted this tick.
+
+    Ordinary boot already requires the key (the boot gate), so a missing key here means
+    a manual removal mid-run; it is recorded as `no_key` and the job simply waits. A
+    database hiccup is recorded in the progress record by `encrypt_tick` and re-raised,
+    so the watch sees the failure and the next tick resumes from the same cursor."""
+    from src.ingest.soul_crypto import SoulKeyMissing, get_soul_fernet
+    from src.orchestrator import soul_encrypt_progress
+
+    actions: Actions = ctx["cascade"].actions
+    try:
+        fernet = get_soul_fernet()
+    except SoulKeyMissing:
+        return 0
+    before = int(soul_encrypt_progress.read_progress().get("rows_done", 0))
+    record = await soul_encrypt_progress.encrypt_tick(actions.pool, fernet)
+    return int(record.get("rows_done", 0)) - before
+
+
 async def harness_backfill_heartbeat(ctx: dict[str, Any]) -> int:
     """THE HARNESS SIGNAL'S OWN CATCH-UP (wave 13 item 3, thread e7f173a6, Thoth's ruling
     msg 8544): mount() stamps a `harness` property going forward, but every mind mounted
@@ -1682,6 +1706,11 @@ class WorkerSettings:
         # default)". Unconditional — read-only classification, no kill switch.
         cron(watched(harness_backfill_heartbeat, every=900), minute={8, 23, 38, 53},
              second={50}, timeout=600, run_at_startup=True),
+        # THE BACKGROUND ENCRYPTION PASS (operator ruling: key setup is automatic): every 30s,
+        # a bounded slice of the still-plaintext rows, throttled to at most half duty so live
+        # ingest is never starved; a no-op file read once everything is encrypted.
+        cron(watched(soul_encrypt_heartbeat, every=30), second={10, 40}, timeout=120,
+             run_at_startup=True),
         # WAVE B item 1 (thread 8839): positions the whole graph incrementally, one
         # bounded batch (layout.batch_size objects, local relaxation only) every
         # layout.tick_seconds (default 5 min, module-level above) -- a fresh graph

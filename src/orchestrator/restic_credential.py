@@ -7,12 +7,20 @@ hand-copy of the systemd-creds invocation.
 DELIBERATELY SMALLER THAN THE SOUL-STORE API: this password is a restic repository
 passphrase, not a Fernet key. Any bytes restic accepts as `RESTIC_PASSWORD` work (no
 fixed shape to validate), so there is no `MultiFernet`/legacy-key-rotation-window
-concept here at all. THIS FIRST CUT SHIPS `init`/`status` ONLY, no `rotate`,
-`enroll-recovery`, or `recover` yet. This is a deliberate scope cut, not an oversight:
-a restic repository's own password rotation additionally needs a `restic key add`/
-`restic key remove` pass against the live repository, not just a local file swap, and
-a FIDO2 recovery wrap is planned but not yet built, so partial rotate support that
-looks complete is deliberately not being shipped.
+concept here at all, and it is NEVER derived from the soul key: a derived password would
+change with every soul-key rotation and orphan every existing repository. The password is
+independent and stays fixed for the life of the repositories it protects.
+
+CREATED AUTOMATICALLY: `restic_key_ensure` (called by `osiris deploy` through
+`src.orchestrator.key_setup`) adopts an existing password or mints and seals a new one;
+`init` stays the manual door and refuses when one exists. RECOVERY: the password also
+rides inside the security-key recovery blob (`soul_crypto.attach_restic_password_to_
+recovery`), wrapped under the soul key that blob protects, so the one PIN-and-touch
+enrollment that recovers the soul key recovers the backup password with it
+(`seal_recovered_password` seals it onto the new machine). Rotating the soul key never
+changes it; re-enrolling recovery afterwards refreshes the wrap. ROTATING THE PASSWORD
+ITSELF is not supported: it would need a `restic key add`/`restic key remove` pass
+against every live repository, not just a local file swap.
 
 RESTIC ITSELF NEVER SEES THE CUSTODY LAYER: `get_restic_password()` returns the raw
 plaintext bytes (decrypted, if the backend is `host-cred`/`host+tpm2`) for the
@@ -153,6 +161,42 @@ def restic_key_init(*, path: str | None = None, backend: str | None = None) -> d
                     "back in after, then re-run restic-key init after removing the "
                     "old credential to upgrade)")
     return {"path": str(written_path), "backend": effective_backend, "tss_hint": tss_hint}
+
+
+def restic_key_ensure(*, path: str | None = None, backend: str | None = None) -> dict[str, Any]:
+    """The automatic setup's own entry: adopt the backup password if one already exists
+    (an existing repository keeps working, the password is never regenerated), else mint
+    and seal one. Returns `{"created": bool, ...}` (the `restic_key_init` result when it
+    minted). `restic-key init` stays the manual door and still refuses on an existing
+    password; this never does, because "already there" is the success case here."""
+    resolved = _password_file_path(explicit=path)
+    if resolved.exists() or _credential_path(resolved, explicit=path is not None).exists():
+        return {"created": False, "path": str(resolved)}
+    out = restic_key_init(path=path, backend=backend)
+    return out if "error" in out else {"created": True, **out}
+
+
+def seal_recovered_password(
+    password: bytes, *, path: str | None = None, backend: str | None = None,
+) -> dict[str, Any]:
+    """Seals a backup password recovered from the recovery blob onto this machine.
+    Refuses to replace a DIFFERENT existing password (that would orphan whatever it
+    protects); an identical one is a quiet success."""
+    resolved = _password_file_path(explicit=path)
+    if resolved.exists() or _credential_path(resolved, explicit=path is not None).exists():
+        try:
+            same = get_restic_password(path=path) == password
+        except ResticPasswordMissing:
+            same = False
+        if same:
+            return {"path": str(resolved), "sealed": False}
+        return {"error": f"a different backup password already exists at {resolved}, "
+                         "refusing to replace it"}
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    written_path, effective_backend = _write_password_for_backend(
+        password, resolved=resolved, backend=_resolve_backend(backend),
+        explicit_path=path is not None)
+    return {"path": str(written_path), "backend": effective_backend, "sealed": True}
 
 
 def restic_key_status(*, path: str | None = None) -> dict[str, Any]:

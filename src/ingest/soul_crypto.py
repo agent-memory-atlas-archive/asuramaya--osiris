@@ -97,7 +97,7 @@ import getpass
 import json
 import os
 import pwd
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -139,7 +139,7 @@ class PrfOutputShapeError(SoulKeyRecoveryError):
     parser bug is never reported as the operator's key lacking the extension."""
 
 
-_FERNET_TOKEN_PREFIX = b"gAAAA"  # base64 of the fixed Fernet version byte (0x80) + start
+FERNET_TOKEN_PREFIX = b"gAAAA"  # base64 of the fixed Fernet version byte (0x80) + start
 
 
 def is_encrypted(raw: bytes) -> bool:
@@ -152,7 +152,7 @@ def is_encrypted(raw: bytes) -> bool:
     ever widens what counts as 'not encrypted', never what counts as 'a genuine
     decryption failure'. This check can retire as a follow-up once a migration
     report shows zero legacy rows remaining across every deployment."""
-    return raw.startswith(_FERNET_TOKEN_PREFIX)
+    return raw.startswith(FERNET_TOKEN_PREFIX)
 
 
 def _installed_user_unit_env_value(env_name: str) -> str | None:
@@ -814,8 +814,95 @@ def _hkdf_wrap_key(prf_output: bytes) -> Fernet:
     return Fernet(base64.urlsafe_b64encode(derived))
 
 
+def key_fingerprint(raw_key: bytes) -> str:
+    """The short, never-secret fingerprint the recovery blob records for the key it wraps
+    (first 16 hex chars of the sha256), so a recovery can be checked against a live key
+    without ever comparing key bytes in a report."""
+    import hashlib
+
+    return hashlib.sha256(raw_key).hexdigest()[:16]
+
+
+def _restic_wrap_key(raw_soul_key: bytes) -> Fernet:
+    """The wrapping key for the backup password that rides inside the recovery blob:
+    HKDF-SHA256 over the soul key the SAME blob protects, under its own fixed label so it
+    is unrelated to the key that wraps the soul key itself. Deriving from the soul key
+    (rather than the security key's PRF output) is what lets the backup password be added
+    to an existing enrollment later with no second touch."""
+    import base64
+
+    derived = HKDF(
+        algorithm=hashes.SHA256(), length=32, salt=None,
+        info=b"osiris-restic-password-wrap",
+    ).derive(raw_soul_key)
+    return Fernet(base64.urlsafe_b64encode(derived))
+
+
+def wrap_restic_password(raw_soul_key: bytes, restic_password: bytes) -> str:
+    return _restic_wrap_key(raw_soul_key).encrypt(restic_password).decode()
+
+
+def unwrap_restic_password(raw_soul_key: bytes, wrapped: str) -> bytes | None:
+    """The backup password inside a recovery blob, or None if `wrapped` does not open
+    under this soul key (a blob wrapped under a different key generation)."""
+    try:
+        return _restic_wrap_key(raw_soul_key).decrypt(wrapped.encode())
+    except InvalidToken:
+        return None
+
+
+def soul_key_recovery_facts(*, path: str | None = None) -> dict[str, Any]:
+    """Cheap, filesystem-only facts about the recovery enrollment, for status readers:
+    `enrolled`, `restic_wrapped` (the backup password rides in the blob), and `stale`
+    (the blob wraps a different key generation than the live key, so a recovery today
+    would return an out-of-date key; None when it cannot be told). No touch, no PIN."""
+    resolved = _key_file_path(explicit=path)
+    recovery_path = _recovery_path(resolved)
+    if not recovery_path.exists():
+        return {"enrolled": False, "restic_wrapped": False, "stale": False}
+    try:
+        blob = json.loads(recovery_path.read_text())
+    except (OSError, ValueError):
+        return {"enrolled": True, "restic_wrapped": False, "stale": None}
+    stale: bool | None
+    try:
+        live = read_key_bytes_at(resolved, explicit=path is not None)
+        stale = key_fingerprint(live) != blob.get("key_fingerprint")
+    except Exception:  # noqa: BLE001 - no readable live key: staleness is unknowable, never fatal
+        stale = None
+    return {"enrolled": True, "restic_wrapped": bool(blob.get("restic_password_wrapped")),
+            "stale": stale}
+
+
+def attach_restic_password_to_recovery(
+    restic_password: bytes, *, path: str | None = None,
+) -> dict[str, Any]:
+    """Adds (or refreshes) the wrapped backup password in an EXISTING recovery blob, with
+    no touch and no PIN: it is wrapped under the soul key the blob already protects, which
+    is readable here because this is the live box. Refuses when the blob wraps a different
+    key generation than the live key (a rotation since enrollment): attaching would pair a
+    stale key with a current wrap, so re-enrolling recovery comes first."""
+    resolved = _key_file_path(explicit=path)
+    recovery_path = _recovery_path(resolved)
+    if not recovery_path.exists():
+        return {"error": f"no recovery enrollment found at {recovery_path}"}
+    blob = json.loads(recovery_path.read_text())
+    live = read_key_bytes_at(resolved, explicit=path is not None)
+    if key_fingerprint(live) != blob.get("key_fingerprint"):
+        return {"error": "the recovery enrollment protects an older key than the live one "
+                         "(the key was rotated since). Re-enroll recovery first"}
+    existing = blob.get("restic_password_wrapped")
+    if existing and unwrap_restic_password(live, existing) == restic_password:
+        return {"path": str(recovery_path), "changed": False}
+    blob["restic_password_wrapped"] = wrap_restic_password(live, restic_password)
+    recovery_path.write_text(json.dumps(blob))
+    recovery_path.chmod(0o600)
+    return {"path": str(recovery_path), "changed": True}
+
+
 def soul_key_enroll_recovery(
     *, path: str | None = None, rp_id: str = _DEFAULT_RP_ID,
+    restic_password: bytes | None = None,
 ) -> dict[str, Any]:
     """Enrolls a new discoverable FIDO2 credential on the operator's Security Key
     with the PRF extension, derives a wrapping key from its PRF output at a fresh
@@ -833,6 +920,11 @@ def soul_key_enroll_recovery(
     `cmd_soul_key` (cli.py) reads it live and passes it in; this function's own
     default (`_DEFAULT_RP_ID`, "localhost") is only what a caller with no pool
     in hand (a test, a script) falls back to.
+
+    `restic_password`: the backup password, when one exists, is wrapped into the same
+    blob (under the soul key, see `_restic_wrap_key`) so the one enrollment recovers
+    both; the caller (the orchestration layer) supplies it, this module never reads the
+    backup credential itself.
 
     Requires PIN and touch: blocks on physical interaction via
     `_CliUserInteraction`; never call this from a non-interactive context (the
@@ -855,7 +947,7 @@ def soul_key_enroll_recovery(
     # own `path=`/`explicit=` entirely and ignores an explicit path, the same
     # defect class caught in soul_key_rotate_begin while this function was built.
     raw_key = read_key_bytes_at(resolved)
-    wrapped = _enroll_and_wrap(device, raw_key, rp_id=rp_id)
+    wrapped = _enroll_and_wrap(device, raw_key, rp_id=rp_id, restic_password=restic_password)
     if "error" in wrapped:
         return wrapped
     recovery_path.write_text(json.dumps(wrapped["blob"]))
@@ -863,7 +955,9 @@ def soul_key_enroll_recovery(
     return {"path": str(recovery_path), "credential_id_fingerprint": wrapped["fingerprint"]}
 
 
-def _enroll_and_wrap(device: Any, raw_key: bytes, *, rp_id: str) -> dict[str, Any]:
+def _enroll_and_wrap(
+    device: Any, raw_key: bytes, *, rp_id: str, restic_password: bytes | None = None,
+) -> dict[str, Any]:
     """The actual CTAP2 enrollment flow, split out from `soul_key_enroll_recovery`
     so tests can inject a fake `device`/monkeypatch `_fido2_client` without also
     faking the filesystem side. Returns `{"blob": {...}, "fingerprint": ...}` on
@@ -928,6 +1022,8 @@ def _enroll_and_wrap(device: Any, raw_key: bytes, *, rp_id: str) -> dict[str, An
         "key_fingerprint": fingerprint,
         "rp_id": rp_id,
     }
+    if restic_password is not None:
+        blob["restic_password_wrapped"] = wrap_restic_password(raw_key, restic_password)
     return {"blob": blob, "fingerprint": fingerprint}
 
 
@@ -1010,6 +1106,7 @@ def _prf_first_output(ext_results: Any) -> bytes | None:
 
 def soul_key_recover(
     *, path: str | None = None, backend: str | None = None, rp_id: str = _DEFAULT_RP_ID,
+    seal_restic: Callable[[bytes], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Reverses `soul_key_enroll_recovery`: reads `_recovery_path(resolved)`,
     re-derives the same wrapping key via `_prf_eval` on the same credential and
@@ -1030,6 +1127,11 @@ def soul_key_recover(
     changes it; this function recovers what was actually minted, never what's
     merely configured today.
 
+    `seal_restic`: when the blob also carries a wrapped backup password, it is unwrapped
+    under the just-recovered key and handed to this callback (the orchestration layer's
+    own sealer, so this module never touches the backup credential itself); the result
+    reports `restic_password_recovered` and never contains the password.
+
     Refuses if a key already exists at the target path (this is a recovery
     function, not a rotation: `soul-key rotate` is the command once you already
     have a live key and just want a new one)."""
@@ -1041,8 +1143,40 @@ def soul_key_recover(
     recovery_path = _recovery_path(resolved)
     if not recovery_path.exists():
         return {"error": f"no recovery enrollment found at {recovery_path}"}
+    unwrapped = _unwrap_recovery(recovery_path, rp_id)
+    if "error" in unwrapped:
+        return unwrapped
+    raw_key = unwrapped["raw_key"]
+    blob = unwrapped["blob"]
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    effective_backend = _resolve_backend(backend)
+    written_path, effective_backend = _write_key_for_backend(
+        raw_key, resolved=resolved, backend=effective_backend, explicit_path=path is not None)
+    out: dict[str, Any] = {
+        "path": str(written_path), "backend": effective_backend,
+        "systemd_note": _deploy_note(resolved),
+    }
+    wrapped_pw = blob.get("restic_password_wrapped")
+    if wrapped_pw:
+        password = unwrap_restic_password(raw_key, wrapped_pw)
+        if password is None:
+            out["restic_password_recovered"] = False
+        elif seal_restic is None:
+            out["restic_password_recovered"] = False
+        else:
+            sealed = seal_restic(password)
+            out["restic_password_recovered"] = "error" not in sealed
+            if "error" in sealed:
+                out["restic_password_note"] = sealed["error"]
+    return out
+
+
+def _unwrap_recovery(recovery_path: Path, rp_id: str) -> dict[str, Any]:
+    """The physical half shared by recover and verify: reads the blob, re-derives the
+    wrapping key from the security key (PIN and touch), unwraps the soul key and checks
+    it against the blob's own recorded fingerprint. Returns {"raw_key", "blob"} or
+    {"error"}. Writes nothing."""
     import base64
-    import hashlib
 
     blob = json.loads(recovery_path.read_text())
     effective_rp_id = blob.get("rp_id") or rp_id
@@ -1069,15 +1203,45 @@ def soul_key_recover(
     except InvalidToken:
         return {"error": "recovery blob failed to decrypt: wrong Security Key, or the "
                          "blob is corrupted"}
-    if hashlib.sha256(raw_key).hexdigest()[:16] != blob["key_fingerprint"]:
+    if key_fingerprint(raw_key) != blob["key_fingerprint"]:
         return {"error": "recovered key's own fingerprint does not match the recovery "
                          "blob's recorded one, refusing to seal a possibly-tampered "
                          "key; this is a real break, not a retryable glitch"}
-    resolved.parent.mkdir(parents=True, exist_ok=True)
-    effective_backend = _resolve_backend(backend)
-    written_path, effective_backend = _write_key_for_backend(
-        raw_key, resolved=resolved, backend=effective_backend, explicit_path=path is not None)
+    return {"raw_key": raw_key, "blob": blob}
+
+
+def soul_key_verify_recovery(
+    *, path: str | None = None, rp_id: str = _DEFAULT_RP_ID,
+    restic_password: bytes | None = None,
+) -> dict[str, Any]:
+    """A NON-DESTRUCTIVE recovery check: the same PIN and touch as `soul_key_recover`,
+    the same unwrap and fingerprint check, and then it stops. Nothing is written, sealed
+    or replaced, and it works while a live key exists (which `soul_key_recover` refuses).
+
+    Reports whether the recovered key matches the LIVE key (`matches_live_key`), and,
+    when the blob carries a wrapped backup password and the caller passes the current one,
+    whether that matches too (`restic_password_matches`; None when either side is
+    absent). The key material itself never appears in the result, only fingerprints."""
+    resolved = _key_file_path(explicit=path)
+    recovery_path = _recovery_path(resolved)
+    if not recovery_path.exists():
+        return {"error": f"no recovery enrollment found at {recovery_path}"}
+    unwrapped = _unwrap_recovery(recovery_path, rp_id)
+    if "error" in unwrapped:
+        return unwrapped
+    raw_key = unwrapped["raw_key"]
+    blob = unwrapped["blob"]
+    matches_live: bool | None
+    try:
+        matches_live = read_key_bytes_at(resolved, explicit=path is not None) == raw_key
+    except Exception:  # noqa: BLE001 - no readable live key: the comparison is simply absent
+        matches_live = None
+    pw_matches: bool | None = None
+    wrapped_pw = blob.get("restic_password_wrapped")
+    if wrapped_pw and restic_password is not None:
+        pw_matches = unwrap_restic_password(raw_key, wrapped_pw) == restic_password
     return {
-        "path": str(written_path), "backend": effective_backend,
-        "systemd_note": _deploy_note(resolved),
+        "verified": True, "key_fingerprint": blob["key_fingerprint"],
+        "matches_live_key": matches_live, "restic_password_wrapped": bool(wrapped_pw),
+        "restic_password_matches": pw_matches,
     }

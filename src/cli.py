@@ -1031,7 +1031,8 @@ async def cmd_seed(*, compositions_only: bool, pool: asyncpg.Pool | None = None)
 # not inside soul_crypto.py itself).
 _SOUL_KEY_POOL_FREE_ACTIONS = ("init",)
 _SOUL_KEY_ACTIONS = (
-    "status", "init", "rotate", "restore-drill", "enroll-recovery", "recover")
+    "status", "init", "rotate", "restore-drill", "enroll-recovery", "verify-recovery",
+    "recover")
 
 
 _SOUL_KEY_RESTART_UNITS = ["osiris-mcp.service", "osiris-worker.service"]
@@ -1041,20 +1042,24 @@ async def cmd_soul_key(
     action: str, *, owner: str | None = None, path: str | None = None,
     backend: str | None = None, finish: bool = False, print_recovery: bool = False,
     repo_url: str | None = None, restart: bool = False, as_json: bool = False,
-    pool: asyncpg.Pool | None = None,
+    exact: bool = False, pool: asyncpg.Pool | None = None,
 ) -> int:
-    """osiris soul-key <status|init|rotate|restore-drill|enroll-recovery|recover>:
+    """osiris soul-key <status|init|rotate|restore-drill|enroll-recovery|verify-recovery|recover>:
     THE KEY ENTRY POINT, so that key and backup setup are configurable from the UI or the
     CLI without needing an agent. A thin console-script entry point, matching `osiris
     composition <action>`'s own shape.
 
-    `init` stays POOL-FREE and calls `src.ingest.soul_crypto` directly.
-    `enroll-recovery`/`recover` ALSO call `src.ingest.soul_crypto` directly (both stay
-    CLI-ONLY, never REST, see `src.orchestrator.soul_key`'s own module docstring:
-    minting or unwrapping a recovery blob from a non-interactive HTTP call makes no
-    sense, both need a human's own PIN and touch right there in the terminal) but DO
-    compose a short-lived pool now, solely to read `soul_key.rp_id` before the FIDO2
-    ceremony.
+    `init` stays POOL-FREE and calls `src.ingest.soul_crypto` directly (setup itself no
+    longer needs it: `osiris deploy` mints the key when none exists, this stays as the
+    manual and debugging door).
+    `enroll-recovery`/`verify-recovery`/`recover` go through `src.orchestrator.soul_key`
+    (the backup password rides along with the key, and verify writes its receipt there).
+    All three stay CLI-ONLY, never REST, see that module's own docstring: minting,
+    checking or unwrapping a recovery blob from a non-interactive HTTP call makes no
+    sense, each needs a human's own PIN and touch right there in the terminal. They DO
+    compose a short-lived pool, solely to read `soul_key.rp_id` before the FIDO2
+    ceremony. `verify-recovery` changes nothing: it proves the recovery works and
+    records a receipt.
 
     status/rotate/restore-drill compose a pool and call `src.orchestrator.
     soul_key`, the SAME three functions the `/soul-key/*` REST routes call,
@@ -1118,20 +1123,23 @@ async def cmd_soul_key(
             return 1
     try:
         if action == "status":
-            out = await soul_key_orchestrator.soul_key_status(pool, path=path)
+            out = await soul_key_orchestrator.soul_key_status(pool, path=path, exact=exact)
         elif action == "rotate":
             out = await soul_key_orchestrator.soul_key_rotate(
                 pool, path=path, finish=finish, print_recovery=print_recovery)
         elif action == "restore-drill":
             out = await soul_key_orchestrator.soul_key_restore_drill(pool, repo_url=repo_url)
-        else:  # enroll-recovery / recover: pool-free soul_crypto calls, rp_id off settings
+        else:  # enroll-recovery / verify-recovery / recover: rp_id off settings
             from src.orchestrator.settings_service import get_setting
 
             rp_id = (await get_setting(pool, "soul_key.rp_id"))["value"]
             if action == "enroll-recovery":
-                out = soul_crypto.soul_key_enroll_recovery(path=path, rp_id=rp_id)
+                out = soul_key_orchestrator.soul_key_enroll_recovery(path=path, rp_id=rp_id)
+            elif action == "verify-recovery":
+                out = soul_key_orchestrator.soul_key_verify_recovery(path=path, rp_id=rp_id)
             else:  # recover
-                out = soul_crypto.soul_key_recover(path=path, backend=backend, rp_id=rp_id)
+                out = soul_key_orchestrator.soul_key_recover(
+                    path=path, backend=backend, rp_id=rp_id)
     finally:
         if owns_pool:
             await pool.close()
@@ -3584,6 +3592,7 @@ WaitForHealth = Callable[[], Awaitable[tuple[bool, float]]]
 WaitForSmoke = Callable[[], Awaitable[tuple[list[str], float]]]
 CheckWhisperProbe = Callable[[], Awaitable[tuple[bool, str]]]
 WaitForMcpSocket = Callable[[], Awaitable[tuple[bool, float]]]
+EnsureKeySetup = Callable[[], Awaitable[dict[str, Any]]]
 ChaosGate = Callable[[asyncpg.Pool], Awaitable[dict[str, Any]]]
 FullSuiteGate = Callable[[Path], Awaitable[dict[str, Any]]]
 CheckFalseMintLive = Callable[[asyncpg.Pool], Awaitable[list[dict[str, Any]]]]
@@ -3850,6 +3859,16 @@ async def _real_update_deploy_snapshot(root: Path, sha: str) -> str:
     return out or "deploy snapshot: ran, no output"
 
 
+async def _real_ensure_key_setup() -> dict[str, Any]:
+    """The automatic key and backup setup (`src.orchestrator.key_setup`), off the event loop
+    because minting shells out to systemd-creds. Resolved at call time inside `cmd_deploy`
+    (never bound as a default) so the test suite can replace this one name and never touch
+    a developer's real credential store."""
+    from src.orchestrator.key_setup import ensure_key_setup
+
+    return await asyncio.to_thread(ensure_key_setup)
+
+
 async def cmd_deploy(
     *, repo_root: Path | None = None, git_status: GitStatus = _real_git_status,
     restart: RestartServices = _real_restart_services, pool: asyncpg.Pool | None = None,
@@ -3863,6 +3882,7 @@ async def cmd_deploy(
     unit_start_timestamps: UnitStartTimestamps = _real_unit_start_timestamps,
     check_whisper_probe: CheckWhisperProbe = _real_check_whisper_probe,
     wait_for_mcp_socket: WaitForMcpSocket = _wait_for_mcp_socket,
+    ensure_key_setup: EnsureKeySetup | None = None,
     chaos_gate: ChaosGate = _real_chaos_gate,
     check_false_mint_live: CheckFalseMintLive = _real_check_false_mint_live,
     full_suite_gate: FullSuiteGate = _real_full_suite_gate,
@@ -4011,6 +4031,30 @@ async def cmd_deploy(
                   "placeholders, not real units (see the `unit: REFUSED` line(s) "
                   "above). Nothing was installed or restarted.", file=sys.stderr)
             return 1
+
+        # THE KEY NEEDS NO COMMAND: a fresh box has no encryption key, and the services
+        # refuse to boot without one, so setup mints it HERE, before the restart below
+        # picks it up (which is also why no separate restart step is needed for a
+        # first-time key). The backup password is minted or adopted the same way. Both are
+        # no-ops on a box that already has them. Only a failure to have a key stops the
+        # deploy; a backup-password hiccup is named and the deploy continues.
+        key_setup = await (ensure_key_setup or _real_ensure_key_setup)()
+        if not key_setup.get("ok", True):
+            print(f"osiris deploy: refused. The encryption key is missing and could not be "
+                  f"created: {key_setup.get('error')}. Nothing was restarted.",
+                  file=sys.stderr)
+            return 1
+        if key_setup.get("minted"):
+            print("key: created (the restart below picks it up)")
+            if key_setup.get("tss_hint"):
+                print(f"NOTE: {key_setup['tss_hint']}")
+        if key_setup.get("backup_password") == "minted":
+            print("backup password: created")
+        elif key_setup.get("backup_password") == "failed":
+            print(f"NOTE: backup password not set up: "
+                  f"{key_setup.get('backup_password_error')}")
+        if key_setup.get("recovery_note"):
+            print(f"NOTE: recovery refresh skipped: {key_setup['recovery_note']}")
 
         tools_before = await list_tools()
 
@@ -7874,22 +7918,27 @@ def _build_parser() -> argparse.ArgumentParser:
                "example: osiris soul-key init --backend file --print-recovery\n"
                "example: osiris soul-key status\n"
                "example: osiris soul-key enroll-recovery\n"
+               "example: osiris soul-key verify-recovery\n"
                "example: osiris soul-key rotate\n"
                "example: osiris soul-key rotate --finish\n"
                "example: osiris soul-key recover\n"
                "example: osiris soul-key restore-drill")
     p_soul_key.add_argument(
         "action",
-        choices=["status", "init", "rotate", "restore-drill", "enroll-recovery", "recover"],
-        help="status: show backend, recovery, and legacy-row facts, never the key bytes "
-             "themselves. init: mint the first key, refusing if one already exists; a "
-             "systemd-creds user credential by default, or use --backend file for the "
-             "older plaintext form. rotate: mint a new key and re-wrap every row onto "
-             "it; run again with --finish once the report is clean. enroll-recovery: "
-             "wrap the current key with a hardware security key (PIN plus touch). "
-             "recover: restore a key from a security-key recovery enrollment onto a "
-             "box with no live key yet. restore-drill: prove that an off-box backup "
-             "repository actually restores")
+        choices=["status", "init", "rotate", "restore-drill", "enroll-recovery",
+                 "verify-recovery", "recover"],
+        help="status: show backend, recovery, and encryption-progress facts, never the "
+             "key bytes themselves. init: mint the first key by hand, refusing if one "
+             "already exists (a deploy does this automatically); a systemd-creds user "
+             "credential by default, or use --backend file for the older plaintext "
+             "form. rotate: mint a new key and re-wrap every row onto it; run again "
+             "with --finish once the report is clean. enroll-recovery: wrap the "
+             "current key with a hardware security key (PIN plus touch). "
+             "verify-recovery: prove that recovery works without changing anything "
+             "(PIN plus touch) and record a receipt. recover: restore a key from a "
+             "security-key recovery enrollment onto a box with no live key yet. "
+             "restore-drill: prove that an off-box backup repository actually "
+             "restores")
     p_soul_key.add_argument("--owner", default=None,
                             help="init only: change ownership of the key file and "
                                  "directory to this user after writing (useful when "
@@ -7919,6 +7968,11 @@ def _build_parser() -> argparse.ArgumentParser:
                                  "after minting the key (a user-level restart, no "
                                  "sudo needed). Without this flag, init prints the "
                                  "command to run by hand instead")
+    p_soul_key.add_argument("--exact", action="store_true",
+                            help="status only: count the rows still stored in plain "
+                                 "text exactly (decrypts every row, can take minutes on a "
+                                 "large store). The default reads the background "
+                                 "encryption pass's own progress instead, instantly")
     p_soul_key.add_argument("--json", action="store_true", dest="as_json",
                             help="machine-readable: one compact JSON line")
 
@@ -9468,7 +9522,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(cmd_soul_key(
             args.action, owner=args.owner, path=args.path, backend=args.backend,
             finish=args.finish, print_recovery=args.print_recovery,
-            repo_url=args.repo_url, restart=args.restart, as_json=args.as_json))
+            repo_url=args.repo_url, restart=args.restart, as_json=args.as_json,
+            exact=args.exact))
     if args.command == "restic-key":
         return asyncio.run(cmd_restic_key(
             args.action, path=args.path, backend=args.backend, as_json=args.as_json))
