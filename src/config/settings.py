@@ -137,6 +137,11 @@ class Settings(BaseSettings):
     # cost more relatively, and this daemon's own concurrency never measured near its old
     # ceiling the way the worker's did, so the pool size was lowered accordingly.
     osiris_mcp_pool_size: int = 8
+    # The bound on every acquire from that pool (src/db/pool.py's PoolStarved). asyncpg's
+    # own default waits forever, so the 2026-09-29 pool-starvation deadlock hung every tool
+    # call with no error at all. Starvation now fails loud and named after this many
+    # seconds; generous enough that a merely busy pool never trips it.
+    osiris_mcp_pool_acquire_timeout: float = 30.0
     # The other two long-running daemons: osiris-worker and the console (src/api/app.py)
     # each called create_pool with no size override, silently inheriting the bare
     # asyncpg.create_pool default (max_size=10), unconfigured rather than a deliberate

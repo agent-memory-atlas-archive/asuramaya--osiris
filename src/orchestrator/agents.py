@@ -2278,7 +2278,7 @@ _LOCK_TIMEOUT = "5s"  # a genuinely wedged holder fails waiters loud, not silent
 
 
 @asynccontextmanager
-async def mint_lock(pool: asyncpg.Pool, lineage_root: str) -> AsyncIterator[None]:
+async def mint_lock(pool: asyncpg.Pool, lineage_root: str) -> AsyncIterator[asyncpg.Pool]:
     """Serialize generation-minting per lineage (a pg advisory lock on the root). Two
     concurrent transition observers once minted two generations in the same second with
     identical transition strings: each walked the head, each minted, and the loser's
@@ -2292,7 +2292,15 @@ async def mint_lock(pool: asyncpg.Pool, lineage_root: str) -> AsyncIterator[None
     could return the connection to the pool still holding it (advisory locks are
     session-scoped, unaffected by asyncpg's connection.reset()). pg_advisory_xact_lock
     inside an explicit transaction dies with the transaction instead, no finally needed,
-    and a short SET LOCAL lock_timeout makes a genuinely wedged holder fail waiters loud."""
+    and a short SET LOCAL lock_timeout makes a genuinely wedged holder fail waiters loud.
+
+    YIELDS THE LOCKED CONNECTION as a pinned pool (src/db/pool.py's PinnedPool): the body
+    must do ALL its database work through it (`Actions(locked)`, `locked.fetchval(...)`),
+    never through the pool it passed in. The 2026-09-29 wedge: every body here used to
+    re-enter `actions.pool`, a second acquire while this one held the first, and a burst of
+    concurrent holders (heartbeat-driven live_succession across several lineages) took
+    every slot, each parked waiting for one more: a pool-starvation deadlock."""
+    from src.db.pool import pin
     from src.orchestrator.seats import LockWedged
 
     key = f"mint:{lineage_root}"
@@ -2304,7 +2312,7 @@ async def mint_lock(pool: asyncpg.Pool, lineage_root: str) -> AsyncIterator[None
             raise LockWedged(
                 f"mint_lock: {key!r} still held past {_LOCK_TIMEOUT}: another mint is "
                 "genuinely in flight (or wedged)") from exc
-        yield
+        yield pin(pool, conn)
 
 
 # For the source_model property, the resolution method is the provenance, and observation
@@ -3767,7 +3775,10 @@ async def live_succession(
             await actions.pool.execute(
                 "UPDATE agent_mounts SET model=$2 WHERE job_dir=$1", row["job_dir"], observed)
         return {"unchanged": True}
-    async with mint_lock(actions.pool, _generation(row["agent_id"])[0]):
+    async with mint_lock(actions.pool, _generation(row["agent_id"])[0]) as locked:
+        # Everything below runs on the lock's own connection (mint_lock's docstring): the
+        # function returns from inside this block, so rebinding `actions` never leaks it.
+        actions = Actions(locked)
         # Re-read inside the lock: two concurrent heartbeats once both read the pre-swap row
         # and both minted, producing identical transition strings a second apart. The loser
         # now waits, re-reads, sees the winner's write, and no-ops.
@@ -3972,11 +3983,14 @@ async def register_agent(
     # The mint lock: phases 0-1 read-then-write the succession chain; two concurrent
     # registrations (or a registration racing the heartbeat) must serialize per lineage, or
     # the loser's head-walk finds the winner's mint and stacks a generation on it.
-    async with mint_lock(actions.pool, _generation(identity.agent_id)[0]):
+    async with mint_lock(actions.pool, _generation(identity.agent_id)[0]) as locked:
+        # The whole lock body runs on the lock's own connection (mint_lock's docstring):
+        # `lk` is `actions` pinned to it, never the shared pool.
+        lk = Actions(locked)
         # Phase 0, lineage: a session-keyed resolve lands on the base id; walk to the lineage
         # head first, since the head is who this name is now. Transition checks run against
         # the head.
-        head = await lineage_head(actions.pool, identity.agent_id)
+        head = await lineage_head(lk.pool, identity.agent_id)
         if head != identity.agent_id:
             identity.agent_id = head
         src = identity.agent_id
@@ -3985,13 +3999,13 @@ async def register_agent(
         # widening it here would ripple across the whole codebase for one caller's own
         # question. Only computed under revisit_check (an extra read on the primary mint path is
         # a real cost, paid only by the one call site that asked for it).
-        genuinely_fresh = revisit_check and not bool(await actions.pool.fetchval(
+        genuinely_fresh = revisit_check and not bool(await lk.pool.fetchval(
             "SELECT 1 FROM objects WHERE type='Agent' AND canonical=$1", identity.agent_id))
-        a = await actions.create_or_find_object("Agent", identity.agent_id, src)
+        a = await lk.create_or_find_object("Agent", identity.agent_id, src)
 
         # Phase 1, transition detection leading to mint: the heir gets its own name.
         mint_because: str | None = None
-        if await _winning_retired(actions, a):
+        if await _winning_retired(lk, a):
             # A retired identity is never re-worn: the arriving context is an heir and gets
             # minted below. The retirement stands.
             mint_because = "reanimation-of-retired"
@@ -4002,7 +4016,7 @@ async def register_agent(
             # every time, since the returning model is a third identity, not the first one
             # back. Normalized comparison: a bracketed display variant of the same weights
             # is the same identity, never a transition.
-            prior_raw, prior_at = await _last_anchored_stamp(actions, a)
+            prior_raw, prior_at = await _last_anchored_stamp(lk, a)
             prior = normalize_model(prior_raw)
             obs = normalize_model(identity.model)
             # The no-baseline gate, defense-in-depth for the same lesson applied in forks.py: a
@@ -4032,12 +4046,12 @@ async def register_agent(
             # minting. The debounce must work whichever observer witnesses the return leg
             # (it used to live only in the heartbeat, so a mount seeing the round-trip
             # minted a phantom generation).
-            healed = await _debounce_roundtrip(actions, agent_id=identity.agent_id,
+            healed = await _debounce_roundtrip(lk, agent_id=identity.agent_id,
                                                observed=obs, now=now)
             if healed is not None:
                 identity.agent_id = str(healed["restored"])
                 src = identity.agent_id
-                a = await actions.create_or_find_object("Agent", identity.agent_id, src)
+                a = await lk.create_or_find_object("Agent", identity.agent_id, src)
                 identity.model_succession = None
                 mint_because = None
         if mint_because == "reanimation-of-retired":
@@ -4048,16 +4062,16 @@ async def register_agent(
             # fold already resolved this", correct mid-walk, wrong as an entry point).
             # Skip forward past any false_mint ancestors first, landing on the nearest
             # eligible one before the fold walk ever runs.
-            identity.agent_id, a = await _skip_false_mint_ancestors(actions, identity.agent_id, a)
+            identity.agent_id, a = await _skip_false_mint_ancestors(lk, identity.agent_id, a)
         if mint_because:
             # Succession follows turns: fold any zero-turn phantom off the front of the
             # chain before minting. succeeded_from must land on whoever this heir actually
             # succeeds, not a phantom that never took a turn (the exact gap that once left
             # orient()'s inheritance block blind on a double-mint).
             identity.agent_id, a = await _fold_zero_turn_ancestors(
-                actions, identity.agent_id, a, now)
+                lk, identity.agent_id, a, now)
             identity.succeeded_from = identity.agent_id
-            heir, a = await mint_heir(actions, identity.agent_id, a, because=mint_because,
+            heir, a = await mint_heir(lk, identity.agent_id, a, because=mint_because,
                                       succession=identity.model_succession, now=now,
                                       minting_door=identity.session,
                                       upcoming_project=identity.project)

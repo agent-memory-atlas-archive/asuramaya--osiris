@@ -577,22 +577,55 @@ class _FakeRegistration:
         self.attestation_object = _FakeAttestationObject(credential_id)
 
 
-class _FakeExtensionResults:
-    def __init__(self, prf_output: bytes | None) -> None:
-        self.prf = {"results": {"first": prf_output}} if prf_output is not None else None
+def _real_prf_client_outputs(prf_output: bytes | None) -> Any:
+    """The EXACT object python-fido2 2.x hands back as
+    `AuthenticatorAssertionResponse.client_extension_results`, built from the
+    library's own types. An earlier hand-rolled fake used a plain dict here, which
+    matched the parser's wrong assumption and hid the bug that refused every
+    real YubiKey enrollment."""
+    from fido2.ctap2.extensions import (
+        AuthenticatorExtensionsPRFOutputs,
+        AuthenticatorExtensionsPRFValues,
+    )
+    from fido2.webauthn import AuthenticationExtensionsClientOutputs
+
+    if prf_output is None:
+        return AuthenticationExtensionsClientOutputs({})
+    return AuthenticationExtensionsClientOutputs({
+        "prf": AuthenticatorExtensionsPRFOutputs(
+            results=AuthenticatorExtensionsPRFValues(first=prf_output)),
+    })
 
 
 class _FakeAssertion:
-    def __init__(self, prf_output: bytes | None) -> None:
-        self.client_extension_results = _FakeExtensionResults(prf_output)
+    def __init__(self, prf_output: bytes | None, client_extension_results: Any = None) -> None:
+        self.client_extension_results = (
+            client_extension_results if client_extension_results is not None
+            else _real_prf_client_outputs(prf_output))
 
 
 class _FakeAssertionSelection:
-    def __init__(self, prf_output: bytes | None) -> None:
+    def __init__(self, prf_output: bytes | None, client_extension_results: Any = None) -> None:
         self._prf_output = prf_output
+        self._client_extension_results = client_extension_results
 
     def get_response(self, index: int) -> _FakeAssertion:
-        return _FakeAssertion(self._prf_output)
+        return _FakeAssertion(self._prf_output, self._client_extension_results)
+
+
+class _CannedOutputsClient:
+    """get_assertion returns exactly the client-extension outputs it was built with."""
+
+    def __init__(self, client_extension_results: Any) -> None:
+        self._outputs = client_extension_results
+        self.seen_extensions: list[Any] = []
+
+    def make_credential(self, options: Any) -> _FakeRegistration:
+        return _FakeRegistration(b"fake-credential-id-0123456789ab")
+
+    def get_assertion(self, options: Any) -> _FakeAssertionSelection:
+        self.seen_extensions.append(options.extensions)
+        return _FakeAssertionSelection(None, self._outputs)
 
 
 class _FakeFido2Client:
@@ -617,6 +650,80 @@ class _FakeFido2Client:
         salt = options.extensions["prf"]["eval"]["first"]
         prf_output = hmac.new(self._device_secret, salt, hashlib.sha256).digest()
         return _FakeAssertionSelection(prf_output)
+
+
+def test_prf_eval_reads_fido2s_real_rich_prf_output_type() -> None:
+    """Regression: python-fido2 2.2.1 returns `AuthenticatorExtensionsPRFOutputs`
+    (a dataclass, not a dict) from `client_extension_results.prf`. The old parser
+    demanded a dict, returned None, and refused a YubiKey 5C NFC (fw 5.7.1,
+    hmac-secret supported) three times as "may not support the extension"."""
+    secret = b"x" * 32
+    client = _CannedOutputsClient(_real_prf_client_outputs(secret))
+    out = soul_crypto._prf_eval(client, b"cred", b"s" * 32, rp_id="localhost")
+    assert out == secret
+    assert isinstance(out, bytes)
+    # the extension input is the shape fido2 2.2.1's PRF input parser accepts
+    assert client.seen_extensions == [{"prf": {"eval": {"first": b"s" * 32}}}]
+
+
+def test_prf_eval_accepts_the_json_dict_shape_too() -> None:
+    """Item access on the same outputs yields base64url strings; either shape decodes."""
+    secret = bytes(range(32))
+    outputs = _real_prf_client_outputs(secret)
+    as_json = {"prf": outputs["prf"]}
+    assert isinstance(as_json["prf"]["results"]["first"], str)
+    client = _CannedOutputsClient(as_json)
+    assert soul_crypto._prf_eval(client, b"cred", b"s" * 32, rp_id="localhost") == secret
+
+
+def test_prf_eval_returns_none_only_when_there_is_genuinely_no_output() -> None:
+    from fido2.ctap2.extensions import AuthenticatorExtensionsPRFOutputs
+    from fido2.webauthn import AuthenticationExtensionsClientOutputs
+
+    for outputs in (
+        AuthenticationExtensionsClientOutputs({}),
+        AuthenticationExtensionsClientOutputs(
+            {"prf": AuthenticatorExtensionsPRFOutputs(enabled=True)}),
+    ):
+        client = _CannedOutputsClient(outputs)
+        assert soul_crypto._prf_eval(client, b"c", b"s" * 32, rp_id="localhost") is None
+
+
+def test_prf_eval_names_an_unexpected_shape_instead_of_blaming_the_key() -> None:
+    client = _CannedOutputsClient({"prf": 12345})
+    with pytest.raises(soul_crypto.PrfOutputShapeError, match="unexpected PRF output shape 'int'"):
+        soul_crypto._prf_eval(client, b"c", b"s" * 32, rp_id="localhost")
+
+
+def test_enroll_recovery_reports_a_parse_failure_honestly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Output present but unparsable must never read as "your key may not support it"."""
+    key_file = tmp_path / "soul.key"
+    soul_key_init(path=str(key_file), backend="file")
+    monkeypatch.setattr(soul_crypto, "_find_fido2_device", lambda: object())
+    monkeypatch.setattr(
+        soul_crypto, "_fido2_client",
+        lambda device, rp_id: _CannedOutputsClient({"prf": object()}))
+    out = soul_crypto.soul_key_enroll_recovery(path=str(key_file))
+    assert "unexpected PRF output shape" in out["error"]
+    assert "may not support" not in out["error"]
+    assert not soul_crypto._recovery_path(key_file).exists()  # nothing written
+
+
+def test_enroll_recovery_no_output_still_says_unsupported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fido2.webauthn import AuthenticationExtensionsClientOutputs
+
+    key_file = tmp_path / "soul.key"
+    soul_key_init(path=str(key_file), backend="file")
+    monkeypatch.setattr(soul_crypto, "_find_fido2_device", lambda: object())
+    monkeypatch.setattr(
+        soul_crypto, "_fido2_client",
+        lambda device, rp_id: _CannedOutputsClient(AuthenticationExtensionsClientOutputs({})))
+    out = soul_crypto.soul_key_enroll_recovery(path=str(key_file))
+    assert "returned no PRF/hmac-secret output" in out["error"]
 
 
 def test_soul_key_enroll_recovery_refuses_when_no_key_exists(

@@ -74,14 +74,27 @@ class _FakeRegistration:
         self.attestation_object = _FakeAttestationObject(credential_id)
 
 
-class _FakeExtensionResults:
-    def __init__(self, prf_output: bytes | None) -> None:
-        self.prf = {"results": {"first": prf_output}} if prf_output is not None else None
+def _real_prf_client_outputs(prf_output: bytes | None) -> Any:
+    """python-fido2's own `AuthenticationExtensionsClientOutputs` with its rich PRF
+    type, never a hand-rolled dict (a dict fake hid the parser bug that refused
+    every real Security Key enrollment)."""
+    from fido2.ctap2.extensions import (
+        AuthenticatorExtensionsPRFOutputs,
+        AuthenticatorExtensionsPRFValues,
+    )
+    from fido2.webauthn import AuthenticationExtensionsClientOutputs
+
+    if prf_output is None:
+        return AuthenticationExtensionsClientOutputs({})
+    return AuthenticationExtensionsClientOutputs({
+        "prf": AuthenticatorExtensionsPRFOutputs(
+            results=AuthenticatorExtensionsPRFValues(first=prf_output)),
+    })
 
 
 class _FakeAssertion:
     def __init__(self, prf_output: bytes | None) -> None:
-        self.client_extension_results = _FakeExtensionResults(prf_output)
+        self.client_extension_results = _real_prf_client_outputs(prf_output)
 
 
 class _FakeAssertionSelection:

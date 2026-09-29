@@ -97,6 +97,7 @@ import getpass
 import json
 import os
 import pwd
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -130,6 +131,12 @@ class SoulKeyRecoveryError(RuntimeError):
     Named separately from `SoulKeyMissing` because the fix is never "run soul-key
     init", it's "plug in your Security Key" or similar, and callers (the CLI) print
     a different hint for each."""
+
+
+class PrfOutputShapeError(SoulKeyRecoveryError):
+    """The authenticator DID return a PRF extension output, but in a shape
+    `_prf_first_output` can't read. Kept distinct from "no PRF output" so a
+    parser bug is never reported as the operator's key lacking the extension."""
 
 
 _FERNET_TOKEN_PREFIX = b"gAAAA"  # base64 of the fixed Fernet version byte (0x80) + start
@@ -899,10 +906,18 @@ def _enroll_and_wrap(device: Any, raw_key: bytes, *, rp_id: str) -> dict[str, An
         raise SoulKeyRecoveryError(f"FIDO2 enrollment failed: {exc}") from exc
     credential_id = registration.raw_id
     salt = _os.urandom(_PRF_SALT_LEN)
-    prf_output = _prf_eval(client, credential_id, salt, rp_id=rp_id)
+    try:
+        prf_output = _prf_eval(client, credential_id, salt, rp_id=rp_id)
+    except PrfOutputShapeError as exc:
+        return {"error": f"{exc} (a discoverable credential was already minted on the "
+                         f"key for rp {rp_id!r} and is now orphaned; `ykman fido "
+                         "credentials list` shows it)"}
+    except Exception as exc:  # noqa: BLE001 - the fido2 boundary: name it, never a raw traceback
+        raise SoulKeyRecoveryError(f"FIDO2 enrollment failed: {exc}") from exc
     if prf_output is None:
-        return {"error": "this Security Key did not return a PRF/hmac-secret output, "
-                         "it may not support the extension (needs FIDO2, not U2F-only)"}
+        return {"error": "this Security Key returned no PRF/hmac-secret output for the "
+                         "credential it just minted, it may not support the extension "
+                         "(needs FIDO2 with hmac-secret, not U2F-only)"}
     wrap_fernet = _hkdf_wrap_key(prf_output)
     wrapped_key = wrap_fernet.encrypt(raw_key)
     fingerprint = hashlib.sha256(raw_key).hexdigest()[:16]
@@ -936,11 +951,61 @@ def _prf_eval(client: Any, credential_id: bytes, salt: bytes, *, rp_id: str) -> 
             type=PublicKeyCredentialType.PUBLIC_KEY, id=credential_id)],
         extensions={"prf": {"eval": {"first": salt}}},
     )).get_response(0)
-    results = getattr(assertion.client_extension_results, "prf", None)
-    if not results:
+    return _prf_first_output(assertion.client_extension_results)
+
+
+def _prf_first_output(ext_results: Any) -> bytes | None:
+    """Pulls `prf.results.first` out of a `get_assertion` response's client
+    extension outputs as raw bytes. Returns None ONLY when the authenticator
+    genuinely returned no PRF result (no `prf` entry, or one with no `results`).
+    Raises `PrfOutputShapeError` when an output IS present but in a shape this
+    parser doesn't know: that is our bug, never "your key may not support it".
+
+    python-fido2 2.x's `AuthenticationExtensionsClientOutputs` answers attribute
+    access (`.prf`) with its rich type, an `AuthenticatorExtensionsPRFOutputs`
+    dataclass whose `.results.first` is bytes, and item access (`["prf"]`) with a
+    JSON-ready dict whose bytes are base64url strings. The old code read the
+    attribute and then demanded a dict, so it returned None on every real key
+    (three live enrollments refused with a YubiKey 5 that does support
+    hmac-secret). Both shapes are read here."""
+    from fido2.utils import websafe_decode
+
+    prf = getattr(ext_results, "prf", None)
+    if prf is None and isinstance(ext_results, Mapping):
+        prf = ext_results.get("prf")
+    if prf is None:
         return None
-    first = results.get("results", {}).get("first") if isinstance(results, dict) else None
-    return bytes(first) if first else None
+    # The rich dataclass is ALSO a Mapping (its item access serializes to
+    # base64url), so read its attributes first and fall back to the dict shape.
+    results: Any
+    if not isinstance(prf, dict) and hasattr(prf, "results"):
+        results = prf.results
+        if results is not None and not hasattr(results, "first"):
+            raise PrfOutputShapeError(
+                f"unexpected PRF results shape {type(results).__name__!r}: this is a "
+                "parser bug in osiris, not a key that lacks the extension")
+        first = results.first if results is not None else None
+    elif isinstance(prf, Mapping):
+        results = prf.get("results")
+        if results is not None and not isinstance(results, Mapping):
+            raise PrfOutputShapeError(
+                f"unexpected PRF results shape {type(results).__name__!r}: this is a "
+                "parser bug in osiris, not a key that lacks the extension")
+        first = results.get("first") if results is not None else None
+    else:
+        raise PrfOutputShapeError(
+            f"unexpected PRF output shape {type(prf).__name__!r}: this is a parser "
+            "bug in osiris, not a key that lacks the extension")
+    if first is None:
+        return None
+    if isinstance(first, (bytes, bytearray, memoryview)):
+        return bytes(first) or None
+    if isinstance(first, str):
+        return websafe_decode(first) or None
+    raise PrfOutputShapeError(
+        f"unexpected PRF results.first shape {type(first).__name__!r} inside "
+        f"{type(prf).__name__!r}: this is a parser bug in osiris, not a key that "
+        "lacks the extension")
 
 
 def soul_key_recover(
@@ -990,6 +1055,8 @@ def soul_key_recover(
     salt = base64.urlsafe_b64decode(blob["salt"])
     try:
         prf_output = _prf_eval(client, credential_id, salt, rp_id=effective_rp_id)
+    except PrfOutputShapeError as exc:
+        return {"error": str(exc)}
     except Exception as exc:  # noqa: BLE001 - the fido2 boundary: name it, never a raw traceback
         raise SoulKeyRecoveryError(f"FIDO2 recovery failed: {exc}") from exc
     if prf_output is None:

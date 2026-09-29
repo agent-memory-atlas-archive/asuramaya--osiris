@@ -1526,7 +1526,7 @@ def test_self_compacted_marker_from_a_dead_life_does_not_mute_the_seam(
 # file already keeps). -------------------------------------------------------------------
 
 def test_parse_slash_read_matches_a_served_verb_and_splits_its_args() -> None:
-    assert _parse_slash_read("/status") == ("status", [])
+    assert _parse_slash_read("/osiris") == ("osiris", [])
     assert _parse_slash_read("/search quorumlatch counter") == (
         "search", ["quorumlatch", "counter"])
     assert _parse_slash_read("  /roster --repo osiris  ") == ("roster", ["--repo", "osiris"])
@@ -1535,8 +1535,8 @@ def test_parse_slash_read_matches_a_served_verb_and_splits_its_args() -> None:
 def test_parse_slash_read_only_the_first_line_first_word() -> None:
     assert _parse_slash_read("not a slash command at all") is None
     assert _parse_slash_read("/") is None
-    assert _parse_slash_read("/status\nplease also tell me about X") == ("status", [])
-    assert _parse_slash_read("some prose that mentions /status mid-sentence") is None
+    assert _parse_slash_read("/osiris\nplease also tell me about X") == ("osiris", [])
+    assert _parse_slash_read("some prose that mentions /osiris mid-sentence") is None
 
 
 def test_parse_slash_read_ignores_an_unserved_verb() -> None:
@@ -1594,7 +1594,7 @@ def test_cmd_read_falls_through_on_subprocess_timeout(monkeypatch: Any) -> None:
         raise _subprocess.TimeoutExpired(cmd=args, timeout=8)
 
     monkeypatch.setattr(osiris_hook.subprocess, "run", _fake_run)
-    assert _cmd_read({"prompt": "/status"}) == 0
+    assert _cmd_read({"prompt": "/osiris"}) == 0
 
 
 def test_cmd_read_mail_falls_through_with_no_project_baked_in(monkeypatch: Any) -> None:
@@ -1625,7 +1625,7 @@ def test_cmd_read_renders_a_matched_verb_as_a_block_decision(monkeypatch: Any) -
     printed: list[str] = []
     monkeypatch.setattr(osiris_hook.subprocess, "run", _fake_run)
     monkeypatch.setattr("builtins.print", lambda s="", **kw: printed.append(s))
-    assert _cmd_read({"prompt": "/status"}) == 0
+    assert _cmd_read({"prompt": "/osiris"}) == 0
     assert seen["args"] == [osiris_hook._OSIRIS_BIN, "status", "--text"]
     assert len(printed) == 1
     payload = json.loads(printed[0])

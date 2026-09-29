@@ -413,7 +413,33 @@ def _log_all_thread_stacks(log: Any, *, reason: str) -> None:
     parts = [f"{reason}: {len(frames)} live thread(s):"]
     for thread_id, frame in frames.items():
         parts.append(f"--- thread {thread_id} ---\n{''.join(traceback.format_stack(frame))}")
+    parts.append(_format_asyncio_task_stacks())
     log.warning("\n".join(parts))
+
+
+def _format_asyncio_task_stacks() -> str:
+    """Every pending asyncio task's own coroutine stack. The thread dump alone shows
+    only the event loop sitting in select(): the 2026-09-29 pool-starvation wedge (every
+    pooled connection held by a coroutine parked in a second pool.acquire()) was a
+    single-threaded, all-coroutine hang, and the thread dump named none of it. Each task
+    is printed with `Task.print_stack` (the innermost awaiting frame is the line that is
+    stuck), so the next wedge names its coroutine. Never raises: a watchdog that throws
+    while reporting is worse than one that reports less."""
+    import io
+
+    try:
+        tasks = asyncio.all_tasks()
+    except RuntimeError:  # no running loop (called off-loop, e.g. from a signal handler)
+        return "--- asyncio tasks: no running event loop ---"
+    parts = [f"--- asyncio: {len(tasks)} pending task(s) ---"]
+    for task in sorted(tasks, key=lambda t: t.get_name()):
+        buf = io.StringIO()
+        try:
+            task.print_stack(limit=40, file=buf)
+        except Exception as exc:  # noqa: BLE001, see docstring
+            buf.write(f"<stack unavailable: {exc!r}>\n")
+        parts.append(f"--- task {task.get_name()} ---\n{buf.getvalue()}")
+    return "\n".join(parts)
 
 
 async def _watchdog_loop() -> None:
@@ -1431,6 +1457,7 @@ async def _pool_get() -> asyncpg.Pool:
         _pool = await create_pool(
             get_settings().database_url, max_size=get_settings().osiris_mcp_pool_size,
             application_name="osiris-mcp",
+            acquire_timeout=get_settings().osiris_mcp_pool_acquire_timeout,
         )
     return _pool
 
