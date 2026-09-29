@@ -489,6 +489,63 @@ def _write_key_for_backend(
     return cred_path, backend
 
 
+_TPM_DEVICE = "/dev/tpmrm0"
+
+
+def tpm_facts() -> dict[str, bool]:
+    """What decides whether the key can be sealed to this machine's TPM. `usable` is the
+    real test (this process can open the device), which is stricter than `tss_member`:
+    the group list on disk changes at `usermod` time, but a running session only gets
+    the new group after a fresh login."""
+    return {
+        "device_present": os.path.exists(_TPM_DEVICE),
+        "usable": os.access(_TPM_DEVICE, os.R_OK | os.W_OK),
+        "tss_member": _is_tss_member(),
+        "creds_available": _systemd_creds_available(),
+    }
+
+
+def soul_key_reseal_tpm(*, path: str | None = None) -> dict[str, Any]:
+    """Moves an existing `host-cred` key onto `host+tpm2` WITHOUT changing the key: the
+    same key bytes are sealed a stronger way, so no rows are re-wrapped and an enrolled
+    recovery method still unlocks it. (`rotate` cannot do this: it mints a new key under
+    the OLD backend on purpose.) Does nothing, and says why, unless the TPM is usable
+    right now. The new blob is proven to decrypt back to the same key before it replaces
+    the old one, and replaces it atomically, so a failure at any point leaves the
+    working key untouched."""
+    status = soul_key_status(path=path)
+    if not status["present"]:
+        return {"resealed": False, "reason": "no key yet"}
+    if status["backend"] == "host+tpm2":
+        return {"resealed": False, "reason": "already sealed to the TPM"}
+    if status["backend"] != "host-cred":
+        return {"resealed": False,
+                "reason": f"a {status['backend']} key cannot be sealed to the TPM"}
+    facts = tpm_facts()
+    if not (facts["creds_available"] and facts["usable"]):
+        return {"resealed": False,
+                "reason": "the TPM is not usable by this session yet" if facts["device_present"]
+                else "no TPM on this machine"}
+    resolved = _key_file_path(explicit=path)
+    explicit = path is not None
+    cred_path = _credential_path(resolved, explicit=explicit)
+    key = _decrypt_with_systemd_creds(cred_path.read_bytes())
+    try:
+        blob = _encrypt_with_systemd_creds(key, with_key="host+tpm2")
+        if _decrypt_with_systemd_creds(blob) != key:
+            return {"resealed": False, "error": "the sealed copy did not read back the same key"}
+    except RuntimeError as exc:
+        return {"resealed": False, "error": str(exc)}
+    tmp = cred_path.with_name(cred_path.name + ".resealing")
+    tmp.write_bytes(blob)
+    tmp.chmod(0o600)
+    os.replace(tmp, cred_path)
+    meta = _meta_path(resolved)
+    meta.write_text(json.dumps({"backend": "host+tpm2"}))
+    meta.chmod(0o600)
+    return {"resealed": True, "backend": "host+tpm2"}
+
+
 def soul_key_init(
     *, owner: str | None = None, path: str | None = None, backend: str | None = None,
     print_recovery: bool = False,
@@ -559,7 +616,8 @@ def soul_key_init(
         tss_hint = (f"a stronger TPM2-bound key is available once you join the "
                     f"'{_TSS_GROUP}' group: `usermod -aG {_TSS_GROUP} {target_owner}` "
                     "(run by root; log out and back in after, then `osiris soul-key "
-                    "rotate` to upgrade the existing key onto host+tpm2)")
+                    "reseal` to move the existing key onto host+tpm2; the key itself does "
+                    "not change)")
     return {
         "path": str(written_path), "backend": effective_backend, "owner": target_owner,
         "chowned": chowned, "recovery_disclosed": print_recovery,

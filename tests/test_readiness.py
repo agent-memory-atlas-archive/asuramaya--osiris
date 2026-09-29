@@ -167,7 +167,8 @@ def test_only_the_steps_that_need_a_person_carry_an_action() -> None:
         if s["mode"] == "auto":
             assert s["action"] is None, s["key"]
     assert {s["key"] for s in steps if s["mode"] == "hands"} == {
-        "recovery_enrolled", "recovery_verified", "offload_target_present"}
+        "recovery_enrolled", "recovery_verified", "offload_target_present",
+        "key_tpm_sealed"}
 
 
 def test_zero_legacy_rows_is_done_never_needs_attention() -> None:
@@ -318,3 +319,58 @@ def test_exactly_one_step_is_current_when_something_is_missing() -> None:
     current = [s for s in steps.values() if s["current"]]
     assert len(current) == 1
     assert current[0]["key"] == "recovery_enrolled"
+
+
+# --- the optional TPM step (setup is automatic; only the sudo group join is a person's) ----
+
+TPM_OFF = {"device_present": True, "usable": False, "tss_member": False,
+           "creds_available": True}
+
+
+def _tpm(**tpm: object) -> dict[str, object]:
+    key = dict(KEY_READY, backend="host-cred", tpm=dict(TPM_OFF, **tpm))
+    return _steps(soul_key=key, services_restarted=True)["key_tpm_sealed"]
+
+
+def test_tpm_step_is_last_and_optional() -> None:
+    assert STEP_ORDER[-1] == "key_tpm_sealed"
+    assert _tpm()["optional"] is True
+
+
+def test_not_in_the_tss_group_offers_the_sudo_command_sequence() -> None:
+    step = _tpm()
+    assert step["mode"] == "hands" and step["status"] == "missing"
+    assert step["action"] == {"kind": "tpm_setup", "commands": [
+        "sudo usermod -aG tss $USER", "log out and back in"]}
+
+
+def test_in_the_group_but_not_logged_back_in_has_no_command_to_run() -> None:
+    step = _tpm(tss_member=True)
+    assert "log out" in str(step["reason"]).lower()
+
+
+def test_usable_tpm_reseals_automatically_with_no_action() -> None:
+    step = _tpm(tss_member=True, usable=True)
+    assert step["mode"] == "auto" and step["action"] is None
+
+
+def test_no_tpm_device_is_done_and_never_a_warning() -> None:
+    step = _tpm(device_present=False)
+    assert step["status"] == "done"
+    assert step["reason"] == "Not available on this machine."
+
+
+def test_already_tpm_sealed_is_done() -> None:
+    key = dict(KEY_READY, backend="host+tpm2")
+    assert _steps(soul_key=key, services_restarted=True)["key_tpm_sealed"]["status"] == "done"
+
+
+def test_a_skipped_tpm_step_never_becomes_the_current_step_or_blocks_completion() -> None:
+    targets = [{"name": "nas", "kind": "local", "enabled": True,
+                "presence": {"present": True}, "last_successful_offload": "2026-09-01"}]
+    receipts = {"x": {"last_passed_at": "2026-09-01T00:00:00Z"}}
+    key = dict(KEY_READY, backend="host-cred", tpm=TPM_OFF)
+    steps = compute_readiness_steps(
+        soul_key=key, restic_key=RESTIC_READY, offload_targets=targets,
+        restore_drill_receipts=receipts, services_restarted=True)
+    assert not any(s["current"] for s in steps)

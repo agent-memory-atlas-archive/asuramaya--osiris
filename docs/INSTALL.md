@@ -138,7 +138,14 @@ claude mcp add --scope user --transport http osiris http://127.0.0.1:8790/mcp \
   --header 'X-Osiris-Job: ${CLAUDE_JOB_DIR}'
 ```
 
-Or add to project-specific `.mcp.json`:
+`osiris deploy` then approves the server once for every directory (it adds `osiris` to
+`enabledMcpjsonServers` in `~/.claude/settings.json`, keeping every other setting), so Claude
+Code stops asking you to approve it again for each new git worktree or repo. Re-running is a
+no-op, and a settings file it cannot safely merge is left untouched and reported.
+`osiris onboard` writes no per-repo `.mcp.json` once the user-scope registration above exists
+(pass `--repo-pinned` to write one anyway).
+
+Or add to project-specific `.mcp.json` (without the user-scope registration above):
 
 ```json
 {

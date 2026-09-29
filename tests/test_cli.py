@@ -2629,6 +2629,32 @@ async def test_cmd_deploy_names_a_backup_password_problem_but_carries_on(
     assert "backup password not set up: OSError: read-only" in buf.getvalue()
 
 
+async def test_cmd_deploy_approves_the_osiris_mcp_server_for_every_project(
+    actions: Actions, tmp_path: Path,
+) -> None:
+    """Deploy installs the one-time approval, so a new worktree or repo never re-prompts;
+    the box's own ~/.claude is never touched (the suite points the home at a scratch dir)."""
+    import io
+    import json
+    import os
+    from contextlib import redirect_stdout
+
+    async def _restart(units: list[str]) -> tuple[int, str]:
+        return 0, "done"
+
+    home = Path(os.environ["OSIRIS_CLAUDE_HOME"])
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        await cmd_deploy(repo_root=tmp_path, git_status=lambda root: [], restart=_restart,
+                         pool=actions.pool, wait_for_health=_fake_wait_for_health,
+                         wait_for_smoke=_fake_wait_for_smoke,
+                         wait_for_mcp_socket=_fake_wait_for_mcp_socket,
+                         check_whisper_probe=_fake_check_whisper_ok)
+    assert "mcp approval: approved osiris for every project" in buf.getvalue()
+    settings = json.loads((home / ".claude" / "settings.json").read_text())
+    assert settings["enabledMcpjsonServers"] == ["osiris"]
+
+
 async def test_cmd_deploy_records_normally_when_the_whisper_probe_succeeds(
     actions: Actions, tmp_path: Path,
 ) -> None:

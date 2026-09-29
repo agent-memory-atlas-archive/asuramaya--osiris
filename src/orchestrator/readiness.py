@@ -29,15 +29,17 @@ StepStatus = Literal["done", "missing", "needs_attention"]
 STEP_ORDER = (
     "key_set_up", "services_restarted", "recovery_enrolled", "recovery_verified",
     "recovery_copy_off_box", "data_encrypted", "backup_password_set",
-    "offload_target_present", "offload_run", "restore_test_passed",
+    "offload_target_present", "offload_run", "restore_test_passed", "key_tpm_sealed",
 )
 
 
 def _step(key: str, label: str, status: StepStatus, reason: str | None,
           action: dict[str, Any] | None, *, mode: Literal["auto", "hands"] = "auto",
-          progress: dict[str, Any] | None = None) -> dict[str, Any]:
+          progress: dict[str, Any] | None = None,
+          optional: bool = False) -> dict[str, Any]:
     return {"key": key, "label": label, "status": status, "reason": reason,
-            "action": action, "current": False, "mode": mode, "progress": progress}
+            "action": action, "current": False, "mode": mode, "progress": progress,
+            "optional": optional}
 
 
 def _eta_text(eta_seconds: int | None) -> str:
@@ -83,6 +85,34 @@ def _data_encrypted_step(soul_key: dict[str, Any], key_present: bool) -> dict[st
     return _step("data_encrypted", label, "missing",
                  "Encryption starts automatically in the background.", None,
                  progress=progress)
+
+
+TPM_JOIN_COMMANDS = ["sudo usermod -aG tss $USER", "log out and back in"]
+
+
+def _tpm_step(soul_key: dict[str, Any], key_present: bool) -> dict[str, Any]:
+    """OPTIONAL, never a warning: sealing the key to the machine's TPM is a strength upgrade,
+    so a box that skips it (or has no TPM at all) still reads as fully set up. Only the group
+    join needs a person (it needs sudo); the re-seal itself runs by itself afterwards."""
+    label = "Key sealed to the TPM (optional)"
+    if not key_present:
+        return _step("key_tpm_sealed", label, "missing", "Waiting for the key.", None,
+                     mode="hands", optional=True)
+    backend = soul_key.get("backend")
+    tpm = soul_key.get("tpm") or {}
+    if backend == "host+tpm2":
+        return _step("key_tpm_sealed", label, "done", None, None, mode="hands", optional=True)
+    if backend != "host-cred" or not tpm.get("device_present") or not tpm.get("creds_available"):
+        return _step("key_tpm_sealed", label, "done", "Not available on this machine.", None,
+                     mode="hands", optional=True)
+    if tpm.get("usable"):
+        return _step("key_tpm_sealed", label, "missing",
+                     "Sealing to the TPM automatically.", None, mode="auto", optional=True)
+    reason = ("Log out and back in to finish joining the tss group." if tpm.get("tss_member")
+              else "Join the tss group to seal the key to the TPM.")
+    return _step("key_tpm_sealed", label, "missing", reason,
+                 {"kind": "tpm_setup", "commands": TPM_JOIN_COMMANDS}, mode="hands",
+                 optional=True)
 
 
 def compute_readiness_steps(
@@ -224,8 +254,10 @@ def compute_readiness_steps(
             f"The last restore test failed and will be retried: {failed}" if failed
             else "Runs automatically after the first backup, then weekly.", None))
 
+    steps.append(_tpm_step(soul_key, key_present))
+
     for s in steps:
-        if s["status"] != "done":
+        if s["status"] != "done" and not s["optional"]:
             s["current"] = True
             break
     return steps

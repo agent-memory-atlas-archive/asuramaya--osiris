@@ -33,6 +33,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from src.orchestrator.mcp_approval import user_scope_registered
+
 # The shared, always-on MCP server every fleet agent connects to (deploy/osiris-mcp.service;
 # host/port are src/config/settings.py osiris_mcp_{host,port}). This mirrors THIS repo's own
 # .mcp.json: the exact shape a newly-onboarded repo needs.
@@ -283,8 +285,13 @@ _BOOTSTRAP_NOTE = (
 )
 
 
-def _checklist(root: Path, *, user_scope: bool) -> str:
-    if user_scope:
+def _checklist(root: Path, *, user_scope: bool, registered: bool = False) -> str:
+    if registered and not user_scope:
+        head = (
+            "USER SCOPE -- osiris is already registered for EVERY project on this box, so no\n"
+            f"per-repo .mcp.json was written for {root.name} (pass --repo-pinned to write one)."
+        )
+    elif user_scope:
         head = (
             "USER SCOPE -- run this ONE command to register osiris for EVERY project on this box\n"
             "(it edits ~/.claude.json via the claude CLI, which owns that config; we never do):\n\n"
@@ -322,11 +329,14 @@ def onboard(
     settle_gate: bool = False,
     dry_run: bool = False,
     user_scope: bool = False,
+    repo_pinned: bool = False,
     osiris_home: str | Path | None = None,
 ) -> dict[str, Any]:
     """Wire `repo` into the fleet, locally. Returns a structured result (the applied Changes
     plus the checklist text). Writes files unless `dry_run`; with `user_scope` it prints the
-    box-wide one-liner instead of writing `.mcp.json`. Raises InvalidConfigError on an
+    box-wide one-liner instead of writing `.mcp.json`. When osiris is ALREADY registered at
+    user scope (`user_scope_registered`), no `.mcp.json` is written either, unless
+    `repo_pinned` asks for one. Raises InvalidConfigError on an
     unmergeable file. `reads`/`project`: the zero-token read hook. `settle_gate`: THE
     MECHANICAL SETTLE, see `merge_settings`'s own docstring for both."""
     root = Path(repo).expanduser().resolve()
@@ -337,6 +347,11 @@ def onboard(
     changes: list[Change] = []
     if user_scope:
         changes.append(Change("skipped", root / ".mcp.json"))  # print the one-liner instead
+    elif not repo_pinned and user_scope_registered():
+        # osiris is already registered for every project on this box (user scope), so a
+        # per-repo file would only add a second entry Claude Code asks the user to approve
+        # again for each new directory. `repo_pinned=True` (--repo-pinned) still writes one.
+        changes.append(Change("skipped", root / ".mcp.json"))
     else:
         changes.append(_apply(root / ".mcp.json", merge_mcp, dry_run=dry_run))
     if (statusline or hook or whisper or anchor or precompact or spawn or session_end
@@ -355,7 +370,9 @@ def onboard(
     return {
         "root": root,
         "changes": changes,
-        "checklist": _checklist(root, user_scope=user_scope),
+        "checklist": _checklist(
+            root, user_scope=user_scope,
+            registered=not repo_pinned and user_scope_registered()),
         "dry_run": dry_run,
         "user_scope": user_scope,
     }
@@ -444,6 +461,13 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - CLI glue
         help="print the box-wide `claude mcp add --scope user` one-liner; write no .mcp.json",
     )
     parser.add_argument(
+        "--repo-pinned",
+        action="store_true",
+        dest="repo_pinned",
+        help="write a repo-pinned .mcp.json even when osiris is already registered at user "
+             "scope (by default it is skipped: the box-wide entry already reaches this repo)",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="show what would change without writing"
     )
     args = parser.parse_args(argv)
@@ -465,6 +489,7 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - CLI glue
             settle_gate=args.settle_gate,
             dry_run=args.dry_run,
             user_scope=args.user_scope,
+            repo_pinned=args.repo_pinned,
         )
     except InvalidConfigError as e:
         print(f"onboard: {e}", file=sys.stderr)

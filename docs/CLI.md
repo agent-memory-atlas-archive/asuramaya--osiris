@@ -456,7 +456,7 @@ directly rather than through the generic composition command, since no other pat
 passes through its own `--vault`/`--backups` path overrides. `--vault`/`--backups`
 override the production paths, for a test or a non-standard setup.
 
-## `osiris soul-key <status|init|rotate|restore-drill|enroll-recovery|verify-recovery|recover> [flags]`
+## `osiris soul-key <status|init|rotate|restore-drill|enroll-recovery|verify-recovery|recover|reseal> [flags]`
 
 Inspect, rotate, or recover the soul-store encryption key, check that recovery works, and
 drill an off-box backup's own restorability. The key itself is created by `osiris deploy`
@@ -466,7 +466,8 @@ terminal output for each action: [`KEYS.md`](KEYS.md#everyday-operation).
 `status`/`init`/`rotate`/`restore-drill` are also exposed over the console's own
 network routes (reachable only from the local machine). `enroll-recovery`/`verify-recovery`/`recover`
 stay command-line only by design: no action here is ever exposed to an automated
-agent.
+agent. `reseal` moves an existing key onto the machine's TPM once your user has joined
+the `tss` group; the key itself does not change (the worker also does this by itself).
 
 ```
 osiris soul-key init
@@ -480,6 +481,7 @@ osiris soul-key rotate --finish
 osiris soul-key recover
 osiris soul-key recover --recovery-file ./soul.key.recovery.json
 osiris soul-key restore-drill
+osiris soul-key reseal
 ```
 
 ## `osiris restic-key <status|init> [--path P] [--backend host-cred|host+tpm2|file] [--json]`
