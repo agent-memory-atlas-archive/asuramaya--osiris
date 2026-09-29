@@ -26,6 +26,14 @@ def _receipts_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture(autouse=True)
+def _isolated_credstore(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A deploy on the developer's machine mints a REAL backup password into its own credential
+    store, which the "no password" tests would silently find. Point both lookups at scratch."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdgcfg"))
+    monkeypatch.setenv("OSIRIS_RESTIC_PASSWORD_FILE", str(tmp_path / "no-such-restic-password"))
+
+
+@pytest.fixture(autouse=True)
 def _restic_password(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OSIRIS_RESTIC_PASSWORD", "a-test-password")
 

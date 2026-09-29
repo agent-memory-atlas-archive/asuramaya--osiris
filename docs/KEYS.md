@@ -37,7 +37,10 @@ override it with `--backend`:
 1. **`host+tpm2`**: a `systemd-creds` credential bound to this machine's own host key and
    its TPM2 security chip, the strongest option. Only available once you have joined the
    `tss` Linux group (`sudo usermod -aG tss $USER`, then log out and back in). `init` prints
-   that instruction when it applies, rather than running it for you.
+   that instruction when it applies, rather than running it for you. Once you are back in
+   after joining, osiris moves an existing `host-cred` key onto the TPM by itself (the key
+   does not change, so no data is re-encrypted and recovery still works), or run
+   `osiris soul-key reseal` to do it right away. `rotate` keeps the old storage method.
 2. **`host-cred`**: the same `systemd-creds` mechanism, bound to the host key alone, with no
    TPM2 involved. This is what a fresh machine gets by default.
 3. **`file`**: a plain file on disk, with restrictive file permissions. Only chosen
