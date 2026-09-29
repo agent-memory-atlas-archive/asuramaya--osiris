@@ -135,7 +135,7 @@ wrappers.
 |---|---|---|
 | /mail | get_mail() | Show unread inbox |
 | /settle | settle() | Write back decisions/threads before leaving |
-| /status | get_status() | Quick identity + mail glance |
+| /osiris | get_status() | Quick identity + mail glance |
 | /threads | get_thread_list(project=...) | Show open threads for a project |
 | /decisions | get_decision_list(project=...) | Show recent decisions |
 | /graph | graph_search(query=..., project=...) | Search graph scoped to project |

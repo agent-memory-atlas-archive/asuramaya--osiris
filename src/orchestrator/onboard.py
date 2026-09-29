@@ -426,7 +426,7 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - CLI glue
         "--reads",
         action="store_true",
         help="also install the UserPromptSubmit zero-token read hook (a matched bare slash "
-             "read like /status renders straight to the screen, never reaches the model), "
+             "read like /osiris renders straight to the screen, never reaches the model), "
              "an OPERATOR consent switch",
     )
     parser.add_argument(

@@ -5151,7 +5151,7 @@ async def cmd_amend_decision(
 
 # --- send / decide / thread (the write triangle) --------------------------------------------
 #
-# The counterpart to the read triangle (get_status(render='text') + commands/status.md
+# The counterpart to the read triangle (get_status(render='text') + commands/osiris.md
 # gave a bare terminal a way to read the fleet); these three close the matching gap on the
 # WRITE side. mail, a decision, and closing a thread were each reachable only through an
 # MCP client before this, so an operator (or a script) at a plain shell had no way to post

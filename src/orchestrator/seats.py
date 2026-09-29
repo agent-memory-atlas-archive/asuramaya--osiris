@@ -46,6 +46,7 @@ from typing import Any, Literal
 import asyncpg
 
 from src.actions.core import Actions
+from src.db.pool import pin
 from src.parsers.base import EvidenceClass
 from src.parsers.evidence import confidence_for
 
@@ -108,9 +109,12 @@ class LockWedged(TimeoutError):
 
 
 @asynccontextmanager
-async def _seat_lock(pool: asyncpg.Pool, house: str, handle: str) -> AsyncIterator[None]:
+async def _seat_lock(pool: asyncpg.Pool, house: str, handle: str) -> AsyncIterator[asyncpg.Pool]:
     """Serialize ensure_seat per (house, handle): the same advisory-lock discipline as
-    mint_lock (two concurrent ensures would otherwise both find nothing and mint twins)."""
+    mint_lock (two concurrent ensures would otherwise both find nothing and mint twins).
+    Yields the locked connection as a pinned pool, and the body works ONLY through it:
+    a second acquire from the shared pool while this one is held is the 2026-09-29
+    pool-starvation deadlock (see mint_lock)."""
     key = f"seat:{house or ''}/{handle.lower()}"
     async with pool.acquire() as conn, conn.transaction():
         await conn.execute(f"SET LOCAL lock_timeout = '{_LOCK_TIMEOUT}'")
@@ -120,11 +124,11 @@ async def _seat_lock(pool: asyncpg.Pool, house: str, handle: str) -> AsyncIterat
             raise LockWedged(
                 f"_seat_lock: {key!r} still held past {_LOCK_TIMEOUT}, another "
                 "ensure_seat is genuinely in flight (or wedged)") from exc
-        yield
+        yield pin(pool, conn)
 
 
 @asynccontextmanager
-async def _peer_lock(pool: asyncpg.Pool, *canonicals: str) -> AsyncIterator[None]:
+async def _peer_lock(pool: asyncpg.Pool, *canonicals: str) -> AsyncIterator[asyncpg.Pool]:
     """Serialize peer_seats per seat: the same advisory-lock discipline as _seat_lock.
     peer_seats' own "already has a peer" check and its create_link are two round-trips
     with no lock between them, so two concurrent peer_seats calls sharing a seat could
@@ -143,7 +147,7 @@ async def _peer_lock(pool: asyncpg.Pool, *canonicals: str) -> AsyncIterator[None
                 raise LockWedged(
                     f"_peer_lock: {key!r} still held past {_LOCK_TIMEOUT}, another "
                     "peer_seats is genuinely in flight (or wedged)") from exc
-        yield
+        yield pin(pool, conn)
 
 
 async def find_seat(pool: asyncpg.Pool, *, house: str | None, handle: str) -> str | None:
@@ -189,7 +193,8 @@ async def ensure_seat(
     handle = (handle or "").strip()
     if not handle:
         return {"error": "a seat needs a handle"}
-    async with _seat_lock(actions.pool, house or "", handle):
+    async with _seat_lock(actions.pool, house or "", handle) as locked:
+        actions = Actions(locked)  # the lock's own connection; returns inside the block
         existing = await find_seat(actions.pool, house=house, handle=handle)
         if existing is not None:
             return {"seat_id": existing, "handle": handle, "house": house, "minted": False}
@@ -3445,7 +3450,8 @@ async def peer_seats(
                          "the record"}
     seat_a = (seat_a or "").strip()
     seat_b = (seat_b or "").strip()
-    async with _peer_lock(actions.pool, seat_a, seat_b):
+    async with _peer_lock(actions.pool, seat_a, seat_b) as locked:
+        actions = Actions(locked)  # the lock's own connection; returns inside the block
         row_a = await _resolve_active_seat(actions.pool, seat_a)
         if row_a is None:
             return {"error": f"no such active seat: {seat_a!r}"}

@@ -2020,8 +2020,9 @@ HUMAN_FACING_VERBS = frozenset({
 # mcp_tool -> reason: a HUMAN_FACING_VERBS member with no slash reference anywhere in
 # commands/*.md. Mirrors NO_CLI_EQUIVALENT's own shape exactly.
 NO_SLASH_EQUIVALENT: dict[str, str] = {
-    "stop": "stop.md exists and performs this exact act, but deliberately never names the "
-        "bare `stop` tool, its own text reads 'never the deprecated bare `stop` tool', "
+    "stop": "seat.md's `stop <handle>` verb performs this exact act (the standalone "
+        "stop.md was retired: `/stop` is a Claude Code built-in, commands/RESERVED_NAMES.txt) "
+        "but deliberately never names the bare `stop` tool, "
         "composing `seat` with action='stop' instead (the #202 seat-dispatcher fold). A "
         "reference-extraction gate that requires the literal tool name would force the doc "
         "to point at the deprecated alias it was written specifically to steer callers away "

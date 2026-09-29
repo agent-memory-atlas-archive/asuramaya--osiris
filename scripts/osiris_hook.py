@@ -1428,7 +1428,9 @@ _OSIRIS_BIN = os.environ.get("OSIRIS_CLI_BIN", "osiris")
 # one project by definition, so this is resolved once, not guessed per-invocation) and
 # fall through when it's unset, rather than ever guessing a project from cwd.
 _READ_HOOK_VERBS: dict[str, tuple[str, bool]] = {
-    "status": ("status", False),
+    # `/osiris` (commands/osiris.md), the board glance; never `/status`, which is a
+    # Claude Code built-in (commands/RESERVED_NAMES.txt). The CLI subcommand stays `status`.
+    "osiris": ("status", False),
     "backlog": ("backlog", False),
     "threads": ("threads", False),
     "roster": ("roster", False),
